@@ -290,15 +290,15 @@ A **shared, permissionless, on-chain coordination layer** where:
 
 #### Storage Model
 
-| Key | Type | Storage | TTL |
-|-----|------|---------|-----|
-| `Admin` | `Address` | Instance | Instance lifetime |
-| `FeeBps` | `u32` | Instance | Instance lifetime |
-| `Paused` | `bool` | Instance | Instance lifetime |
-| `TaskCounter` | `u64` | Instance | Instance lifetime |
-| `RewardToken` | `Address` | Instance | Instance lifetime |
-| `Task(u64)` | `Task` struct | Persistent | `task.ttl_ledgers` |
-| `KeeperReward(Address)` | `i128` | Persistent | ~1 year (6.3M ledgers) |
+| Key | Type | Storage | TTL | Default when unset |
+|-----|------|---------|-----|---------------------|
+| `Admin` | `Address` | Instance | Instance lifetime | — |
+| `FeeBps` | `u32` | Instance | Instance lifetime | `0` (see `DEFAULT_FEE_BPS`) |
+| `Paused` | `bool` | Instance | Instance lifetime | `false` |
+| `TaskCounter` | `u64` | Instance | Instance lifetime | `0` |
+| `RewardToken` | `Address` | Instance | Instance lifetime | — |
+| `Task(u64)` | `Task` struct | Persistent | `task.ttl_ledgers` | — |
+| `KeeperReward(Address)` | `i128` | Persistent | ~1 year (6.3M ledgers) | `0` |
 
 `Task.deadline` is a unix timestamp **in seconds**; `Task.ttl_ledgers` is a
 Persistent storage TTL **in ledgers** — the two are different units with no
