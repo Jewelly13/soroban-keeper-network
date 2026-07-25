@@ -99,7 +99,8 @@ pub struct Task {
     /// Address that registered and funded this task.
     pub owner: Address,
     pub task_type: TaskType,
-    /// Arbitrary bytes the keeper uses to reconstruct the target call off-chain.
+    /// Arbitrary bytes the keeper uses to reconstruct the target call
+    /// off-chain. Bounded to [`MAX_CALLDATA_LEN`] at registration.
     pub calldata: Bytes,
     /// Reward escrowed in this contract (token units / XLM stroops).
     pub reward: i128,
@@ -136,6 +137,8 @@ pub enum KeeperError {
     NotTaskOwner = 11,
     NotTaskClaimer = 12,
     NoRewardsAvailable = 13,
+    /// `calldata` exceeds [`MAX_CALLDATA_LEN`].
+    CalldataTooLarge = 14,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -339,7 +342,16 @@ fn lock_expired(e: &Env, task: &Task) -> bool {
 
 /// Semantic version of the contract logic. Bumped on behavior changes so
 /// off-chain clients and indexers can detect which ABI they are talking to.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
+
+/// Maximum `calldata` length, in bytes. Sized to hold an encoded contract
+/// call — a target address, a function symbol, and a handful of scalar or
+/// address arguments (an XDR-encoded `Address` is ~40 bytes, a `Symbol` up to
+/// 32) — with headroom, without letting a task owner push storage and
+/// re-serialisation cost onto the keepers and passers-by who load and
+/// re-write this `Task` on every later lifecycle call (`claim_task`,
+/// `execute_task`, and the permissionless `expire_task`).
+pub const MAX_CALLDATA_LEN: u32 = 1024;
 
 #[contract]
 pub struct KeeperRegistry;
@@ -390,7 +402,9 @@ impl KeeperRegistry {
     // Arguments:
     //   owner        — address funding the task (must auth)
     //   task_type    — classification (Liquidation, OraclePricePush, …)
-    //   calldata     — encoded params the keeper uses to build the target call
+    //   calldata     — encoded params the keeper uses to build the target
+    //                  call; capped at MAX_CALLDATA_LEN bytes, rejected with
+    //                  CalldataTooLarge otherwise
     //   reward       — XLM stroops escrowed as bounty
     //   deadline     — unix timestamp after which the task expires
     //   ttl_ledgers  — how long to keep the storage entry alive
@@ -423,6 +437,9 @@ impl KeeperRegistry {
         }
         if deadline <= e.ledger().timestamp() {
             return Err(KeeperError::DeadlinePassed);
+        }
+        if calldata.len() > MAX_CALLDATA_LEN {
+            return Err(KeeperError::CalldataTooLarge);
         }
 
         // Escrow the reward from the owner into this contract.
