@@ -103,9 +103,15 @@ pub struct Task {
     pub calldata: Bytes,
     /// Reward escrowed in this contract (token units / XLM stroops).
     pub reward: i128,
-    /// Unix timestamp (seconds) after which the task may be expired.
+    /// Unix timestamp IN SECONDS after which the task may be expired. Not
+    /// directly comparable to `ttl_ledgers` — see that field.
     pub deadline: u64,
-    /// Ledger TTL for this storage entry.
+    /// Ledger TTL for this storage entry, IN LEDGERS (not seconds). Ledgers
+    /// close roughly every `SECONDS_PER_LEDGER` seconds, so this and
+    /// `deadline` are different units; `register_task`/`extend_deadline`
+    /// enforce that this always covers `deadline` plus a safety margin so the
+    /// entry cannot be evicted while its escrow is still live (see
+    /// `required_ttl_ledgers`).
     pub ttl_ledgers: u32,
     pub status: TaskStatus,
     /// Set when a keeper claims the task.
@@ -136,6 +142,10 @@ pub enum KeeperError {
     NotTaskOwner = 11,
     NotTaskClaimer = 12,
     NoRewardsAvailable = 13,
+    /// `ttl_ledgers` does not cover the task's `deadline` plus the safety
+    /// margin — the storage entry could expire while the escrow is still
+    /// live. See [`required_ttl_ledgers`].
+    TtlTooShort = 14,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -255,6 +265,28 @@ fn next_task_id(e: &Env) -> u64 {
     next
 }
 
+/// Ledgers close roughly every 5 seconds on Stellar. Used only to sanity-check
+/// that a task's storage outlives its deadline; a conservative estimate is
+/// correct here because over-estimating the ledger rate over-provisions TTL.
+const SECONDS_PER_LEDGER: u64 = 5;
+
+/// Extra ledgers kept beyond the deadline so `expire_task` (and `cancel_task`/
+/// `execute_task`) are still callable for a while after the deadline passes,
+/// giving a margin against clock drift between the two units below.
+const TTL_SAFETY_MARGIN_LEDGERS: u32 = 17_280; // ~1 day
+
+/// Minimum `ttl_ledgers` a task with the given `deadline` must be stored with
+/// so its Persistent storage entry cannot be evicted while the escrow it
+/// guards is still live. `deadline` is a unix timestamp (seconds);
+/// `ttl_ledgers` is a ledger count — the two are different units with no
+/// fixed conversion, so this is deliberately conservative
+/// (see [`SECONDS_PER_LEDGER`], [`TTL_SAFETY_MARGIN_LEDGERS`]).
+fn required_ttl_ledgers(e: &Env, deadline: u64) -> u64 {
+    let seconds_until_deadline = deadline.saturating_sub(e.ledger().timestamp());
+    let ledgers_until_deadline = seconds_until_deadline / SECONDS_PER_LEDGER;
+    ledgers_until_deadline + TTL_SAFETY_MARGIN_LEDGERS as u64
+}
+
 fn load_task(e: &Env, task_id: u64) -> Result<Task, KeeperError> {
     e.storage()
         .persistent()
@@ -339,7 +371,7 @@ fn lock_expired(e: &Env, task: &Task) -> bool {
 
 /// Semantic version of the contract logic. Bumped on behavior changes so
 /// off-chain clients and indexers can detect which ABI they are talking to.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 #[contract]
 pub struct KeeperRegistry;
@@ -392,8 +424,11 @@ impl KeeperRegistry {
     //   task_type    — classification (Liquidation, OraclePricePush, …)
     //   calldata     — encoded params the keeper uses to build the target call
     //   reward       — XLM stroops escrowed as bounty
-    //   deadline     — unix timestamp after which the task expires
-    //   ttl_ledgers  — how long to keep the storage entry alive
+    //   deadline     — unix timestamp IN SECONDS after which the task expires
+    //   ttl_ledgers  — how long to keep the storage entry alive, IN LEDGERS
+    //                  (not seconds — see `required_ttl_ledgers`). Must cover
+    //                  `deadline` plus a safety margin or registration fails
+    //                  with `TtlTooShort`.
     //   lock_ledgers — ledgers the claimer holds exclusive rights
     //
     // Returns the new task_id.
@@ -423,6 +458,9 @@ impl KeeperRegistry {
         }
         if deadline <= e.ledger().timestamp() {
             return Err(KeeperError::DeadlinePassed);
+        }
+        if (ttl_ledgers as u64) < required_ttl_ledgers(&e, deadline) {
+            return Err(KeeperError::TtlTooShort);
         }
 
         // Escrow the reward from the owner into this contract.
@@ -509,6 +547,9 @@ impl KeeperRegistry {
         }
         if new_deadline <= task.deadline {
             return Err(KeeperError::DeadlinePassed);
+        }
+        if (task.ttl_ledgers as u64) < required_ttl_ledgers(&e, new_deadline) {
+            return Err(KeeperError::TtlTooShort);
         }
 
         task.deadline = new_deadline;

@@ -6,6 +6,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — TTL/deadline invariant (VERSION bumped to 2)
+
+- `register_task` and `extend_deadline` now reject a `ttl_ledgers` that does
+  not cover the task's `deadline` plus a safety margin, with a new
+  `TtlTooShort` error. Previously the two were validated independently, so a
+  task's Persistent storage entry could expire while its escrowed reward was
+  still held, permanently stranding the funds (no admin or owner recovery
+  path, since `cancel_task`/`expire_task`/`execute_task` all start with
+  `load_task`).
+- Documented the unit mismatch between `deadline` (unix seconds) and
+  `ttl_ledgers` (ledger count) on both `Task` fields and in
+  [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#ttl--deadline-invariant).
+- Added `TtlTooShort` to `KeeperError`, which changes the contract's error
+  ABI — `VERSION` bumped from 1 to 2.
+
 ### Added — live testnet deployment
 
 - Deployed `KeeperRegistry` to Stellar testnet
