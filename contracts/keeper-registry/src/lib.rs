@@ -290,6 +290,24 @@ fn reward_token(e: &Env) -> Result<token::Client<'_>, KeeperError> {
     Ok(token::Client::new(e, &addr))
 }
 
+/// Protocol fee applied when `FeeBps` has never been written. Kept at zero so
+/// an uninitialized or partially-migrated registry can never silently skim
+/// from a keeper's reward: a fee is a transfer of value away from the keeper,
+/// and defaulting to charging one on a contract whose configuration is
+/// unknown is the more surprising of the two failure modes.
+pub const DEFAULT_FEE_BPS: u32 = 0;
+
+/// Single source of truth for the current protocol fee. Every read of
+/// `FeeBps` — views and the execution path alike — must go through this, so
+/// a caller can never observe a fee rate that differs from the rate the
+/// contract would actually apply.
+fn fee_bps(e: &Env) -> u32 {
+    e.storage()
+        .instance()
+        .get(&DataKey::FeeBps)
+        .unwrap_or(DEFAULT_FEE_BPS)
+}
+
 /// Returns (keeper_net, protocol_fee).
 fn split_reward(reward: i128, fee_bps: u32) -> (i128, i128) {
     let fee = reward
@@ -597,8 +615,7 @@ impl KeeperRegistry {
             return Err(KeeperError::DeadlinePassed);
         }
 
-        let fee_bps: u32 = e.storage().instance().get(&DataKey::FeeBps).unwrap_or(0);
-        let (keeper_net, fee) = split_reward(task.reward, fee_bps);
+        let (keeper_net, fee) = split_reward(task.reward, fee_bps(&e));
         credit_keeper(&e, &keeper, keeper_net);
         accrue_fee(&e, fee);
 
@@ -742,7 +759,7 @@ impl KeeperRegistry {
         if new_bps > 10_000 {
             return Err(KeeperError::InvalidFeeBps);
         }
-        let old_bps: u32 = e.storage().instance().get(&DataKey::FeeBps).unwrap_or(0);
+        let old_bps = fee_bps(&e);
         e.storage().instance().set(&DataKey::FeeBps, &new_bps);
         emit_fee_updated(&e, old_bps, new_bps);
         log!(&e, "Fee updated to {} bps", new_bps);
@@ -870,10 +887,7 @@ impl KeeperRegistry {
     }
 
     pub fn get_fee_bps(e: Env) -> u32 {
-        e.storage()
-            .instance()
-            .get(&DataKey::FeeBps)
-            .unwrap_or(300u32)
+        fee_bps(&e)
     }
 
     pub fn is_paused(e: Env) -> bool {

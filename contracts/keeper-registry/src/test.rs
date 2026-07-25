@@ -563,6 +563,48 @@ fn test_execute_task_credits_keeper_net_of_fee() {
 }
 
 #[test]
+fn test_get_fee_bps_matches_applied_fee_when_never_written() {
+    let s = setup();
+    // Simulate a registry where `FeeBps` was never written (e.g. queried
+    // before `initialize`, or dropped by a future storage migration).
+    s.env.as_contract(&s.registry.address, || {
+        s.env.storage().instance().remove(&DataKey::FeeBps);
+    });
+
+    let keeper = Address::generate(&s.env);
+    let id = register_default_task(&s); // reward 1_000_000
+
+    let reported_fee_bps = s.registry.get_fee_bps();
+
+    s.registry.claim_task(&keeper, &id);
+    s.registry
+        .execute_task(&keeper, &id, &Bytes::from_slice(&s.env, b"proof"));
+
+    let (expected_net, _) = split_reward(1_000_000i128, reported_fee_bps);
+    assert_eq!(s.registry.keeper_balance(&keeper), expected_net);
+    assert_eq!(reported_fee_bps, 0u32);
+}
+
+#[test]
+fn test_get_fee_bps_matches_applied_fee_after_set_fee_bps() {
+    let s = setup();
+    s.registry.set_fee_bps(&s.admin, &750u32);
+
+    let keeper = Address::generate(&s.env);
+    let id = register_default_task(&s); // reward 1_000_000
+
+    let reported_fee_bps = s.registry.get_fee_bps();
+
+    s.registry.claim_task(&keeper, &id);
+    s.registry
+        .execute_task(&keeper, &id, &Bytes::from_slice(&s.env, b"proof"));
+
+    let (expected_net, _) = split_reward(1_000_000i128, reported_fee_bps);
+    assert_eq!(s.registry.keeper_balance(&keeper), expected_net);
+    assert_eq!(reported_fee_bps, 750u32);
+}
+
+#[test]
 fn test_execute_by_non_claimer_fails() {
     let s = setup();
     let keeper = Address::generate(&s.env);
