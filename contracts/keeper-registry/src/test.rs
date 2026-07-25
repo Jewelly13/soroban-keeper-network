@@ -13,12 +13,13 @@
 #![cfg(test)]
 
 use soroban_sdk::{
-    testutils::{Address as _, Events as _, Ledger},
+    testutils::{Address as _, Deployer as _, Events as _, Ledger},
     token, Address, Bytes, Env,
 };
 
 use crate::{
     split_reward, KeeperError, KeeperRegistry, KeeperRegistryClient, TaskStatus, TaskType,
+    INSTANCE_BUMP_LEDGERS, INSTANCE_BUMP_THRESHOLD,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -963,6 +964,62 @@ fn test_transfer_admin_emits_event() {
     let before = s.env.events().all().len();
     s.registry.transfer_admin(&s.admin, &new_admin);
     assert!(s.env.events().all().len() > before);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Instance TTL renewal
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_instance_ttl_renewed_by_mutation_stays_alive_past_initial_window() {
+    let s = setup();
+
+    // initialize() already bumped the instance TTL to ~INSTANCE_BUMP_LEDGERS.
+    let ttl_after_init = s
+        .env
+        .deployer()
+        .get_contract_instance_ttl(&s.registry.address);
+    assert!(ttl_after_init > INSTANCE_BUMP_THRESHOLD);
+
+    // Advance far enough that remaining TTL drops below the renewal
+    // threshold, but not so far that the entry actually expires.
+    advance(
+        &s.env,
+        INSTANCE_BUMP_LEDGERS - INSTANCE_BUMP_THRESHOLD + 1_000,
+        0,
+    );
+    let ttl_before_mutation = s
+        .env
+        .deployer()
+        .get_contract_instance_ttl(&s.registry.address);
+    assert!(
+        ttl_before_mutation < INSTANCE_BUMP_THRESHOLD,
+        "test setup should cross the renewal threshold"
+    );
+
+    // A state-mutating admin call renews the TTL back up to
+    // ~INSTANCE_BUMP_LEDGERS from the current ledger. Uses an instance-only
+    // mutation (no persistent Task entry involved) so this test isolates
+    // instance TTL renewal from per-task TTL, which is a separate mechanism
+    // covered by `save_task`.
+    s.registry.set_min_reward(&s.admin, &0i128);
+    let ttl_after_mutation = s
+        .env
+        .deployer()
+        .get_contract_instance_ttl(&s.registry.address);
+    assert!(ttl_after_mutation > INSTANCE_BUMP_LEDGERS - 1_000);
+
+    // Advance well past where the *original* TTL window (from initialize)
+    // would have expired the instance — total ledgers advanced now exceeds
+    // INSTANCE_BUMP_LEDGERS. Without the interim renewal above, the instance
+    // would be archived here and every call below would fail.
+    advance(&s.env, INSTANCE_BUMP_LEDGERS - 1_000, 0);
+
+    // The contract is still fully usable: reads and further mutations both
+    // succeed against the (still-live) instance storage.
+    assert_eq!(s.registry.task_count(), 0u64);
+    s.registry.set_fee_bps(&s.admin, &500u32);
+    assert_eq!(s.registry.get_fee_bps(), 500u32);
 }
 
 #[test]
