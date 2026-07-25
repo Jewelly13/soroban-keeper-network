@@ -625,18 +625,20 @@ impl KeeperRegistry {
             return Err(KeeperError::InvalidTaskStatus);
         }
 
-        // Refund the escrow, then mark cancelled (CEI: state after transfer is
-        // safe here because status guards prevent re-entry into a fresh cancel).
-        reward_token(&e).transfer(&e.current_contract_address(), &owner, &task.reward);
+        // Effects before interaction: a re-entrant cancel must find the task
+        // already Cancelled and be rejected by the status guard above.
+        let refund = task.reward;
         task.status = TaskStatus::Cancelled;
         save_task(&e, task_id, &task);
+
+        reward_token(&e).transfer(&e.current_contract_address(), &owner, &refund);
 
         emit_task_cancelled(&e, task_id, &owner);
         log!(
             &e,
             "Task {} cancelled, {} refunded to {}",
             task_id,
-            task.reward,
+            refund,
             owner
         );
         Ok(())
