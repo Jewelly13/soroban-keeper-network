@@ -136,6 +136,12 @@ pub enum KeeperError {
     NotTaskOwner = 11,
     NotTaskClaimer = 12,
     NoRewardsAvailable = 13,
+    // 14 is reserved for `ProofTooLarge`, added by a sibling in-flight PR
+    // (see #10 / execute_task proof bounding). Left as a gap rather than
+    // reused so the two branches don't collide on the same discriminant.
+    /// A function requiring configured state (`initialize` must have been
+    /// called) was invoked on a registry that isn't configured yet.
+    NotInitialized = 15,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -272,11 +278,15 @@ fn require_not_paused(e: &Env) -> Result<(), KeeperError> {
 }
 
 fn require_admin(e: &Env, caller: &Address) -> Result<(), KeeperError> {
+    // An admin key that hasn't been set yet means `initialize` was never
+    // called — that's a different failure than an authenticated caller who
+    // simply isn't the admin, so it gets its own error rather than being
+    // folded into Unauthorized.
     let admin: Address = e
         .storage()
         .instance()
         .get(&DataKey::Admin)
-        .ok_or(KeeperError::Unauthorized)?;
+        .ok_or(KeeperError::NotInitialized)?;
     caller.require_auth();
     if *caller != admin {
         return Err(KeeperError::Unauthorized);
@@ -311,13 +321,31 @@ fn save_task(e: &Env, task_id: u64, task: &Task) {
     );
 }
 
-fn reward_token(e: &Env) -> token::Client<'_> {
+fn reward_token(e: &Env) -> Result<token::Client<'_>, KeeperError> {
     let addr: Address = e
         .storage()
         .instance()
         .get(&DataKey::RewardToken)
-        .expect("not initialized");
-    token::Client::new(e, &addr)
+        .ok_or(KeeperError::NotInitialized)?;
+    Ok(token::Client::new(e, &addr))
+}
+
+/// Protocol fee applied when `FeeBps` has never been written. Kept at zero so
+/// an uninitialized or partially-migrated registry can never silently skim
+/// from a keeper's reward: a fee is a transfer of value away from the keeper,
+/// and defaulting to charging one on a contract whose configuration is
+/// unknown is the more surprising of the two failure modes.
+pub const DEFAULT_FEE_BPS: u32 = 0;
+
+/// Single source of truth for the current protocol fee. Every read of
+/// `FeeBps` — views and the execution path alike — must go through this, so
+/// a caller can never observe a fee rate that differs from the rate the
+/// contract would actually apply.
+fn fee_bps(e: &Env) -> u32 {
+    e.storage()
+        .instance()
+        .get(&DataKey::FeeBps)
+        .unwrap_or(DEFAULT_FEE_BPS)
 }
 
 /// Returns (keeper_net, protocol_fee).
@@ -477,7 +505,7 @@ impl KeeperRegistry {
         bump_instance(&e);
 
         // Escrow the reward from the owner into this contract.
-        reward_token(&e).transfer(&owner, &e.current_contract_address(), &reward);
+        reward_token(&e)?.transfer(&owner, &e.current_contract_address(), &reward);
 
         let task_id = next_task_id(&e);
         let task = Task {
@@ -526,7 +554,7 @@ impl KeeperRegistry {
         }
 
         bump_instance(&e);
-        reward_token(&e).transfer(&owner, &e.current_contract_address(), &additional);
+        reward_token(&e)?.transfer(&owner, &e.current_contract_address(), &additional);
         task.reward = task
             .reward
             .checked_add(additional)
@@ -642,8 +670,7 @@ impl KeeperRegistry {
         }
 
         bump_instance(&e);
-        let fee_bps: u32 = e.storage().instance().get(&DataKey::FeeBps).unwrap_or(0);
-        let (keeper_net, fee) = split_reward(task.reward, fee_bps);
+        let (keeper_net, fee) = split_reward(task.reward, fee_bps(&e));
         credit_keeper(&e, &keeper, keeper_net);
         accrue_fee(&e, fee);
 
@@ -683,7 +710,7 @@ impl KeeperRegistry {
         bump_instance(&e);
         // Refund the escrow, then mark cancelled (CEI: state after transfer is
         // safe here because status guards prevent re-entry into a fresh cancel).
-        reward_token(&e).transfer(&e.current_contract_address(), &owner, &task.reward);
+        reward_token(&e)?.transfer(&e.current_contract_address(), &owner, &task.reward);
         task.status = TaskStatus::Cancelled;
         save_task(&e, task_id, &task);
 
@@ -718,7 +745,7 @@ impl KeeperRegistry {
         }
 
         bump_instance(&e);
-        reward_token(&e).transfer(&e.current_contract_address(), &task.owner, &task.reward);
+        reward_token(&e)?.transfer(&e.current_contract_address(), &task.owner, &task.reward);
         task.status = TaskStatus::Expired;
         save_task(&e, task_id, &task);
 
@@ -751,7 +778,7 @@ impl KeeperRegistry {
         bump_instance(&e);
         // Effects before interaction.
         e.storage().persistent().set(&key, &0i128);
-        reward_token(&e).transfer(&e.current_contract_address(), &keeper, &balance);
+        reward_token(&e)?.transfer(&e.current_contract_address(), &keeper, &balance);
 
         emit_rewards_withdrawn(&e, &keeper, balance);
         log!(&e, "Keeper {} withdrew {}", keeper, balance);
@@ -793,7 +820,7 @@ impl KeeperRegistry {
             return Err(KeeperError::InvalidFeeBps);
         }
         bump_instance(&e);
-        let old_bps: u32 = e.storage().instance().get(&DataKey::FeeBps).unwrap_or(0);
+        let old_bps = fee_bps(&e);
         e.storage().instance().set(&DataKey::FeeBps, &new_bps);
         emit_fee_updated(&e, old_bps, new_bps);
         log!(&e, "Fee updated to {} bps", new_bps);
@@ -876,7 +903,7 @@ impl KeeperRegistry {
         e.storage()
             .instance()
             .set(&DataKey::FeesAccrued, &(accrued - amount));
-        reward_token(&e).transfer(&e.current_contract_address(), &treasury, &amount);
+        reward_token(&e)?.transfer(&e.current_contract_address(), &treasury, &amount);
 
         log!(&e, "Swept {} fees to {}", amount, treasury);
         Ok(())
@@ -891,6 +918,16 @@ impl KeeperRegistry {
     }
 
     // ── Read-only views ───────────────────────────────────────────────────────
+    //
+    // Policy: views never return NotInitialized. Unlike a state-changing call,
+    // a view on an uninitialized registry has an unambiguous, harmless answer
+    // (zero tasks, zero balance, not paused, no admin configured) rather than
+    // an operation that would silently do the wrong thing — `admin()` already
+    // reflects this by returning `Option::None`, and `task_count`/`is_paused`/
+    // `fees_accrued` return their natural default. Please keep this policy
+    // rather than "fixing" these to error, so views stay side-effect-free and
+    // safe to call speculatively (e.g. by a keeper bot probing a fresh
+    // deployment before it knows whether `initialize` has run).
 
     pub fn get_task(e: Env, task_id: u64) -> Result<Task, KeeperError> {
         load_task(&e, task_id)
@@ -928,10 +965,7 @@ impl KeeperRegistry {
     }
 
     pub fn get_fee_bps(e: Env) -> u32 {
-        e.storage()
-            .instance()
-            .get(&DataKey::FeeBps)
-            .unwrap_or(300u32)
+        fee_bps(&e)
     }
 
     pub fn is_paused(e: Env) -> bool {
