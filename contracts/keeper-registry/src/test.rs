@@ -13,6 +13,8 @@
 #![cfg(test)]
 
 use soroban_sdk::{
+    testutils::{Address as _, Deployer as _, Events as _, Ledger, MockAuth, MockAuthInvoke},
+    token, Address, Bytes, Env, IntoVal,
     testutils::{Address as _, Deployer as _, Events as _, Ledger},
     token, Address, Bytes, Env, TryIntoVal,
 };
@@ -1046,6 +1048,106 @@ fn test_transfer_admin_emits_event() {
     let before = s.env.events().all().len();
     s.registry.transfer_admin(&s.admin, &new_admin);
     assert!(s.env.events().all().len() > before);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// transfer_admin — dual authorization
+//
+// `transfer_admin` calls both `require_admin` (which requires the *current*
+// admin's auth) and `new_admin.require_auth()`, so the role can never be
+// pushed onto an address that has not consented to take it. Every test above
+// runs under `setup()`'s `env.mock_all_auths()`, which satisfies every
+// `require_auth()` regardless of who "signed" — so it cannot distinguish a
+// working dual-auth check from a deleted one. These three tests deliberately
+// use `mock_auths` with an explicit, minimal authorization list instead, so
+// they actually exercise the guard. Do not "simplify" these to
+// `mock_all_auths()` — that would silently remove the only coverage of this
+// safety property.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_transfer_admin_fails_without_new_admin_auth() {
+    let s = setup();
+    let new_admin = Address::generate(&s.env);
+
+    // Authorize only the current admin. The incoming admin has not consented.
+    s.env.mock_auths(&[MockAuth {
+        address: &s.admin,
+        invoke: &MockAuthInvoke {
+            contract: &s.registry.address,
+            fn_name: "transfer_admin",
+            args: (s.admin.clone(), new_admin.clone()).into_val(&s.env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let result = s.registry.try_transfer_admin(&s.admin, &new_admin);
+    assert!(
+        result.is_err(),
+        "transfer must fail without the incoming admin's auth"
+    );
+    // The consequence that actually matters: admin is unchanged.
+    assert_eq!(s.registry.admin(), Some(s.admin.clone()));
+}
+
+#[test]
+fn test_transfer_admin_fails_without_current_admin_auth() {
+    let s = setup();
+    let new_admin = Address::generate(&s.env);
+
+    // Authorize only the incoming admin. The current admin did not sign.
+    s.env.mock_auths(&[MockAuth {
+        address: &new_admin,
+        invoke: &MockAuthInvoke {
+            contract: &s.registry.address,
+            fn_name: "transfer_admin",
+            args: (s.admin.clone(), new_admin.clone()).into_val(&s.env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let result = s.registry.try_transfer_admin(&s.admin, &new_admin);
+    assert!(
+        result.is_err(),
+        "transfer must fail without the current admin's auth"
+    );
+    assert_eq!(s.registry.admin(), Some(s.admin.clone()));
+}
+
+#[test]
+fn test_transfer_admin_succeeds_with_both_auths_explicit() {
+    let s = setup();
+    let new_admin = Address::generate(&s.env);
+
+    // Both required parties authorize explicitly (no mock_all_auths involved),
+    // proving the harness itself is capable of making the call succeed.
+    s.env.mock_auths(&[
+        MockAuth {
+            address: &s.admin,
+            invoke: &MockAuthInvoke {
+                contract: &s.registry.address,
+                fn_name: "transfer_admin",
+                args: (s.admin.clone(), new_admin.clone()).into_val(&s.env),
+                sub_invokes: &[],
+            },
+        },
+        MockAuth {
+            address: &new_admin,
+            invoke: &MockAuthInvoke {
+                contract: &s.registry.address,
+                fn_name: "transfer_admin",
+                args: (s.admin.clone(), new_admin.clone()).into_val(&s.env),
+                sub_invokes: &[],
+            },
+        },
+    ]);
+
+    let result = s.registry.try_transfer_admin(&s.admin, &new_admin);
+    assert!(
+        result.is_ok(),
+        "transfer must succeed when both parties explicitly authorize"
+    );
+    assert_eq!(s.registry.admin(), Some(new_admin));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
