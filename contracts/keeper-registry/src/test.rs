@@ -14,7 +14,7 @@
 
 use soroban_sdk::{
     testutils::{Address as _, Deployer as _, Events as _, Ledger},
-    token, Address, Bytes, Env,
+    token, Address, Bytes, Env, TryIntoVal,
 };
 
 use crate::{
@@ -603,6 +603,46 @@ fn test_get_fee_bps_matches_applied_fee_after_set_fee_bps() {
     let (expected_net, _) = split_reward(1_000_000i128, reported_fee_bps);
     assert_eq!(s.registry.keeper_balance(&keeper), expected_net);
     assert_eq!(reported_fee_bps, 750u32);
+}
+
+#[test]
+fn test_execute_task_emits_proof_in_event() {
+    let s = setup();
+    let keeper = Address::generate(&s.env);
+    let id = register_default_task(&s);
+    let proof = Bytes::from_slice(&s.env, b"keeper-proof:task:1:tx:deadbeef");
+
+    s.registry.claim_task(&keeper, &id);
+    s.registry.execute_task(&keeper, &id, &proof);
+
+    let (_contract, _topics, data) = s.env.events().all().last().unwrap();
+    let (event_task_id, event_keeper, event_net, event_proof): (u64, Address, i128, Bytes) =
+        data.try_into_val(&s.env).unwrap();
+
+    assert_eq!(event_task_id, id);
+    assert_eq!(event_keeper, keeper);
+    assert_eq!(event_net, 970_000i128);
+    assert_eq!(event_proof, proof);
+}
+
+#[test]
+fn test_execute_task_over_max_proof_len_fails() {
+    let s = setup();
+    let keeper = Address::generate(&s.env);
+    let id = register_default_task(&s);
+    s.registry.claim_task(&keeper, &id);
+
+    let oversized = Bytes::from_slice(&s.env, &[0u8; (crate::MAX_PROOF_LEN + 1) as usize]);
+    assert_eq!(
+        s.registry.try_execute_task(&keeper, &id, &oversized),
+        Err(Ok(KeeperError::ProofTooLarge))
+    );
+
+    // The task is untouched by the rejected call — still claimable/executable.
+    assert_eq!(s.registry.get_task(&id).status, TaskStatus::Claimed);
+    let at_limit = Bytes::from_slice(&s.env, &[0u8; crate::MAX_PROOF_LEN as usize]);
+    s.registry.execute_task(&keeper, &id, &at_limit);
+    assert_eq!(s.registry.get_task(&id).status, TaskStatus::Executed);
 }
 
 #[test]
