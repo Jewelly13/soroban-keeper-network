@@ -40,26 +40,12 @@ const {
   nativeToScVal,
   scValToNative,
   Contract,
+  StrKey,
 } = require("@stellar/stellar-sdk");
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Configuration — set via environment variables or .env file
 // ─────────────────────────────────────────────────────────────────────────────
-
-const CONFIG = {
-  network: process.env.NETWORK || "testnet",
-  secretKey: process.env.KEEPER_SECRET_KEY || "",
-  registryContractId: process.env.REGISTRY_CONTRACT_ID || "",
-  pollIntervalMs: parseInt(process.env.POLL_INTERVAL_MS || "10000", 10),
-  withdrawThreshold: BigInt(process.env.WITHDRAW_THRESHOLD || "10000000"), // 1 XLM in stroops
-  maxTasksPerRound: parseInt(process.env.MAX_TASKS_PER_ROUND || "5", 10),
-  maxRetries: parseInt(process.env.MAX_RETRIES || "3", 10),
-  retryBaseMs: parseInt(process.env.RETRY_BASE_MS || "500", 10),
-  // When true, the bot calls expire_task on past-deadline tasks as a courtesy
-  // so owners' escrow is refunded even if no keeper executed. This is a public
-  // good and costs only the transaction fee.
-  expireStaleTasks: (process.env.EXPIRE_STALE_TASKS || "true") === "true",
-};
 
 const NETWORK_CONFIG = {
   testnet: {
@@ -76,23 +62,117 @@ const NETWORK_CONFIG = {
   },
 };
 
+let CONFIG; // Initialized in main() after validation
+
 // ─────────────────────────────────────────────────────────────────────────────
-// Validate configuration
+// Configuration validation
 // ─────────────────────────────────────────────────────────────────────────────
 
-function validateConfig() {
-  if (!CONFIG.secretKey) {
-    console.error("❌  KEEPER_SECRET_KEY not set. Copy .env.example to .env and fill it in.");
-    process.exit(1);
+function fail(name, value, reason) {
+  let message = `❌  Invalid ${name}`;
+  if (value) {
+    message += `: ${value}`;
   }
-  if (!CONFIG.registryContractId) {
-    console.error("❌  REGISTRY_CONTRACT_ID not set.");
-    process.exit(1);
+  console.error(`${message} — ${reason}`);
+  process.exit(1);
+}
+
+function requireEnv(name, { parse, validate, secret = false, fallback }) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") {
+    if (fallback !== undefined) {
+      return fallback;
+    }
+    fail(name, raw, "must be set");
   }
-  if (!NETWORK_CONFIG[CONFIG.network]) {
-    console.error(`❌  Unknown NETWORK '${CONFIG.network}'. Use testnet, futurenet, or mainnet.`);
-    process.exit(1);
+  try {
+    const parsed = parse ? parse(raw) : raw;
+    if (validate && !validate.fn(parsed)) {
+      fail(name, secret ? null : raw, validate.reason);
+    }
+    return parsed;
+  } catch (e) {
+    fail(name, secret ? null : raw, e.message);
   }
+}
+
+async function validateAndLoadConfig() {
+  const network = requireEnv("NETWORK", {
+    validate: {
+      fn: (v) => Object.keys(NETWORK_CONFIG).includes(v),
+      reason: `must be one of: ${Object.keys(NETWORK_CONFIG).join(", ")}`,
+    },
+    fallback: "testnet",
+  });
+
+  const registryContractId = requireEnv("REGISTRY_CONTRACT_ID", {
+    validate: {
+      fn: StrKey.isValidContract,
+      reason: "must be a valid contract ID (starts with C...)",
+    },
+  });
+
+  const secretKey = requireEnv("KEEPER_SECRET_KEY", {
+    secret: true,
+    validate: {
+      fn: StrKey.isValidEd25519SecretSeed,
+      reason: "must be a valid secret key (starts with S...)",
+    },
+  });
+
+  // After validating the required string values, we can create the server
+  // connection and use it to validate the contract's existence on the network.
+  const { rpcUrl } = NETWORK_CONFIG[network];
+  const server = new SorobanRpc.Server(rpcUrl, { allowHttp: false });
+
+  try {
+    await server.getContractData(registryContractId);
+  } catch (e) {
+    if (e.response && e.response.status === 404) {
+      fail(
+        "REGISTRY_CONTRACT_ID",
+        registryContractId,
+        `not found on network ${network}. Please check the contract ID and NETWORK settings.`
+      );
+    }
+    // For other errors, we'll let the main connectivity check handle it.
+  }
+
+  // Now that all critical configs are validated, build the final CONFIG object.
+  CONFIG = {
+    network,
+    registryContractId,
+    secretKey,
+    pollIntervalMs: requireEnv("POLL_INTERVAL_MS", {
+      parse: (v) => parseInt(v, 10),
+      validate: { fn: (v) => v >= 1000, reason: "must be >= 1000" },
+      fallback: 10000,
+    }),
+    withdrawThreshold: requireEnv("WITHDRAW_THRESHOLD", {
+      parse: BigInt,
+      validate: { fn: (v) => v >= 0, reason: "must be a positive number" },
+      fallback: 10000000n,
+    }),
+    maxTasksPerRound: requireEnv("MAX_TASKS_PER_ROUND", {
+      parse: (v) => parseInt(v, 10),
+      validate: { fn: (v) => v >= 1, reason: "must be >= 1" },
+      fallback: 5,
+    }),
+    maxRetries: requireEnv("MAX_RETRIES", {
+      parse: (v) => parseInt(v, 10),
+      validate: { fn: (v) => v >= 0, reason: "must be >= 0" },
+      fallback: 3,
+    }),
+    retryBaseMs: requireEnv("RETRY_BASE_MS", {
+      parse: (v) => parseInt(v, 10),
+      validate: { fn: (v) => v > 0, reason: "must be > 0" },
+      fallback: 500,
+    }),
+    expireStaleTasks: requireEnv("EXPIRE_STALE_TASKS", {
+      parse: (v) => v.toLowerCase() === "true",
+      fallback: true,
+    }),
+  };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -352,7 +432,7 @@ async function keeperLoop(server, keypair, networkPassphrase, contractId) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function main() {
-  validateConfig();
+  await validateAndLoadConfig();
 
   const { rpcUrl, networkPassphrase } = NETWORK_CONFIG[CONFIG.network];
   const keypair = Keypair.fromSecret(CONFIG.secretKey);
