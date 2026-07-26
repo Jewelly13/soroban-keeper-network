@@ -993,6 +993,87 @@ fn test_sweep_by_non_admin_fails() {
     );
 }
 
+#[test]
+fn test_sweep_zero_amount_fails() {
+    let s = setup();
+    let _ = executed_task_keeper(&s); // 30_000 accrued
+    let treasury = Address::generate(&s.env);
+    assert_eq!(
+        s.registry.try_sweep_fees(&s.admin, &treasury, &0i128),
+        Err(Ok(KeeperError::InvalidReward))
+    );
+    assert_eq!(s.registry.fees_accrued(), 30_000i128);
+}
+
+#[test]
+fn test_sweep_negative_amount_fails() {
+    let s = setup();
+    let _ = executed_task_keeper(&s); // 30_000 accrued
+    let treasury = Address::generate(&s.env);
+    assert_eq!(
+        s.registry.try_sweep_fees(&s.admin, &treasury, &-1i128),
+        Err(Ok(KeeperError::InvalidReward))
+    );
+    assert_eq!(s.registry.fees_accrued(), 30_000i128);
+}
+
+#[test]
+fn test_sweep_with_nothing_accrued_fails() {
+    let s = setup();
+    // Fresh contract — no task has ever executed, so nothing is accrued.
+    let treasury = Address::generate(&s.env);
+    assert_eq!(s.registry.fees_accrued(), 0i128);
+    assert_eq!(
+        s.registry.try_sweep_fees(&s.admin, &treasury, &1i128),
+        Err(Ok(KeeperError::NoRewardsAvailable))
+    );
+}
+
+#[test]
+fn test_sweep_partial_sequence_conserves_remainder_and_leaves_other_balances_untouched() {
+    let s = setup();
+    let token = token::Client::new(&s.env, &s.token_id);
+    let treasury = Address::generate(&s.env);
+
+    // An unrelated open task and a credited keeper — the accumulator is the
+    // only thing sweep_fees is allowed to draw from, so neither should ever
+    // move as a result of sweeping.
+    let untouched_task_id = register_default_task(&s); // 1_000_000 escrowed
+    let keeper = executed_task_keeper(&s); // credits keeper 970_000, accrues 30_000 fee
+
+    assert_eq!(s.registry.fees_accrued(), 30_000i128);
+
+    // Three uneven partial sweeps summing to the full 30_000 accrued.
+    let parts = [12_000i128, 9_000i128, 9_000i128];
+    let mut swept_so_far = 0i128;
+    for &part in parts.iter() {
+        s.registry.sweep_fees(&s.admin, &treasury, &part);
+        swept_so_far += part;
+        assert_eq!(s.registry.fees_accrued(), 30_000i128 - swept_so_far);
+        assert_eq!(token.balance(&treasury), swept_so_far);
+    }
+    assert_eq!(s.registry.fees_accrued(), 0i128);
+
+    // Nothing left: a further sweep of 1 is rejected.
+    assert_eq!(
+        s.registry.try_sweep_fees(&s.admin, &treasury, &1i128),
+        Err(Ok(KeeperError::NoRewardsAvailable))
+    );
+
+    // The unrelated task's escrow and the keeper's credited balance are
+    // exactly as they were before any sweep — proving sweeping never dipped
+    // into either.
+    assert_eq!(
+        s.registry.get_task(&untouched_task_id).reward,
+        1_000_000i128
+    );
+    assert_eq!(
+        s.registry.get_task(&untouched_task_id).status,
+        TaskStatus::Pending
+    );
+    assert_eq!(s.registry.keeper_balance(&keeper), 970_000i128);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Admin controls: pause / set_fee_bps / transfer_admin / upgrade
 // ─────────────────────────────────────────────────────────────────────────────
