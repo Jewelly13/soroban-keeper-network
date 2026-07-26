@@ -405,12 +405,22 @@ fn accrue_fee(e: &Env, amount: i128) {
 /// True once a claimed task's exclusive lock window has elapsed, meaning any
 /// keeper may re-claim it. This is what prevents a keeper from claiming and then
 /// never executing: after `lock_ledgers`, the task is fair game again.
+///
+/// The boundary is inclusive: at `claim_ledger + lock_ledgers` exactly, the
+/// lock is already considered expired (`>=`, not `>`), so a re-claim is
+/// allowed in the same ledger the window ends.
 fn lock_expired(e: &Env, task: &Task) -> bool {
     match task.claim_ledger {
         Some(claimed_at) => {
             let unlock_at = claimed_at.saturating_add(task.lock_ledgers);
             e.ledger().sequence() >= unlock_at
         }
+        // Unreachable in practice: every path that sets `status = Claimed`
+        // (only `claim_task`) sets `claim_ledger` in the same write, so a
+        // `Claimed` task always has `Some(claim_ledger)`. Both callers of
+        // `lock_expired` only reach this branch after already matching on
+        // `TaskStatus::Claimed`. Treated as "no active lock" if it ever were
+        // reached, which is the safe default.
         None => true,
     }
 }
