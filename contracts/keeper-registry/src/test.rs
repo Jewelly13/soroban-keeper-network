@@ -524,6 +524,117 @@ fn test_reclaim_after_lock_window_elapses() {
     assert_eq!(s.registry.get_task(&id).claimer, Some(second));
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// lock_expired boundary — pins the exact ledger the lock lifts, per issue #33.
+// A small `lock_ledgers` (10) keeps the arithmetic easy to follow.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Registers a task with the given `lock_ledgers`, claims it as `keeper`, and
+/// returns `(task_id, unlock_at)` where `unlock_at = claim_ledger + lock_ledgers`
+/// — the first ledger sequence at which the lock is considered expired.
+fn claim_with_lock(s: &Setup, keeper: &Address, lock_ledgers: u32) -> (u64, u32) {
+    let deadline = s.env.ledger().timestamp() + 3_600;
+    let id = s.registry.register_task(
+        &s.admin,
+        &TaskType::Liquidation,
+        &calldata(&s.env),
+        &1_000_000i128,
+        &deadline,
+        &17_280u32,
+        &lock_ledgers,
+    );
+    s.registry.claim_task(keeper, &id);
+    let claim_ledger = s.registry.get_task(&id).claim_ledger.unwrap();
+    (id, claim_ledger + lock_ledgers)
+}
+
+/// Advances the ledger sequence to exactly `target` (timestamp untouched).
+fn goto_ledger(env: &Env, target: u32) {
+    let current = env.ledger().sequence();
+    advance(env, target - current, 0);
+}
+
+#[test]
+fn test_lock_boundary_unlock_at_minus_one_is_still_locked() {
+    let s = setup();
+    let first = Address::generate(&s.env);
+    let second = Address::generate(&s.env);
+    let (id, unlock_at) = claim_with_lock(&s, &first, 10u32);
+
+    goto_ledger(&s.env, unlock_at - 1);
+
+    assert!(!s.registry.is_claimable(&id));
+    assert_eq!(
+        s.registry.try_claim_task(&second, &id),
+        Err(Ok(KeeperError::LockPeriodActive))
+    );
+}
+
+#[test]
+fn test_lock_boundary_at_unlock_at_is_reclaimable() {
+    let s = setup();
+    let first = Address::generate(&s.env);
+    let second = Address::generate(&s.env);
+    let (id, unlock_at) = claim_with_lock(&s, &first, 10u32);
+
+    goto_ledger(&s.env, unlock_at);
+
+    // The `>=` in `lock_expired` makes the boundary inclusive: exactly at
+    // `unlock_at`, the lock has already lifted.
+    assert!(s.registry.is_claimable(&id));
+    s.registry.claim_task(&second, &id);
+    let task = s.registry.get_task(&id);
+    assert_eq!(task.claimer, Some(second));
+    assert_eq!(task.claim_ledger, Some(unlock_at));
+}
+
+#[test]
+fn test_lock_boundary_unlock_at_plus_one_is_reclaimable() {
+    let s = setup();
+    let first = Address::generate(&s.env);
+    let second = Address::generate(&s.env);
+    let (id, unlock_at) = claim_with_lock(&s, &first, 10u32);
+
+    goto_ledger(&s.env, unlock_at + 1);
+
+    assert!(s.registry.is_claimable(&id));
+    s.registry.claim_task(&second, &id);
+    assert_eq!(s.registry.get_task(&id).claimer, Some(second));
+}
+
+#[test]
+fn test_lock_window_extending_past_deadline_is_blocked_by_deadline_first() {
+    let s = setup();
+    let first = Address::generate(&s.env);
+    let second = Address::generate(&s.env);
+
+    // The lock window (1000 ledgers) would far outlive the 10-second deadline.
+    let deadline = s.env.ledger().timestamp() + 10;
+    let id = s.registry.register_task(
+        &s.admin,
+        &TaskType::Liquidation,
+        &calldata(&s.env),
+        &1_000_000i128,
+        &deadline,
+        &17_280u32,
+        &1_000u32,
+    );
+    s.registry.claim_task(&first, &id);
+
+    // Advance past the deadline but nowhere near the lock's unlock_at.
+    advance(&s.env, 1, 11);
+    assert!(s.env.ledger().timestamp() >= deadline);
+
+    // The deadline check runs before the lock check in both `claim_task` and
+    // `is_claimable`, so the takeover path is unreachable here: the failure
+    // is DeadlinePassed, never LockPeriodActive.
+    assert!(!s.registry.is_claimable(&id));
+    assert_eq!(
+        s.registry.try_claim_task(&second, &id),
+        Err(Ok(KeeperError::DeadlinePassed))
+    );
+}
+
 #[test]
 fn test_claim_past_deadline_fails() {
     let s = setup();
