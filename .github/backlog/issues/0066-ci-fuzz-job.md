@@ -1,6 +1,6 @@
 ---
 title: "chore(ci): wire a time-boxed fuzz run into PR CI, with a longer nightly job"
-labels: [ci, testing, intermediate]
+labels: [tooling, testing, intermediate]
 epic: E03
 wave: 2
 depends_on: [0051, 0052, 0053]

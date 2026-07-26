@@ -1,6 +1,6 @@
 ---
 title: "chore(ci): track CPU/memory resource cost per entry point over time"
-labels: [ci, testing, intermediate]
+labels: [tooling, testing, intermediate]
 epic: E05
 wave: 2
 depends_on: []
