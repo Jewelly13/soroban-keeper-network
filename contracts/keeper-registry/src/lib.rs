@@ -99,7 +99,8 @@ pub struct Task {
     /// Address that registered and funded this task.
     pub owner: Address,
     pub task_type: TaskType,
-    /// Arbitrary bytes the keeper uses to reconstruct the target call off-chain.
+    /// Arbitrary bytes the keeper uses to reconstruct the target call
+    /// off-chain. Bounded to [`MAX_CALLDATA_LEN`] at registration.
     pub calldata: Bytes,
     /// Reward escrowed in this contract (token units / XLM stroops).
     pub reward: i128,
@@ -142,9 +143,8 @@ pub enum KeeperError {
     NotTaskOwner = 11,
     NotTaskClaimer = 12,
     NoRewardsAvailable = 13,
-    // 14 is reserved for `ProofTooLarge`, added by a sibling in-flight PR
-    // (see #10 / execute_task proof bounding). Left as a gap rather than
-    // reused so the two branches don't collide on the same discriminant.
+    /// `proof` passed to `execute_task` exceeded `MAX_PROOF_LEN`.
+    ProofTooLarge = 14,
     /// A function requiring configured state (`initialize` must have been
     /// called) was invoked on a registry that isn't configured yet.
     NotInitialized = 15,
@@ -155,6 +155,11 @@ pub enum KeeperError {
     // 17 is reserved for `CalldataTooLarge`, added by a sibling in-flight PR
     // (see #13 / register_task calldata bounding). Left as a gap rather than
     // reused so the two branches don't collide on the same discriminant.
+    // 16 is reserved for `TtlTooShort`, added by a sibling in-flight PR (see
+    // #11 / register_task deadline-vs-TTL invariant). Left as a gap rather
+    // than reused so the two branches don't collide on the same discriminant.
+    /// `calldata` exceeds [`MAX_CALLDATA_LEN`].
+    CalldataTooLarge = 17,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -175,10 +180,16 @@ pub fn emit_task_claimed(e: &Env, task_id: u64, keeper: &Address) {
     );
 }
 
-pub fn emit_task_executed(e: &Env, task_id: u64, keeper: &Address, net_reward: i128) {
+pub fn emit_task_executed(
+    e: &Env,
+    task_id: u64,
+    keeper: &Address,
+    net_reward: i128,
+    proof: &Bytes,
+) {
     e.events().publish(
         (symbol_short!("exec"), symbol_short!("task")),
-        (task_id, keeper.clone(), net_reward),
+        (task_id, keeper.clone(), net_reward, proof.clone()),
     );
 }
 
@@ -435,12 +446,22 @@ fn accrue_fee(e: &Env, amount: i128) {
 /// True once a claimed task's exclusive lock window has elapsed, meaning any
 /// keeper may re-claim it. This is what prevents a keeper from claiming and then
 /// never executing: after `lock_ledgers`, the task is fair game again.
+///
+/// The boundary is inclusive: at `claim_ledger + lock_ledgers` exactly, the
+/// lock is already considered expired (`>=`, not `>`), so a re-claim is
+/// allowed in the same ledger the window ends.
 fn lock_expired(e: &Env, task: &Task) -> bool {
     match task.claim_ledger {
         Some(claimed_at) => {
             let unlock_at = claimed_at.saturating_add(task.lock_ledgers);
             e.ledger().sequence() >= unlock_at
         }
+        // Unreachable in practice: every path that sets `status = Claimed`
+        // (only `claim_task`) sets `claim_ledger` in the same write, so a
+        // `Claimed` task always has `Some(claim_ledger)`. Both callers of
+        // `lock_expired` only reach this branch after already matching on
+        // `TaskStatus::Claimed`. Treated as "no active lock" if it ever were
+        // reached, which is the safe default.
         None => true,
     }
 }
@@ -452,6 +473,23 @@ fn lock_expired(e: &Env, task: &Task) -> bool {
 /// Semantic version of the contract logic. Bumped on behavior changes so
 /// off-chain clients and indexers can detect which ABI they are talking to.
 pub const VERSION: u32 = 2;
+
+/// Maximum `calldata` length, in bytes. Sized to hold an encoded contract
+/// call — a target address, a function symbol, and a handful of scalar or
+/// address arguments (an XDR-encoded `Address` is ~40 bytes, a `Symbol` up to
+/// 32) — with headroom, without letting a task owner push storage and
+/// re-serialisation cost onto the keepers and passers-by who load and
+/// re-write this `Task` on every later lifecycle call (`claim_task`,
+/// `execute_task`, and the permissionless `expire_task`).
+pub const MAX_CALLDATA_LEN: u32 = 1024;
+
+/// Maximum length, in bytes, of the `proof` accepted by `execute_task`.
+/// Event data is charged against the paying keeper's transaction resource
+/// budget, so an unbounded proof would make execution arbitrarily expensive.
+/// 256 bytes comfortably fits a 32-byte tx hash or a small state witness —
+/// the two shapes of proof this MVP expects — while keeping the emitted
+/// event's cost bounded and predictable.
+pub const MAX_PROOF_LEN: u32 = 256;
 
 #[contract]
 pub struct KeeperRegistry;
@@ -502,7 +540,9 @@ impl KeeperRegistry {
     // Arguments:
     //   owner        — address funding the task (must auth)
     //   task_type    — classification (Liquidation, OraclePricePush, …)
-    //   calldata     — encoded params the keeper uses to build the target call
+    //   calldata     — encoded params the keeper uses to build the target
+    //                  call; capped at MAX_CALLDATA_LEN bytes, rejected with
+    //                  CalldataTooLarge otherwise
     //   reward       — XLM stroops escrowed as bounty
     //   deadline     — unix timestamp IN SECONDS after which the task expires
     //   ttl_ledgers  — how long to keep the storage entry alive, IN LEDGERS
@@ -538,6 +578,9 @@ impl KeeperRegistry {
         }
         if deadline <= e.ledger().timestamp() {
             return Err(KeeperError::DeadlinePassed);
+        }
+        if calldata.len() > MAX_CALLDATA_LEN {
+            return Err(KeeperError::CalldataTooLarge);
         }
 
         bump_instance(&e);
@@ -691,6 +734,13 @@ impl KeeperRegistry {
     // in the contract (later swept by admin via `sweep_fees`). The reward is
     // credited to an internal balance rather than transferred out here so the
     // keeper controls when it pays the withdrawal transfer cost.
+    //
+    // The proof is emitted in `TaskExecuted` (not just logged) so it is
+    // publicly recoverable off-chain — this MVP trusts the claimer to submit
+    // it (see README's Known Design Decisions), and that trade-off only holds
+    // if a keeper submitting garbage can be identified after the fact. Its
+    // size is bounded by `MAX_PROOF_LEN` since event data is charged against
+    // the paying keeper's transaction resource budget.
 
     pub fn execute_task(
         e: Env,
@@ -700,6 +750,10 @@ impl KeeperRegistry {
     ) -> Result<(), KeeperError> {
         require_not_paused(&e)?;
         keeper.require_auth();
+
+        if proof.len() > MAX_PROOF_LEN {
+            return Err(KeeperError::ProofTooLarge);
+        }
 
         let mut task = load_task(&e, task_id)?;
 
@@ -722,7 +776,7 @@ impl KeeperRegistry {
         task.status = TaskStatus::Executed;
         save_task(&e, task_id, &task);
 
-        emit_task_executed(&e, task_id, &keeper, keeper_net);
+        emit_task_executed(&e, task_id, &keeper, keeper_net, &proof);
         log!(
             &e,
             "Task {} executed by {} net={} proof_len={}",

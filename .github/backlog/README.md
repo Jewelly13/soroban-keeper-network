@@ -52,17 +52,32 @@ earlier work actually produced.
 | Wave | Issues | Theme | Status |
 |------|--------|-------|--------|
 | 1 | 0001–0050 | Correctness, spec alignment, and test gaps in the shipped MVP; keeper-bot fixes; contributor tooling | **Published** |
-| 2 | 0051–0150 | Execution verifier, batch operations, gas work, fuzzing and invariant testing | Planned |
+| 2 | 0051–0150 | Execution verifier, batch operations, gas work, fuzzing and invariant testing | Partially published (0051–0100) |
 | 3 | 0151–0300 | TypeScript SDK, Rust SDK, event indexer, keeper bot v2 | Planned |
 | 4 | 0301–0450 | Staking, slashing, reputation, treasury, governance | Planned |
 | 5 | 0451–0600 | Dashboard, CLI, observability, audit readiness, docs and ecosystem examples | Planned |
 
 "Planned" means the epic scope and issue count are fixed but the issue files
-are not written yet. Only wave 1 exists on disk today. Waves are written one at
-a time, deliberately: issues 0051 onward depend on decisions that wave 1 will
-settle — the TTL model, the proof-in-event shape, the branching workflow — and
-writing them before those land would produce issues that specify the wrong
-thing.
+are not written yet. Waves are written one at a time, deliberately: later
+issues depend on decisions earlier work settles, and writing them too early
+risks specifying against the wrong assumptions.
+
+Wave 2 issues 0051–0100 (all of E03 Fuzzing & Invariant Testing, all of E04
+On-chain Execution Verifier, and the first four of E05 Batch Operations & Gas)
+are now published. Issues 0101–0150 (the rest of E05) are still planned.
+
+**A caveat specific to this wave.** Several wave-1 PRs were still open and
+unmerged when 0051–0100 were written (see the CEI-ordering and instance-TTL
+work in issues 0002/0003/0015). Where a wave-2 issue references a wave-1
+function name, constant, or discriminant number, treat it as provisional —
+confirm against `main` at pickup time rather than trusting the issue text
+verbatim. This is the exact risk the "write one wave at a time" rule above
+exists to avoid; it was accepted here on the reasoning that E03/E04/E05 are
+additive surface (new modules, new optional fields) rather than edits to the
+contested code, so the risk of drift is lower than for a wave that touched
+`execute_task`'s or `cancel_task`'s existing bodies directly. If an issue
+turns out to specify against something that changed, correct the issue file
+in the same PR that picks it up rather than silently working around it.
 
 ---
 

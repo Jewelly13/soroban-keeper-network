@@ -20,6 +20,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#ttl--deadline-invariant).
 - Added `TtlTooShort` to `KeeperError`, which changes the contract's error
   ABI — `VERSION` bumped from 1 to 2.
+### Added — calldata size bound (VERSION bumped to 2)
+
+- `register_task` now rejects `calldata` larger than `MAX_CALLDATA_LEN`
+  (1024 bytes) with a new `CalldataTooLarge` error. Previously `calldata` was
+  unbounded, so a task owner could register a payload that every later
+  lifecycle call (`claim_task`, `execute_task`, the permissionless
+  `expire_task`) would have to re-read and re-write in full, pushing the
+  storage and re-serialisation cost onto keepers and passers-by rather than
+  the owner who chose the payload size.
+- Empty `calldata` is intentionally still accepted; documented in the README.
+- Adding `CalldataTooLarge` changes the contract's error ABI — `VERSION`
+  bumped from 1 to 2.
 
 ### Added — live testnet deployment
 
