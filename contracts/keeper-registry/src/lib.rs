@@ -798,18 +798,20 @@ impl KeeperRegistry {
             return Err(KeeperError::DeadlineNotPassed);
         }
 
+        let refund = task.reward;
+        let owner = task.owner.clone();
+
+        // Effects before interaction: a re-entrant call for the same task_id
+        // now sees status Expired and is rejected by the guard above, so the
+        // refund can never be paid twice out of the contract's pooled escrow.
         bump_instance(&e);
-        reward_token(&e)?.transfer(&e.current_contract_address(), &task.owner, &task.reward);
         task.status = TaskStatus::Expired;
         save_task(&e, task_id, &task);
 
+        reward_token(&e)?.transfer(&e.current_contract_address(), &owner, &refund);
+
         emit_task_expired(&e, task_id);
-        log!(
-            &e,
-            "Task {} expired, {} refunded to owner",
-            task_id,
-            task.reward
-        );
+        log!(&e, "Task {} expired, {} refunded to owner", task_id, refund);
         Ok(())
     }
 
