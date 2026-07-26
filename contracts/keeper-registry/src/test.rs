@@ -14,9 +14,7 @@
 
 use soroban_sdk::{
     testutils::{Address as _, Deployer as _, Events as _, Ledger, MockAuth, MockAuthInvoke},
-    token, Address, Bytes, Env, IntoVal,
-    testutils::{Address as _, Deployer as _, Events as _, Ledger},
-    token, Address, Bytes, Env, TryIntoVal,
+    token, Address, Bytes, Env, IntoVal, TryIntoVal,
 };
 
 use crate::{

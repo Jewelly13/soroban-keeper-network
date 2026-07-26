@@ -21,16 +21,13 @@
  *   # or: RUN_ONCE=true node index.js
  *
  * This example already includes:
+ *   - Comprehensive startup validation for all config settings
  *   - Retry with exponential back-off + jitter on transient RPC errors
  *   - Graceful shutdown (SIGINT/SIGTERM) that drains the in-flight round
  *   - Permissionless expiry of stale tasks to refund owners
  *   - Read-only views (`keeper_balance`, etc.) are evaluated via simulation
  *     through `readContract`, not submitted as signed transactions — see
  *     that function's doc comment for why this matters
- *   - Comprehensive startup validation for all config settings.
- *   - Retry with exponential back-off + jitter on transient RPC errors.
- *   - Graceful shutdown (SIGINT/SIGTERM) that drains the in-flight round.
- *   - Permissionless expiry of stale tasks to refund owners.
  *
  * Production keepers should additionally add:
  *   - Persistent task state DB (SQLite / Redis) to avoid double-claiming
@@ -447,6 +444,10 @@ async function keeperLoop(server, keypair, networkPassphrase, contractId) {
         summary.errors.push(err);
       }
     }
+  } catch (err) {
+    console.error(`❌  Keeper loop error: ${err.message}`);
+    summary.errors.push(err);
+  }
 
   // Check accumulated rewards and withdraw if above threshold. This is a
   // read-only view, so it goes through `readContract` (simulation only) and
@@ -472,7 +473,7 @@ async function keeperLoop(server, keypair, networkPassphrase, contractId) {
       console.log(`  ✅  Withdrawal complete!`);
     }
   } catch (err) {
-    console.error(`❌  Keeper loop error: ${err.message}`);
+    console.warn(`  ⚠️  Balance check failed: ${err.message}`);
     summary.errors.push(err);
   }
   return summary;
