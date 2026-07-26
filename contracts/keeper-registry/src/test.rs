@@ -21,7 +21,7 @@ use soroban_sdk::{
 
 use crate::{
     split_reward, DataKey, KeeperError, KeeperRegistry, KeeperRegistryClient, TaskStatus, TaskType,
-    INSTANCE_BUMP_LEDGERS, INSTANCE_BUMP_THRESHOLD,
+    INSTANCE_BUMP_LEDGERS, INSTANCE_BUMP_THRESHOLD, MAX_CALLDATA_LEN,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -185,7 +185,7 @@ fn test_split_reward_invariants() {
 #[test]
 fn test_version_is_exposed() {
     let s = setup();
-    assert_eq!(s.registry.version(), 1u32);
+    assert_eq!(s.registry.version(), 2u32);
 }
 
 #[test]
@@ -407,6 +407,95 @@ fn test_register_increments_task_counter() {
         assert_eq!(id, expected_id);
     }
     assert_eq!(registry.task_count(), 3u64);
+}
+
+#[test]
+fn test_register_task_with_max_calldata_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    token::StellarAssetClient::new(&env, &token_id).mint(&admin, &5_000_000i128);
+
+    let registry_id = env.register(KeeperRegistry, ());
+    let registry = KeeperRegistryClient::new(&env, &registry_id);
+    registry.initialize(&admin, &token_id, &300u32);
+
+    // Exactly at the cap — the largest accepted payload.
+    let max_calldata = Bytes::from_array(&env, &[0u8; MAX_CALLDATA_LEN as usize]);
+    let id = registry.register_task(
+        &admin,
+        &TaskType::Custom,
+        &max_calldata,
+        &1_000_000i128,
+        &(env.ledger().timestamp() + 3_600),
+        &17_280u32,
+        &120u32,
+    );
+    assert_eq!(registry.get_task(&id).calldata.len(), MAX_CALLDATA_LEN);
+}
+
+#[test]
+fn test_register_task_over_max_calldata_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let registry_id = env.register(KeeperRegistry, ());
+    let registry = KeeperRegistryClient::new(&env, &registry_id);
+    registry.initialize(&admin, &token_id, &300u32);
+
+    // One byte over the cap — the smallest rejected payload.
+    let oversized = Bytes::from_array(&env, &[0u8; MAX_CALLDATA_LEN as usize + 1]);
+    assert_eq!(
+        registry.try_register_task(
+            &admin,
+            &TaskType::Custom,
+            &oversized,
+            &1_000_000i128,
+            &(env.ledger().timestamp() + 3_600),
+            &17_280u32,
+            &120u32,
+        ),
+        Err(Ok(KeeperError::CalldataTooLarge))
+    );
+    assert_eq!(registry.task_count(), 0u64);
+}
+
+#[test]
+fn test_register_task_with_empty_calldata_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    token::StellarAssetClient::new(&env, &token_id).mint(&admin, &5_000_000i128);
+
+    let registry_id = env.register(KeeperRegistry, ());
+    let registry = KeeperRegistryClient::new(&env, &registry_id);
+    registry.initialize(&admin, &token_id, &300u32);
+
+    // Empty calldata is intentionally accepted: some task types (e.g. a
+    // TtlExtension on a well-known key) may need no extra encoded params.
+    let empty = Bytes::new(&env);
+    let id = registry.register_task(
+        &admin,
+        &TaskType::TtlExtension,
+        &empty,
+        &1_000_000i128,
+        &(env.ledger().timestamp() + 3_600),
+        &17_280u32,
+        &120u32,
+    );
+    assert_eq!(registry.get_task(&id).calldata.len(), 0);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

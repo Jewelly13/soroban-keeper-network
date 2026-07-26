@@ -211,6 +211,8 @@ A **shared, permissionless, on-chain coordination layer** where:
 - `register_task` MUST escrow the full reward amount from the caller.
 - Task ID MUST be monotonically increasing and globally unique.
 - `deadline` MUST be strictly in the future at registration time.
+- `calldata` MUST NOT exceed `MAX_CALLDATA_LEN` (1024 bytes), rejected with
+  `CalldataTooLarge` otherwise. Empty `calldata` is accepted.
 - `reward` MUST be greater than zero.
 - MUST emit `TaskRegistered` event with `(task_id, owner, reward, deadline)`.
 
@@ -296,6 +298,19 @@ A **shared, permissionless, on-chain coordination layer** where:
 | `RewardToken` | `Address` | Instance | Instance lifetime | — |
 | `Task(u64)` | `Task` struct | Persistent | `task.ttl_ledgers` | — |
 | `KeeperReward(Address)` | `i128` | Persistent | ~1 year (6.3M ledgers) | `0` |
+
+`Task.calldata` is capped at `MAX_CALLDATA_LEN` = 1024 bytes, enforced at
+`register_task`. `save_task` re-writes the whole `Task` struct (including
+`calldata`) on every lifecycle mutation — `claim_task`, `execute_task`, the
+permissionless `expire_task`, `increase_reward`, `extend_deadline` — and those
+calls are frequently made by a keeper or third party, not the task owner. An
+unbounded `calldata` would let an owner push arbitrarily large re-serialisation
+and storage cost onto whoever touches the task next. 1024 bytes comfortably
+covers a realistic encoded contract call — a target `Address` (~40 bytes XDR),
+a function `Symbol` (up to 32 bytes), and several scalar or address arguments —
+with headroom for XDR/Vec overhead. Empty `calldata` is accepted, since some
+task types (e.g. a `TtlExtension` against a well-known key) need no extra
+encoded parameters.
 
 #### Events
 
