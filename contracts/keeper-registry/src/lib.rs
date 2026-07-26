@@ -136,9 +136,8 @@ pub enum KeeperError {
     NotTaskOwner = 11,
     NotTaskClaimer = 12,
     NoRewardsAvailable = 13,
-    // 14 is reserved for `ProofTooLarge`, added by a sibling in-flight PR
-    // (see #10 / execute_task proof bounding). Left as a gap rather than
-    // reused so the two branches don't collide on the same discriminant.
+    /// `proof` passed to `execute_task` exceeded `MAX_PROOF_LEN`.
+    ProofTooLarge = 14,
     /// A function requiring configured state (`initialize` must have been
     /// called) was invoked on a registry that isn't configured yet.
     NotInitialized = 15,
@@ -162,10 +161,16 @@ pub fn emit_task_claimed(e: &Env, task_id: u64, keeper: &Address) {
     );
 }
 
-pub fn emit_task_executed(e: &Env, task_id: u64, keeper: &Address, net_reward: i128) {
+pub fn emit_task_executed(
+    e: &Env,
+    task_id: u64,
+    keeper: &Address,
+    net_reward: i128,
+    proof: &Bytes,
+) {
     e.events().publish(
         (symbol_short!("exec"), symbol_short!("task")),
-        (task_id, keeper.clone(), net_reward),
+        (task_id, keeper.clone(), net_reward, proof.clone()),
     );
 }
 
@@ -418,6 +423,14 @@ fn lock_expired(e: &Env, task: &Task) -> bool {
 /// off-chain clients and indexers can detect which ABI they are talking to.
 pub const VERSION: u32 = 1;
 
+/// Maximum length, in bytes, of the `proof` accepted by `execute_task`.
+/// Event data is charged against the paying keeper's transaction resource
+/// budget, so an unbounded proof would make execution arbitrarily expensive.
+/// 256 bytes comfortably fits a 32-byte tx hash or a small state witness —
+/// the two shapes of proof this MVP expects — while keeping the emitted
+/// event's cost bounded and predictable.
+pub const MAX_PROOF_LEN: u32 = 256;
+
 #[contract]
 pub struct KeeperRegistry;
 
@@ -646,6 +659,13 @@ impl KeeperRegistry {
     // in the contract (later swept by admin via `sweep_fees`). The reward is
     // credited to an internal balance rather than transferred out here so the
     // keeper controls when it pays the withdrawal transfer cost.
+    //
+    // The proof is emitted in `TaskExecuted` (not just logged) so it is
+    // publicly recoverable off-chain — this MVP trusts the claimer to submit
+    // it (see README's Known Design Decisions), and that trade-off only holds
+    // if a keeper submitting garbage can be identified after the fact. Its
+    // size is bounded by `MAX_PROOF_LEN` since event data is charged against
+    // the paying keeper's transaction resource budget.
 
     pub fn execute_task(
         e: Env,
@@ -655,6 +675,10 @@ impl KeeperRegistry {
     ) -> Result<(), KeeperError> {
         require_not_paused(&e)?;
         keeper.require_auth();
+
+        if proof.len() > MAX_PROOF_LEN {
+            return Err(KeeperError::ProofTooLarge);
+        }
 
         let mut task = load_task(&e, task_id)?;
 
@@ -677,7 +701,7 @@ impl KeeperRegistry {
         task.status = TaskStatus::Executed;
         save_task(&e, task_id, &task);
 
-        emit_task_executed(&e, task_id, &keeper, keeper_net);
+        emit_task_executed(&e, task_id, &keeper, keeper_net, &proof);
         log!(
             &e,
             "Task {} executed by {} net={} proof_len={}",
