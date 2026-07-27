@@ -308,6 +308,35 @@ cargo watch -x "test --all --features testutils"
 - Use `Env::default()` + `env.mock_all_auths()` for simplicity in unit tests.
 - Use real auth flows when testing auth-specific paths.
 
+### Coverage
+
+CI runs `cargo-llvm-cov` as an **advisory** job (`Coverage (advisory)` in
+`.github/workflows/ci.yml`) — it reports a number in the job summary but
+never blocks a PR. There is no coverage threshold and none is planned; use
+the report to spot untested branches, not to chase a percentage.
+
+To run it locally:
+
+```bash
+# One-time install
+cargo install cargo-llvm-cov --locked
+rustup component add llvm-tools-preview
+
+# Browsable HTML report (writes to target/llvm-cov/html/index.html)
+cargo llvm-cov --workspace --html
+
+# Quick text summary
+cargo llvm-cov --workspace --summary-only
+
+# Or, equivalent to the HTML command above:
+make coverage
+```
+
+`src/test.rs` is excluded from the report (`--ignore-filename-regex
+'test\.rs$'`) — it's the test module itself, so counting it inflates the
+number without saying anything about how well the contract code in `lib.rs`
+is actually exercised.
+
 ---
 
 ## PR Template & Review Process
