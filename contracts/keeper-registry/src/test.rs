@@ -13,8 +13,9 @@
 #![cfg(test)]
 
 use soroban_sdk::{
+    symbol_short,
     testutils::{Address as _, Deployer as _, Events as _, Ledger, MockAuth, MockAuthInvoke},
-    token, Address, Bytes, Env, IntoVal, TryIntoVal,
+    token, Address, Bytes, Env, IntoVal, Symbol, TryIntoVal,
 };
 
 use crate::{
@@ -69,12 +70,19 @@ fn calldata(env: &Env) -> Bytes {
 
 /// Registers a standard 1-hour task funded by `admin` and returns its id.
 fn register_default_task(s: &Setup) -> u64 {
+    register_reward_task(s, 1_000_000i128)
+}
+
+/// Same as `register_default_task` but with a caller-chosen reward, so tests
+/// can exercise several distinct amounts (e.g. non-round fee splits) without
+/// duplicating the register_task call boilerplate.
+fn register_reward_task(s: &Setup, reward: i128) -> u64 {
     let deadline = s.env.ledger().timestamp() + 3_600;
     s.registry.register_task(
         &s.admin,
         &TaskType::Liquidation,
         &calldata(&s.env),
-        &1_000_000i128,
+        &reward,
         &deadline,
         &17_280u32,
         &120u32,
@@ -1162,6 +1170,116 @@ fn test_withdraw_transfers_balance_and_zeroes_it() {
     assert_eq!(withdrawn, 970_000i128);
     assert_eq!(token.balance(&keeper), 970_000i128);
     assert_eq!(s.registry.keeper_balance(&keeper), 0i128);
+}
+
+/// The design credits keepers to an internal balance so they can execute
+/// many tasks and pay one withdrawal fee. `test_withdraw_transfers_balance_and_zeroes_it`
+/// only proves this for a single credit; this test drives multiple credits
+/// per keeper (three for keeper1, two for keeper2, interleaved) and checks
+/// the running balance after every single one — a regression that overwrote
+/// instead of accumulated (`set` instead of `checked_add`) would fail on the
+/// very first assertion after a second credit.
+#[test]
+fn test_keeper_balance_accumulates_across_tasks_and_withdraws_as_one_sum() {
+    let s = setup();
+    let token = token::Client::new(&s.env, &s.token_id);
+    let fee_bps = s.registry.get_fee_bps();
+
+    let keeper1 = Address::generate(&s.env);
+    let keeper2 = Address::generate(&s.env);
+
+    // Rewards deliberately chosen so `reward * fee_bps / 10_000` does not
+    // divide evenly (default fee_bps = 300 / 3%) — the running sum has to
+    // exercise split_reward's truncating division, not just clean multiples.
+    let keeper1_rewards = [850_003i128, 623_777i128, 1_234_567i128];
+    let keeper2_rewards = [111_113i128, 777_779i128];
+
+    let mut keeper1_balance = 0i128;
+    let mut keeper2_balance = 0i128;
+    let mut expected_fees = 0i128;
+
+    // Interleave keeper2's tasks between keeper1's so that DataKey::KeeperReward
+    // keys colliding between the two addresses would show up as
+    // cross-contamination of the running balances, not be hidden by ordering.
+    for (i, &reward1) in keeper1_rewards.iter().enumerate() {
+        let id1 = register_reward_task(&s, reward1);
+        s.registry.claim_task(&keeper1, &id1);
+        s.registry
+            .execute_task(&keeper1, &id1, &Bytes::from_slice(&s.env, b"proof"));
+
+        let (net1, fee1) = split_reward(reward1, fee_bps);
+        keeper1_balance += net1;
+        expected_fees += fee1;
+
+        // Asserting after each step localises a failure to the exact
+        // execution that broke accumulation.
+        assert_eq!(s.registry.keeper_balance(&keeper1), keeper1_balance);
+        assert_eq!(s.registry.keeper_balance(&keeper2), keeper2_balance);
+
+        if let Some(&reward2) = keeper2_rewards.get(i) {
+            let id2 = register_reward_task(&s, reward2);
+            s.registry.claim_task(&keeper2, &id2);
+            s.registry
+                .execute_task(&keeper2, &id2, &Bytes::from_slice(&s.env, b"proof"));
+
+            let (net2, fee2) = split_reward(reward2, fee_bps);
+            keeper2_balance += net2;
+            expected_fees += fee2;
+
+            assert_eq!(s.registry.keeper_balance(&keeper2), keeper2_balance);
+            assert_eq!(s.registry.keeper_balance(&keeper1), keeper1_balance);
+        }
+    }
+
+    // Sanity: the chosen rewards actually produced non-round fee splits.
+    assert!(keeper1_rewards
+        .iter()
+        .any(|&r| r.checked_mul(fee_bps as i128).unwrap() % 10_000 != 0));
+
+    assert_eq!(s.registry.fees_accrued(), expected_fees);
+
+    // A single withdrawal transfers the full accumulated sum and zeroes the
+    // balance.
+    assert_eq!(token.balance(&keeper1), 0i128);
+    let withdrawn = s.registry.withdraw_rewards(&keeper1);
+
+    // Inspect events from this call *before* making any further contract
+    // calls — `events().all()` reflects only the most recent top-level
+    // invocation, and even read-only views (like the balance checks below)
+    // would reset it.
+    //
+    // Exactly one RewardsWithdrawn event was emitted, carrying the total —
+    // not one per credited task, and not the token contract's own transfer
+    // event (which carries a different topic pair).
+    let mut withdraw_event_count = 0u32;
+    let mut withdraw_event_amount = 0i128;
+    for (contract, topics, data) in s.env.events().all().iter() {
+        if contract != s.registry.address {
+            continue;
+        }
+        let t0: Option<Symbol> = topics.get(0).and_then(|v| v.try_into_val(&s.env).ok());
+        let t1: Option<Symbol> = topics.get(1).and_then(|v| v.try_into_val(&s.env).ok());
+        if topics.len() == 2
+            && t0 == Some(symbol_short!("wdraw"))
+            && t1 == Some(symbol_short!("reward"))
+        {
+            withdraw_event_count += 1;
+            let (event_keeper, amount): (Address, i128) = data.try_into_val(&s.env).unwrap();
+            assert_eq!(event_keeper, keeper1);
+            withdraw_event_amount = amount;
+        }
+    }
+    assert_eq!(withdraw_event_count, 1);
+    assert_eq!(withdraw_event_amount, keeper1_balance);
+
+    assert_eq!(withdrawn, keeper1_balance);
+    assert_eq!(token.balance(&keeper1), keeper1_balance);
+    assert_eq!(s.registry.keeper_balance(&keeper1), 0i128);
+
+    // keeper2's balance stayed independent — untouched by keeper1's
+    // accumulation, withdrawal, or the KeeperReward key derivation.
+    assert_eq!(s.registry.keeper_balance(&keeper2), keeper2_balance);
+    assert_eq!(token.balance(&keeper2), 0i128);
 }
 
 #[test]
