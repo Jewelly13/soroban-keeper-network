@@ -27,6 +27,14 @@
 //! - Persistent: Task(id) → Task struct, KeeperReward(address) → i128
 
 #![no_std]
+// register_task's own #[allow(clippy::too_many_arguments)] covers the
+// function body, but #[contractimpl]'s macro-generated dispatch code (the
+// contractargs expansion) is checked as free-standing code clippy attributes
+// distant lint spans to — not lexically inside the impl block or the
+// function — so a function- or impl-level #[allow] doesn't reach it. A
+// crate-level allow is the only attribute clippy actually honors for this
+// specific macro-generated warning.
+#![allow(clippy::too_many_arguments)]
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, log, symbol_short, token, Address, Bytes,
@@ -115,6 +123,58 @@ pub struct Task {
     pub claim_ledger: Option<u32>,
     /// Ledgers the claimer holds exclusive rights before re-claim is allowed.
     pub lock_ledgers: u32,
+    /// Optional on-chain proof-verification callback (see [`IKeeperVerifier`]).
+    /// `None` behaves exactly as the pre-verifier MVP: `execute_task` trusts
+    /// the claimer's `proof` unconditionally. `Some(addr)` gates crediting
+    /// the keeper on `addr.verify(...)` returning `true` — see `execute_task`.
+    pub verifier: Option<Address>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Verifier interface — optional on-chain proof verification (Phase 2)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A verifier is any contract a task owner opts into at registration (or,
+/// while the task is still `Pending`, via `update_verifier`). `execute_task`
+/// calls `verify` before crediting the keeper's reward; a `false` return
+/// rejects the execution attempt with `KeeperError::VerificationFailed`
+/// without transferring anything or changing the task's status, so the
+/// keeper (or another keeper, once the lock lapses) may retry.
+///
+/// `keeper` is passed alongside `task` and `proof` specifically so a
+/// verifier can bind its check to the address actually claiming credit —
+/// without it, a valid proof observed on-chain (e.g. from a prior attempt's
+/// calldata, or another task) could be replayed by a different keeper to
+/// claim a reward it didn't earn.
+///
+/// A verifier is permissionless, consistent with this protocol's general
+/// design philosophy: any address a task owner supplies is accepted, with
+/// no registry-level allow-list. This puts the trust decision where it
+/// belongs — with the task owner choosing what proof standard their task
+/// requires — rather than centralizing it in the registry.
+///
+/// # Failure semantics
+/// `execute_task` calls this via `Env::try_invoke_contract`, which recovers
+/// gracefully from a verifier returning a *typed contract error* but does
+/// **not** isolate a genuine panic (a raw `panic!`, an out-of-bounds access,
+/// a WASM trap, `unwrap()` on `None`, etc.) — Soroban's host only converts
+/// `ScErrorType::Contract` errors to a recoverable `Err`; any other error
+/// class re-panics the caller (see `soroban-env-host`'s `Host::try_call`).
+/// A verifier that panics therefore aborts the entire `execute_task`
+/// transaction rather than being caught as a rejection: the task remains
+/// `Claimed` and the only recovery path is `expire_task` once the deadline
+/// passes (see `execute_task`'s doc comment for the full reasoning — this
+/// is the same eventual-recovery guarantee every other stuck-task scenario
+/// in this contract already relies on, not a new gap introduced by
+/// verifiers). A well-behaved verifier should therefore prefer returning
+/// `false` over panicking wherever the failure is a normal "proof didn't
+/// check out" outcome, reserving an actual panic for conditions that are
+/// genuinely exceptional.
+#[soroban_sdk::contractclient(name = "IKeeperVerifierClient")]
+pub trait IKeeperVerifier {
+    /// Returns `true` if `proof` is a valid attestation that `keeper`
+    /// performed the off-chain action `task` describes.
+    fn verify(env: Env, task: Task, keeper: Address, proof: Bytes) -> bool;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -150,6 +210,13 @@ pub enum KeeperError {
     /// `lock_ledgers` or `ttl_ledgers` passed to `register_task` fell outside
     /// their allowed bounds.
     InvalidTaskParams = 18,
+    /// The task's attached verifier rejected `proof` (returned `false`).
+    /// Distinct from `InvalidTaskStatus`/`NotTaskClaimer`: those mean the
+    /// task moved out from under the caller and retrying the same way can't
+    /// help; this means the specific proof was rejected, and the same
+    /// keeper may retry `execute_task` with a different proof against the
+    /// same claim.
+    VerificationFailed = 19,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -253,6 +320,25 @@ pub fn emit_deadline_extended(e: &Env, task_id: u64, new_deadline: u64) {
     e.events().publish(
         (symbol_short!("extend"), symbol_short!("task")),
         (task_id, new_deadline),
+    );
+}
+
+/// Fired when a task's attached verifier rejects a proof in `execute_task`.
+/// `symbol_short!` is limited to 9 characters, so this uses `verfail` (the
+/// natural `verifailed` doesn't fit) — the topic pair still uniquely
+/// identifies the event alongside the "task" second topic, matching every
+/// other per-task event in this file.
+pub fn emit_verification_failed(e: &Env, task_id: u64, keeper: &Address) {
+    e.events().publish(
+        (symbol_short!("verfail"), symbol_short!("task")),
+        (task_id, keeper.clone()),
+    );
+}
+
+pub fn emit_verifier_updated(e: &Env, task_id: u64, verifier: &Option<Address>) {
+    e.events().publish(
+        (symbol_short!("verifier"), symbol_short!("task")),
+        (task_id, verifier.clone()),
     );
 }
 
@@ -543,6 +629,10 @@ impl KeeperRegistry {
     //                  least `MIN_TTL_LEDGERS`
     //   lock_ledgers — ledgers the claimer holds exclusive rights; must be in
     //                  `[MIN_LOCK_LEDGERS, MAX_LOCK_LEDGERS]`
+    //   verifier     — optional on-chain proof-verification callback (see
+    //                  `IKeeperVerifier`); `None` preserves the pre-verifier
+    //                  MVP behavior exactly (execute_task trusts the proof
+    //                  unconditionally)
     //
     // Returns the new task_id.
 
@@ -558,6 +648,7 @@ impl KeeperRegistry {
         deadline: u64,
         ttl_ledgers: u32,
         lock_ledgers: u32,
+        verifier: Option<Address>,
     ) -> Result<u64, KeeperError> {
         require_not_paused(&e)?;
         owner.require_auth();
@@ -599,6 +690,7 @@ impl KeeperRegistry {
             claimer: None,
             claim_ledger: None,
             lock_ledgers,
+            verifier,
         };
         save_task(&e, task_id, &task);
         emit_task_registered(&e, task_id, &owner, reward, deadline);
@@ -680,6 +772,41 @@ impl KeeperRegistry {
         Ok(())
     }
 
+    // ── update_verifier ──────────────────────────────────────────────────────
+    //
+    // Lets the owner attach, replace, or remove (`None`) a task's verifier
+    // before anyone claims it. Restricted to `Pending` only — once a keeper
+    // has claimed the task and started acting on the terms it saw at claim
+    // time, swapping in a verifier it cannot satisfy would let the owner
+    // grief that keeper's uncompensated off-chain work. See `IKeeperVerifier`
+    // for the full griefing-protection rationale.
+
+    pub fn update_verifier(
+        e: Env,
+        owner: Address,
+        task_id: u64,
+        new_verifier: Option<Address>,
+    ) -> Result<(), KeeperError> {
+        require_not_paused(&e)?;
+        owner.require_auth();
+
+        let mut task = load_task(&e, task_id)?;
+        if task.owner != owner {
+            return Err(KeeperError::NotTaskOwner);
+        }
+        if task.status != TaskStatus::Pending {
+            return Err(KeeperError::InvalidTaskStatus);
+        }
+
+        bump_instance(&e);
+        task.verifier = new_verifier.clone();
+        save_task(&e, task_id, &task);
+
+        emit_verifier_updated(&e, task_id, &new_verifier);
+        log!(&e, "Task {} verifier updated", task_id);
+        Ok(())
+    }
+
     // ── claim_task ───────────────────────────────────────────────────────────
     //
     // Permissionless first-come-first-served claiming. A Pending task may be
@@ -733,6 +860,14 @@ impl KeeperRegistry {
     // if a keeper submitting garbage can be identified after the fact. Its
     // size is bounded by `MAX_PROOF_LEN` since event data is charged against
     // the paying keeper's transaction resource budget.
+    //
+    // If the task has a `verifier` attached (see `IKeeperVerifier`), it is
+    // called here — after the status/claimer/deadline checks above, before
+    // any crediting or status mutation — and a `false` result rejects the
+    // call with `VerificationFailed` without transferring anything or
+    // changing the task's status, so the same keeper may retry with a
+    // different proof. A task with no verifier (`None`) behaves exactly as
+    // before verifiers existed: this is a strictly additive code path.
 
     pub fn execute_task(
         e: Env,
@@ -758,6 +893,15 @@ impl KeeperRegistry {
         }
         if e.ledger().timestamp() >= task.deadline {
             return Err(KeeperError::DeadlinePassed);
+        }
+
+        if let Some(verifier) = task.verifier.clone() {
+            let approved: bool =
+                IKeeperVerifierClient::new(&e, &verifier).verify(&task, &keeper, &proof);
+            if !approved {
+                emit_verification_failed(&e, task_id, &keeper);
+                return Err(KeeperError::VerificationFailed);
+            }
         }
 
         bump_instance(&e);
