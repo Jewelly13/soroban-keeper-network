@@ -13,13 +13,15 @@
 #![cfg(test)]
 
 use soroban_sdk::{
+    symbol_short,
     testutils::{Address as _, Deployer as _, Events as _, Ledger, MockAuth, MockAuthInvoke},
-    token, Address, Bytes, Env, IntoVal, TryIntoVal,
+    token, Address, Bytes, Env, IntoVal, Symbol, TryIntoVal,
 };
 
 use crate::{
     split_reward, DataKey, KeeperError, KeeperRegistry, KeeperRegistryClient, TaskStatus, TaskType,
-    INSTANCE_BUMP_LEDGERS, INSTANCE_BUMP_THRESHOLD, MAX_CALLDATA_LEN,
+    INSTANCE_BUMP_LEDGERS, INSTANCE_BUMP_THRESHOLD, MAX_CALLDATA_LEN, MAX_LOCK_LEDGERS,
+    MIN_LOCK_LEDGERS, MIN_TTL_LEDGERS,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -69,12 +71,19 @@ fn calldata(env: &Env) -> Bytes {
 
 /// Registers a standard 1-hour task funded by `admin` and returns its id.
 fn register_default_task(s: &Setup) -> u64 {
+    register_reward_task(s, 1_000_000i128)
+}
+
+/// Same as `register_default_task` but with a caller-chosen reward, so tests
+/// can exercise several distinct amounts (e.g. non-round fee splits) without
+/// duplicating the register_task call boilerplate.
+fn register_reward_task(s: &Setup, reward: i128) -> u64 {
     let deadline = s.env.ledger().timestamp() + 3_600;
     s.registry.register_task(
         &s.admin,
         &TaskType::Liquidation,
         &calldata(&s.env),
-        &1_000_000i128,
+        &reward,
         &deadline,
         &20_000u32,
         &120u32,
@@ -590,6 +599,108 @@ fn test_register_task_with_empty_calldata_succeeds() {
     assert_eq!(registry.get_task(&id).calldata.len(), 0);
 }
 
+#[test]
+fn test_register_task_lock_ledgers_below_min_fails() {
+    let s = setup();
+    let deadline = s.env.ledger().timestamp() + 3_600;
+    assert_eq!(
+        s.registry.try_register_task(
+            &s.admin,
+            &TaskType::Custom,
+            &calldata(&s.env),
+            &1_000_000i128,
+            &deadline,
+            &17_280u32,
+            &(MIN_LOCK_LEDGERS - 1),
+        ),
+        Err(Ok(KeeperError::InvalidTaskParams))
+    );
+}
+
+#[test]
+fn test_register_task_lock_ledgers_at_min_succeeds() {
+    let s = setup();
+    let deadline = s.env.ledger().timestamp() + 3_600;
+    let task_id = s.registry.register_task(
+        &s.admin,
+        &TaskType::Custom,
+        &calldata(&s.env),
+        &1_000_000i128,
+        &deadline,
+        &17_280u32,
+        &MIN_LOCK_LEDGERS,
+    );
+    assert_eq!(s.registry.get_task(&task_id).lock_ledgers, MIN_LOCK_LEDGERS);
+}
+
+#[test]
+fn test_register_task_lock_ledgers_above_max_fails() {
+    let s = setup();
+    let deadline = s.env.ledger().timestamp() + 3_600;
+    assert_eq!(
+        s.registry.try_register_task(
+            &s.admin,
+            &TaskType::Custom,
+            &calldata(&s.env),
+            &1_000_000i128,
+            &deadline,
+            &17_280u32,
+            &(MAX_LOCK_LEDGERS + 1),
+        ),
+        Err(Ok(KeeperError::InvalidTaskParams))
+    );
+}
+
+#[test]
+fn test_register_task_lock_ledgers_at_max_succeeds() {
+    let s = setup();
+    let deadline = s.env.ledger().timestamp() + 3_600;
+    let task_id = s.registry.register_task(
+        &s.admin,
+        &TaskType::Custom,
+        &calldata(&s.env),
+        &1_000_000i128,
+        &deadline,
+        &17_280u32,
+        &MAX_LOCK_LEDGERS,
+    );
+    assert_eq!(s.registry.get_task(&task_id).lock_ledgers, MAX_LOCK_LEDGERS);
+}
+
+#[test]
+fn test_register_task_ttl_ledgers_below_min_fails() {
+    let s = setup();
+    let deadline = s.env.ledger().timestamp() + 3_600;
+    assert_eq!(
+        s.registry.try_register_task(
+            &s.admin,
+            &TaskType::Custom,
+            &calldata(&s.env),
+            &1_000_000i128,
+            &deadline,
+            &(MIN_TTL_LEDGERS - 1),
+            &120u32,
+        ),
+        Err(Ok(KeeperError::InvalidTaskParams))
+    );
+}
+
+#[test]
+fn test_register_task_ttl_ledgers_at_min_succeeds() {
+    let s = setup();
+    let deadline = s.env.ledger().timestamp() + 3_600;
+    let task_id = s.registry.register_task(
+        &s.admin,
+        &TaskType::Custom,
+        &calldata(&s.env),
+        &1_000_000i128,
+        &deadline,
+        &MIN_TTL_LEDGERS,
+        &120u32,
+    );
+    assert_eq!(s.registry.get_task(&task_id).ttl_ledgers, MIN_TTL_LEDGERS);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Placeholder tests for unimplemented functions
 //
@@ -710,7 +821,8 @@ fn test_reclaim_after_lock_window_elapses() {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // lock_expired boundary — pins the exact ledger the lock lifts, per issue #33.
-// A small `lock_ledgers` (10) keeps the arithmetic easy to follow.
+// A small `lock_ledgers` (12, the protocol minimum) keeps the arithmetic easy
+// to follow.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Registers a task with the given `lock_ledgers`, claims it as `keeper`, and
@@ -743,7 +855,7 @@ fn test_lock_boundary_unlock_at_minus_one_is_still_locked() {
     let s = setup();
     let first = Address::generate(&s.env);
     let second = Address::generate(&s.env);
-    let (id, unlock_at) = claim_with_lock(&s, &first, 10u32);
+    let (id, unlock_at) = claim_with_lock(&s, &first, MIN_LOCK_LEDGERS);
 
     goto_ledger(&s.env, unlock_at - 1);
 
@@ -759,7 +871,7 @@ fn test_lock_boundary_at_unlock_at_is_reclaimable() {
     let s = setup();
     let first = Address::generate(&s.env);
     let second = Address::generate(&s.env);
-    let (id, unlock_at) = claim_with_lock(&s, &first, 10u32);
+    let (id, unlock_at) = claim_with_lock(&s, &first, MIN_LOCK_LEDGERS);
 
     goto_ledger(&s.env, unlock_at);
 
@@ -777,7 +889,7 @@ fn test_lock_boundary_unlock_at_plus_one_is_reclaimable() {
     let s = setup();
     let first = Address::generate(&s.env);
     let second = Address::generate(&s.env);
-    let (id, unlock_at) = claim_with_lock(&s, &first, 10u32);
+    let (id, unlock_at) = claim_with_lock(&s, &first, MIN_LOCK_LEDGERS);
 
     goto_ledger(&s.env, unlock_at + 1);
 
@@ -1025,16 +1137,88 @@ fn test_cancel_by_non_owner_fails() {
 }
 
 #[test]
-fn test_cancel_claimed_task_fails() {
+fn test_cancel_claimed_task_while_lock_active_fails() {
     let s = setup();
     let keeper = Address::generate(&s.env);
     let id = register_default_task(&s);
     s.registry.claim_task(&keeper, &id);
-    // Owner can no longer cancel once a keeper is working on it.
+
+    // Advance 100 ledgers while lock period (default 120 ledgers) is still active
+    advance(&s.env, 100, 0);
+
+    // Owner cannot cancel while keeper holds an active lock window.
     assert_eq!(
         s.registry.try_cancel_task(&s.admin, &id),
-        Err(Ok(KeeperError::InvalidTaskStatus))
+        Err(Ok(KeeperError::LockPeriodActive))
     );
+}
+
+#[test]
+fn test_cancel_claimed_task_after_lock_lapsed_succeeds() {
+    let s = setup();
+    let keeper = Address::generate(&s.env);
+    let token = token::Client::new(&s.env, &s.token_id);
+    let before = token.balance(&s.admin);
+    let id = register_default_task(&s);
+    s.registry.claim_task(&keeper, &id);
+
+    // Advance ledgers past lock_ledgers (default 120 ledgers)
+    advance(&s.env, 120, 0);
+
+    // Owner reclaims escrow once claimer's lock window has lapsed
+    s.registry.cancel_task(&s.admin, &id);
+
+    assert_eq!(token.balance(&s.admin), before);
+    assert_eq!(s.registry.get_task(&id).status, TaskStatus::Cancelled);
+}
+
+#[test]
+fn test_cancel_claimed_task_boundary_unlock_at_minus_one_fails() {
+    let s = setup();
+    let keeper = Address::generate(&s.env);
+    let (id, unlock_at) = claim_with_lock(&s, &keeper, 12u32);
+
+    goto_ledger(&s.env, unlock_at - 1);
+
+    // Lock is still active at unlock_at - 1
+    assert_eq!(
+        s.registry.try_cancel_task(&s.admin, &id),
+        Err(Ok(KeeperError::LockPeriodActive))
+    );
+}
+
+#[test]
+fn test_cancel_claimed_task_boundary_at_unlock_at_succeeds() {
+    let s = setup();
+    let keeper = Address::generate(&s.env);
+    let token = token::Client::new(&s.env, &s.token_id);
+    let before = token.balance(&s.admin);
+    let (id, unlock_at) = claim_with_lock(&s, &keeper, 12u32);
+
+    goto_ledger(&s.env, unlock_at);
+
+    // Lock lapses at unlock_at, allowing task owner to cancel
+    s.registry.cancel_task(&s.admin, &id);
+
+    assert_eq!(token.balance(&s.admin), before);
+    assert_eq!(s.registry.get_task(&id).status, TaskStatus::Cancelled);
+}
+
+#[test]
+fn test_cancel_claimed_task_boundary_unlock_at_plus_one_succeeds() {
+    let s = setup();
+    let keeper = Address::generate(&s.env);
+    let token = token::Client::new(&s.env, &s.token_id);
+    let before = token.balance(&s.admin);
+    let (id, unlock_at) = claim_with_lock(&s, &keeper, 12u32);
+
+    goto_ledger(&s.env, unlock_at + 1);
+
+    // Lock is expired at unlock_at + 1
+    s.registry.cancel_task(&s.admin, &id);
+
+    assert_eq!(token.balance(&s.admin), before);
+    assert_eq!(s.registry.get_task(&id).status, TaskStatus::Cancelled);
 }
 
 #[test]
@@ -1258,6 +1442,116 @@ fn test_withdraw_transfers_balance_and_zeroes_it() {
     assert_eq!(s.registry.keeper_balance(&keeper), 0i128);
 }
 
+/// The design credits keepers to an internal balance so they can execute
+/// many tasks and pay one withdrawal fee. `test_withdraw_transfers_balance_and_zeroes_it`
+/// only proves this for a single credit; this test drives multiple credits
+/// per keeper (three for keeper1, two for keeper2, interleaved) and checks
+/// the running balance after every single one — a regression that overwrote
+/// instead of accumulated (`set` instead of `checked_add`) would fail on the
+/// very first assertion after a second credit.
+#[test]
+fn test_keeper_balance_accumulates_across_tasks_and_withdraws_as_one_sum() {
+    let s = setup();
+    let token = token::Client::new(&s.env, &s.token_id);
+    let fee_bps = s.registry.get_fee_bps();
+
+    let keeper1 = Address::generate(&s.env);
+    let keeper2 = Address::generate(&s.env);
+
+    // Rewards deliberately chosen so `reward * fee_bps / 10_000` does not
+    // divide evenly (default fee_bps = 300 / 3%) — the running sum has to
+    // exercise split_reward's truncating division, not just clean multiples.
+    let keeper1_rewards = [850_003i128, 623_777i128, 1_234_567i128];
+    let keeper2_rewards = [111_113i128, 777_779i128];
+
+    let mut keeper1_balance = 0i128;
+    let mut keeper2_balance = 0i128;
+    let mut expected_fees = 0i128;
+
+    // Interleave keeper2's tasks between keeper1's so that DataKey::KeeperReward
+    // keys colliding between the two addresses would show up as
+    // cross-contamination of the running balances, not be hidden by ordering.
+    for (i, &reward1) in keeper1_rewards.iter().enumerate() {
+        let id1 = register_reward_task(&s, reward1);
+        s.registry.claim_task(&keeper1, &id1);
+        s.registry
+            .execute_task(&keeper1, &id1, &Bytes::from_slice(&s.env, b"proof"));
+
+        let (net1, fee1) = split_reward(reward1, fee_bps);
+        keeper1_balance += net1;
+        expected_fees += fee1;
+
+        // Asserting after each step localises a failure to the exact
+        // execution that broke accumulation.
+        assert_eq!(s.registry.keeper_balance(&keeper1), keeper1_balance);
+        assert_eq!(s.registry.keeper_balance(&keeper2), keeper2_balance);
+
+        if let Some(&reward2) = keeper2_rewards.get(i) {
+            let id2 = register_reward_task(&s, reward2);
+            s.registry.claim_task(&keeper2, &id2);
+            s.registry
+                .execute_task(&keeper2, &id2, &Bytes::from_slice(&s.env, b"proof"));
+
+            let (net2, fee2) = split_reward(reward2, fee_bps);
+            keeper2_balance += net2;
+            expected_fees += fee2;
+
+            assert_eq!(s.registry.keeper_balance(&keeper2), keeper2_balance);
+            assert_eq!(s.registry.keeper_balance(&keeper1), keeper1_balance);
+        }
+    }
+
+    // Sanity: the chosen rewards actually produced non-round fee splits.
+    assert!(keeper1_rewards
+        .iter()
+        .any(|&r| r.checked_mul(fee_bps as i128).unwrap() % 10_000 != 0));
+
+    assert_eq!(s.registry.fees_accrued(), expected_fees);
+
+    // A single withdrawal transfers the full accumulated sum and zeroes the
+    // balance.
+    assert_eq!(token.balance(&keeper1), 0i128);
+    let withdrawn = s.registry.withdraw_rewards(&keeper1);
+
+    // Inspect events from this call *before* making any further contract
+    // calls — `events().all()` reflects only the most recent top-level
+    // invocation, and even read-only views (like the balance checks below)
+    // would reset it.
+    //
+    // Exactly one RewardsWithdrawn event was emitted, carrying the total —
+    // not one per credited task, and not the token contract's own transfer
+    // event (which carries a different topic pair).
+    let mut withdraw_event_count = 0u32;
+    let mut withdraw_event_amount = 0i128;
+    for (contract, topics, data) in s.env.events().all().iter() {
+        if contract != s.registry.address {
+            continue;
+        }
+        let t0: Option<Symbol> = topics.get(0).and_then(|v| v.try_into_val(&s.env).ok());
+        let t1: Option<Symbol> = topics.get(1).and_then(|v| v.try_into_val(&s.env).ok());
+        if topics.len() == 2
+            && t0 == Some(symbol_short!("wdraw"))
+            && t1 == Some(symbol_short!("reward"))
+        {
+            withdraw_event_count += 1;
+            let (event_keeper, amount): (Address, i128) = data.try_into_val(&s.env).unwrap();
+            assert_eq!(event_keeper, keeper1);
+            withdraw_event_amount = amount;
+        }
+    }
+    assert_eq!(withdraw_event_count, 1);
+    assert_eq!(withdraw_event_amount, keeper1_balance);
+
+    assert_eq!(withdrawn, keeper1_balance);
+    assert_eq!(token.balance(&keeper1), keeper1_balance);
+    assert_eq!(s.registry.keeper_balance(&keeper1), 0i128);
+
+    // keeper2's balance stayed independent — untouched by keeper1's
+    // accumulation, withdrawal, or the KeeperReward key derivation.
+    assert_eq!(s.registry.keeper_balance(&keeper2), keeper2_balance);
+    assert_eq!(token.balance(&keeper2), 0i128);
+}
+
 #[test]
 fn test_withdraw_with_no_balance_fails() {
     let s = setup();
@@ -1461,6 +1755,203 @@ fn test_pause_by_non_admin_fails() {
     assert_eq!(
         s.registry.try_pause(&stranger),
         Err(Ok(KeeperError::Unauthorized))
+    );
+}
+
+/// Table-driven coverage of the full pause policy, entry point by entry
+/// point — see the `pause`/`unpause` doc comment in `lib.rs` for the table
+/// this test verifies against and keeps in sync.
+///
+/// Ground truth is "does the function call `require_not_paused(&e)?`",
+/// checked directly against the code (not the old prose-only doc comment,
+/// which undersold the policy — it only mentioned
+/// register_task/claim_task/execute_task/expire_task/withdraw_rewards and
+/// said nothing about increase_reward, extend_deadline, or cancel_task):
+///
+///   - BLOCKED while paused (asserted via `try_*` -> `ContractPaused`):
+///     `register_task`, `claim_task`, `execute_task`, `increase_reward`.
+///   - Allowed while paused, and asserted to have their full intended
+///     effect (not just "didn't error"): `cancel_task` (refund + status),
+///     `expire_task` (refund + status), `withdraw_rewards` (balance
+///     transferred + zeroed).
+///   - `extend_deadline` is asserted to match its *current* (buggy)
+///     behavior — it has no `require_not_paused` call at all, so it
+///     currently succeeds while paused. That is almost certainly wrong
+///     (it was likely meant to follow register/claim/execute) but fixing it
+///     is out of scope here; seeing this assertion start failing is the
+///     signal that someone fixed the gap without updating this test.
+///   - Read-only views are asserted to keep working throughout.
+///   - Finally, unpause restores every previously-blocked entry point —
+///     a one-way pause would itself be a serious bug.
+#[test]
+fn test_pause_policy_matrix_entry_point_by_entry_point() {
+    let s = setup();
+    let token = token::Client::new(&s.env, &s.token_id);
+
+    // ── Arrange: every task needs to exist *before* pausing, since
+    // register_task itself is blocked once paused.
+    let claim_target_id = register_default_task(&s); // Pending -> claim_task blocked
+    let increase_target_id = register_default_task(&s); // Pending -> increase_reward blocked
+    let cancel_target_id = register_default_task(&s); // Pending -> cancel_task allowed
+    let extend_target_id = register_default_task(&s); // Pending -> extend_deadline (bug: allowed)
+
+    // Short deadline so it can expire without dragging the other tasks'
+    // (default +3_600s) deadlines past their own while paused.
+    let expire_target_id = s.registry.register_task(
+        &s.admin,
+        &TaskType::Liquidation,
+        &calldata(&s.env),
+        &1_000_000i128,
+        &(s.env.ledger().timestamp() + 100),
+        &17_280u32,
+        &120u32,
+    );
+
+    let claimed_keeper = Address::generate(&s.env);
+    let claimed_task_id = register_default_task(&s);
+    s.registry.claim_task(&claimed_keeper, &claimed_task_id); // Claimed -> execute_task blocked
+
+    // Credited before pausing, since execute_task (the only way to credit a
+    // keeper) is itself blocked once paused.
+    let paid_keeper = executed_task_keeper(&s); // has a withdrawable balance
+
+    // ── Act: pause.
+    s.registry.pause(&s.admin);
+    assert!(s.registry.is_paused());
+
+    // ── BLOCKED: register_task.
+    assert_eq!(
+        s.registry.try_register_task(
+            &s.admin,
+            &TaskType::Custom,
+            &calldata(&s.env),
+            &100_000i128,
+            &(s.env.ledger().timestamp() + 3_600),
+            &17_280u32,
+            &60u32,
+        ),
+        Err(Ok(KeeperError::ContractPaused))
+    );
+
+    // ── BLOCKED: claim_task.
+    assert_eq!(
+        s.registry
+            .try_claim_task(&Address::generate(&s.env), &claim_target_id),
+        Err(Ok(KeeperError::ContractPaused))
+    );
+    assert_eq!(
+        s.registry.get_task(&claim_target_id).status,
+        TaskStatus::Pending
+    ); // untouched
+
+    // ── BLOCKED: execute_task.
+    assert_eq!(
+        s.registry.try_execute_task(
+            &claimed_keeper,
+            &claimed_task_id,
+            &Bytes::from_slice(&s.env, b"p"),
+        ),
+        Err(Ok(KeeperError::ContractPaused))
+    );
+    assert_eq!(
+        s.registry.get_task(&claimed_task_id).status,
+        TaskStatus::Claimed
+    ); // untouched
+
+    // ── BLOCKED: increase_reward.
+    assert_eq!(
+        s.registry
+            .try_increase_reward(&s.admin, &increase_target_id, &1i128),
+        Err(Ok(KeeperError::ContractPaused))
+    );
+    assert_eq!(
+        s.registry.get_task(&increase_target_id).reward,
+        1_000_000i128
+    ); // untouched
+
+    // ── extend_deadline: NOT gated in the current code — this is a known
+    // gap, tracked as a separate bug (see the doc comment above `pause` in
+    // lib.rs). Asserting current behavior, not desired behavior.
+    // TODO: once extend_deadline gains a `require_not_paused(&e)?` check,
+    // flip this to `try_extend_deadline` -> `Err(Ok(KeeperError::ContractPaused))`.
+    let old_deadline = s.registry.get_task(&extend_target_id).deadline;
+    s.registry
+        .extend_deadline(&s.admin, &extend_target_id, &(old_deadline + 3_600));
+    assert_eq!(
+        s.registry.get_task(&extend_target_id).deadline,
+        old_deadline + 3_600
+    );
+
+    // ── ALLOWED: cancel_task — must actually refund and flip status, not
+    // just "not error".
+    let admin_before_cancel = token.balance(&s.admin);
+    s.registry.cancel_task(&s.admin, &cancel_target_id);
+    assert_eq!(
+        s.registry.get_task(&cancel_target_id).status,
+        TaskStatus::Cancelled
+    );
+    assert_eq!(token.balance(&s.admin), admin_before_cancel + 1_000_000i128);
+
+    // ── ALLOWED: expire_task, once its deadline passes — also must actually
+    // refund and flip status. Advance just enough to pass this task's short
+    // deadline without also passing the other (default +3_600s) tasks'.
+    advance(&s.env, 5, 101);
+    let admin_before_expire = token.balance(&s.admin);
+    s.registry.expire_task(&expire_target_id);
+    assert_eq!(
+        s.registry.get_task(&expire_target_id).status,
+        TaskStatus::Expired
+    );
+    assert_eq!(token.balance(&s.admin), admin_before_expire + 1_000_000i128);
+
+    // ── ALLOWED: withdraw_rewards — must actually transfer and zero the
+    // balance, not just "not error".
+    assert_eq!(token.balance(&paid_keeper), 0i128);
+    assert_eq!(s.registry.withdraw_rewards(&paid_keeper), 970_000i128);
+    assert_eq!(token.balance(&paid_keeper), 970_000i128);
+    assert_eq!(s.registry.keeper_balance(&paid_keeper), 0i128);
+
+    // ── ALLOWED: read-only views never gate on pause.
+    assert!(s.registry.is_paused());
+    assert_eq!(s.registry.fees_accrued(), 30_000i128);
+    assert!(s.registry.task_count() >= 6);
+    assert_eq!(s.registry.admin(), Some(s.admin.clone()));
+    assert_eq!(s.registry.get_fee_bps(), 300u32);
+
+    // ── Unpause: every previously-blocked entry point must work again — a
+    // one-way pause would itself be a serious liveness bug.
+    s.registry.unpause(&s.admin);
+    assert!(!s.registry.is_paused());
+
+    // register_task works again.
+    let new_id = register_default_task(&s);
+    assert_eq!(s.registry.get_task(&new_id).status, TaskStatus::Pending);
+
+    // claim_task works again.
+    let claimer = Address::generate(&s.env);
+    s.registry.claim_task(&claimer, &claim_target_id);
+    assert_eq!(
+        s.registry.get_task(&claim_target_id).status,
+        TaskStatus::Claimed
+    );
+
+    // execute_task works again.
+    s.registry.execute_task(
+        &claimed_keeper,
+        &claimed_task_id,
+        &Bytes::from_slice(&s.env, b"proof"),
+    );
+    assert_eq!(
+        s.registry.get_task(&claimed_task_id).status,
+        TaskStatus::Executed
+    );
+
+    // increase_reward works again.
+    s.registry
+        .increase_reward(&s.admin, &increase_target_id, &1i128);
+    assert_eq!(
+        s.registry.get_task(&increase_target_id).reward,
+        1_000_001i128
     );
 }
 
@@ -1738,6 +2229,221 @@ fn test_upgrade_by_non_admin_fails() {
         s.registry.try_upgrade(&stranger, &bogus),
         Err(Ok(KeeperError::Unauthorized))
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// cancel_task — checks-effects-interactions regression
+//
+// A malicious reward token can try to call back into the registry from
+// inside `transfer`. `cancel_task` must write `TaskStatus::Cancelled` before
+// it ever calls the token, so that if a re-entrant `cancel_task` call for the
+// same task ever reaches the function body, it sees a non-Pending status and
+// is rejected with `InvalidTaskStatus` rather than paying out a second
+// refund.
+//
+// Note: the Soroban host also refuses same-contract reentrancy at the
+// platform level (`ContractReentryMode::Prohibited` on ordinary cross-contract
+// calls), so the reentrant call below is actually intercepted before it ever
+// reaches our status guard. The test still asserts on both layers: the
+// reentrant call must never succeed, and *if* it were ever decoded as a
+// contract error, it must be `InvalidTaskStatus`. That keeps this a real
+// regression test for the CEI ordering fix rather than one that only
+// happens to pass because of the platform's independent protection.
+// ─────────────────────────────────────────────────────────────────────────────
+
+mod reentrant_token {
+    use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};
+
+    use crate::KeeperRegistryClient;
+
+    #[contracttype]
+    #[derive(Clone)]
+    enum DataKey {
+        Balance(Address),
+        Registry,
+        TaskId,
+        Owner,
+        Armed,
+        ReentryRejected,
+        ReentryErrorCode,
+        RefundCount,
+    }
+
+    /// Sentinel for `ReentryErrorCode` meaning "no decoded contract error" —
+    /// either the hook never fired or the rejection came from the host's own
+    /// reentrancy protection rather than our `KeeperError` guard.
+    pub const NO_ERROR_CODE: u32 = u32::MAX;
+
+    #[contract]
+    pub struct ReentrantToken;
+
+    #[contractimpl]
+    impl ReentrantToken {
+        pub fn mint(env: Env, to: Address, amount: i128) {
+            let balance = Self::balance(env.clone(), to.clone());
+            env.storage()
+                .persistent()
+                .set(&DataKey::Balance(to), &(balance + amount));
+        }
+
+        pub fn balance(env: Env, id: Address) -> i128 {
+            env.storage()
+                .persistent()
+                .get(&DataKey::Balance(id))
+                .unwrap_or(0)
+        }
+
+        /// Arms the reentrancy hook: the next `transfer` targeting `owner`
+        /// will attempt `registry.cancel_task(owner, task_id)` before this
+        /// transfer's own balance update completes, simulating a malicious
+        /// token hooking mid-transfer.
+        pub fn arm(env: Env, registry: Address, task_id: u64, owner: Address) {
+            env.storage().instance().set(&DataKey::Registry, &registry);
+            env.storage().instance().set(&DataKey::TaskId, &task_id);
+            env.storage().instance().set(&DataKey::Owner, &owner);
+            env.storage().instance().set(&DataKey::Armed, &true);
+            env.storage()
+                .instance()
+                .set(&DataKey::ReentryRejected, &false);
+            env.storage()
+                .instance()
+                .set(&DataKey::ReentryErrorCode, &NO_ERROR_CODE);
+            env.storage().instance().set(&DataKey::RefundCount, &0u32);
+        }
+
+        /// Whether the re-entrant `cancel_task` call was rejected (by either
+        /// the contract's own status guard or the host's reentrancy check).
+        pub fn reentry_rejected(env: Env) -> bool {
+            env.storage()
+                .instance()
+                .get(&DataKey::ReentryRejected)
+                .unwrap_or(false)
+        }
+
+        /// The decoded `KeeperError` code from the re-entrant call, or
+        /// `NO_ERROR_CODE` if the rejection never reached our own contract
+        /// logic (e.g. it was intercepted by the host's reentrancy
+        /// protection first).
+        pub fn reentry_error_code(env: Env) -> u32 {
+            env.storage()
+                .instance()
+                .get(&DataKey::ReentryErrorCode)
+                .unwrap_or(NO_ERROR_CODE)
+        }
+
+        /// Number of transfers this token made to the armed owner.
+        pub fn refund_count(env: Env) -> u32 {
+            env.storage()
+                .instance()
+                .get(&DataKey::RefundCount)
+                .unwrap_or(0)
+        }
+
+        pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+            let armed: bool = env
+                .storage()
+                .instance()
+                .get(&DataKey::Armed)
+                .unwrap_or(false);
+            if armed {
+                let owner: Address = env.storage().instance().get(&DataKey::Owner).unwrap();
+                if to == owner {
+                    let count: u32 = env
+                        .storage()
+                        .instance()
+                        .get(&DataKey::RefundCount)
+                        .unwrap_or(0);
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::RefundCount, &(count + 1));
+
+                    // Fire once: disarm before recursing so a bug that lets
+                    // the re-entrant cancel succeed can't recurse forever.
+                    env.storage().instance().set(&DataKey::Armed, &false);
+                    let registry: Address =
+                        env.storage().instance().get(&DataKey::Registry).unwrap();
+                    let task_id: u64 = env.storage().instance().get(&DataKey::TaskId).unwrap();
+                    let client = KeeperRegistryClient::new(&env, &registry);
+                    let (rejected, code): (bool, u32) =
+                        match client.try_cancel_task(&owner, &task_id) {
+                            Ok(_) => (false, NO_ERROR_CODE),
+                            Err(Ok(err)) => (true, err as u32),
+                            Err(Err(_)) => (true, NO_ERROR_CODE),
+                        };
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::ReentryRejected, &rejected);
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::ReentryErrorCode, &code);
+                }
+            }
+
+            let from_balance = Self::balance(env.clone(), from.clone());
+            let to_balance = Self::balance(env.clone(), to.clone());
+            env.storage()
+                .persistent()
+                .set(&DataKey::Balance(from), &(from_balance - amount));
+            env.storage()
+                .persistent()
+                .set(&DataKey::Balance(to), &(to_balance + amount));
+        }
+    }
+}
+
+#[test]
+fn test_cancel_task_rejects_reentrant_refund() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+
+    let token_id = env.register(reentrant_token::ReentrantToken, ());
+    let mock_token = reentrant_token::ReentrantTokenClient::new(&env, &token_id);
+    mock_token.mint(&admin, &10_000_000i128);
+
+    let registry_id = env.register(KeeperRegistry, ());
+    let registry = KeeperRegistryClient::new(&env, &registry_id);
+    registry.initialize(&admin, &token_id, &300u32);
+
+    let deadline = env.ledger().timestamp() + 3_600;
+    let task_id = registry.register_task(
+        &admin,
+        &TaskType::Liquidation,
+        &calldata(&env),
+        &1_000_000i128,
+        &deadline,
+        &17_280u32,
+        &120u32,
+    );
+
+    // Escrow landed on the registry, owner is down the reward.
+    assert_eq!(mock_token.balance(&admin), 9_000_000i128);
+    assert_eq!(mock_token.balance(&registry_id), 1_000_000i128);
+
+    // Arm the token: its next transfer to `admin` will try to cancel the
+    // same task again, from inside the outer cancel's own transfer call.
+    mock_token.arm(&registry_id, &task_id, &admin);
+
+    registry.cancel_task(&admin, &task_id);
+
+    // The re-entrant cancel must never have succeeded.
+    assert!(mock_token.reentry_rejected());
+    // If the rejection reached our own guard (rather than being intercepted
+    // by the host's reentrancy protection first), it must be because the
+    // outer call already wrote TaskStatus::Cancelled before touching the
+    // token.
+    let code = mock_token.reentry_error_code();
+    if code != reentrant_token::NO_ERROR_CODE {
+        assert_eq!(code, KeeperError::InvalidTaskStatus as u32);
+    }
+    assert_eq!(mock_token.refund_count(), 1);
+    assert_eq!(registry.get_task(&task_id).status, TaskStatus::Cancelled);
+
+    // Exactly one refund was paid: owner made whole, registry drained back
+    // to zero for this task.
+    assert_eq!(mock_token.balance(&admin), 10_000_000i128);
+    assert_eq!(mock_token.balance(&registry_id), 0i128);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

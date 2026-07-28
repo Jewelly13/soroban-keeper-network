@@ -6,20 +6,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed — TTL/deadline invariant (VERSION bumped to 2)
+### Fixed — task parameter validation
 
-- `register_task` and `extend_deadline` now reject a `ttl_ledgers` that does
-  not cover the task's `deadline` plus a safety margin, with a new
-  `TtlTooShort` error. Previously the two were validated independently, so a
-  task's Persistent storage entry could expire while its escrowed reward was
-  still held, permanently stranding the funds (no admin or owner recovery
-  path, since `cancel_task`/`expire_task`/`execute_task` all start with
-  `load_task`).
-- Documented the unit mismatch between `deadline` (unix seconds) and
-  `ttl_ledgers` (ledger count) on both `Task` fields and in
-  [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#ttl--deadline-invariant).
-- Added `TtlTooShort` to `KeeperError`, which changes the contract's error
-  ABI — `VERSION` bumped from 1 to 2.
+- `register_task` now rejects `lock_ledgers` outside `[MIN_LOCK_LEDGERS,
+  MAX_LOCK_LEDGERS]` and `ttl_ledgers` below `MIN_TTL_LEDGERS`, returning the
+  new `InvalidTaskParams` error. Previously a `lock_ledgers` of `0` let any
+  keeper instantly re-claim a task from another keeper, an oversized
+  `lock_ledgers` let one unresponsive keeper hold a task hostage until the
+  deadline, and a `ttl_ledgers` of `0` risked stranding escrowed funds.
+
 ### Added — calldata size bound (VERSION bumped to 2)
 
 - `register_task` now rejects `calldata` larger than `MAX_CALLDATA_LEN`
