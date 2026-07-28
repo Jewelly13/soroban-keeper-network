@@ -147,7 +147,31 @@ pub enum KeeperError {
     // than reused so the two branches don't collide on the same discriminant.
     /// `calldata` exceeds [`MAX_CALLDATA_LEN`].
     CalldataTooLarge = 17,
+    /// `lock_ledgers` or `ttl_ledgers` passed to `register_task` fell outside
+    /// their allowed bounds.
+    InvalidTaskParams = 18,
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Task parameter bounds
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Stellar closes a ledger roughly every 5 seconds. A lock window shorter than
+/// this gives the claiming keeper no realistic chance to build and submit its
+/// `execute_task` transaction before another keeper can reclaim the task out
+/// from under it.
+const MIN_LOCK_LEDGERS: u32 = 12; // ~1 minute
+
+/// A lock window longer than this lets a single unresponsive keeper hold a
+/// task hostage for the better part of a day, with no possibility of
+/// takeover until `expire_task` becomes callable at the deadline.
+const MAX_LOCK_LEDGERS: u32 = 17_280; // ~1 day
+
+/// Persistent storage entries need enough runway to survive from
+/// registration through claim and execution without lapsing mid-flight.
+/// Below this, the TTL extension is not worth writing and risks the entry
+/// (and its escrowed reward) becoming inaccessible before a keeper can act.
+const MIN_TTL_LEDGERS: u32 = 1_000; // ~83 minutes
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Events — emitted for off-chain keeper bots to consume
@@ -510,8 +534,10 @@ impl KeeperRegistry {
     //                  CalldataTooLarge otherwise
     //   reward       — XLM stroops escrowed as bounty
     //   deadline     — unix timestamp after which the task expires
-    //   ttl_ledgers  — how long to keep the storage entry alive
-    //   lock_ledgers — ledgers the claimer holds exclusive rights
+    //   ttl_ledgers  — how long to keep the storage entry alive; must be at
+    //                  least `MIN_TTL_LEDGERS`
+    //   lock_ledgers — ledgers the claimer holds exclusive rights; must be in
+    //                  `[MIN_LOCK_LEDGERS, MAX_LOCK_LEDGERS]`
     //
     // Returns the new task_id.
 
@@ -543,6 +569,12 @@ impl KeeperRegistry {
         }
         if calldata.len() > MAX_CALLDATA_LEN {
             return Err(KeeperError::CalldataTooLarge);
+        }
+        if !(MIN_LOCK_LEDGERS..=MAX_LOCK_LEDGERS).contains(&lock_ledgers) {
+            return Err(KeeperError::InvalidTaskParams);
+        }
+        if ttl_ledgers < MIN_TTL_LEDGERS {
+            return Err(KeeperError::InvalidTaskParams);
         }
 
         bump_instance(&e);

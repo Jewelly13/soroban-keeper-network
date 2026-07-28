@@ -19,7 +19,8 @@ use soroban_sdk::{
 
 use crate::{
     split_reward, DataKey, KeeperError, KeeperRegistry, KeeperRegistryClient, TaskStatus, TaskType,
-    INSTANCE_BUMP_LEDGERS, INSTANCE_BUMP_THRESHOLD, MAX_CALLDATA_LEN,
+    INSTANCE_BUMP_LEDGERS, INSTANCE_BUMP_THRESHOLD, MAX_CALLDATA_LEN, MAX_LOCK_LEDGERS,
+    MIN_LOCK_LEDGERS, MIN_TTL_LEDGERS,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -496,6 +497,108 @@ fn test_register_task_with_empty_calldata_succeeds() {
     assert_eq!(registry.get_task(&id).calldata.len(), 0);
 }
 
+#[test]
+fn test_register_task_lock_ledgers_below_min_fails() {
+    let s = setup();
+    let deadline = s.env.ledger().timestamp() + 3_600;
+    assert_eq!(
+        s.registry.try_register_task(
+            &s.admin,
+            &TaskType::Custom,
+            &calldata(&s.env),
+            &1_000_000i128,
+            &deadline,
+            &17_280u32,
+            &(MIN_LOCK_LEDGERS - 1),
+        ),
+        Err(Ok(KeeperError::InvalidTaskParams))
+    );
+}
+
+#[test]
+fn test_register_task_lock_ledgers_at_min_succeeds() {
+    let s = setup();
+    let deadline = s.env.ledger().timestamp() + 3_600;
+    let task_id = s.registry.register_task(
+        &s.admin,
+        &TaskType::Custom,
+        &calldata(&s.env),
+        &1_000_000i128,
+        &deadline,
+        &17_280u32,
+        &MIN_LOCK_LEDGERS,
+    );
+    assert_eq!(s.registry.get_task(&task_id).lock_ledgers, MIN_LOCK_LEDGERS);
+}
+
+#[test]
+fn test_register_task_lock_ledgers_above_max_fails() {
+    let s = setup();
+    let deadline = s.env.ledger().timestamp() + 3_600;
+    assert_eq!(
+        s.registry.try_register_task(
+            &s.admin,
+            &TaskType::Custom,
+            &calldata(&s.env),
+            &1_000_000i128,
+            &deadline,
+            &17_280u32,
+            &(MAX_LOCK_LEDGERS + 1),
+        ),
+        Err(Ok(KeeperError::InvalidTaskParams))
+    );
+}
+
+#[test]
+fn test_register_task_lock_ledgers_at_max_succeeds() {
+    let s = setup();
+    let deadline = s.env.ledger().timestamp() + 3_600;
+    let task_id = s.registry.register_task(
+        &s.admin,
+        &TaskType::Custom,
+        &calldata(&s.env),
+        &1_000_000i128,
+        &deadline,
+        &17_280u32,
+        &MAX_LOCK_LEDGERS,
+    );
+    assert_eq!(s.registry.get_task(&task_id).lock_ledgers, MAX_LOCK_LEDGERS);
+}
+
+#[test]
+fn test_register_task_ttl_ledgers_below_min_fails() {
+    let s = setup();
+    let deadline = s.env.ledger().timestamp() + 3_600;
+    assert_eq!(
+        s.registry.try_register_task(
+            &s.admin,
+            &TaskType::Custom,
+            &calldata(&s.env),
+            &1_000_000i128,
+            &deadline,
+            &(MIN_TTL_LEDGERS - 1),
+            &120u32,
+        ),
+        Err(Ok(KeeperError::InvalidTaskParams))
+    );
+}
+
+#[test]
+fn test_register_task_ttl_ledgers_at_min_succeeds() {
+    let s = setup();
+    let deadline = s.env.ledger().timestamp() + 3_600;
+    let task_id = s.registry.register_task(
+        &s.admin,
+        &TaskType::Custom,
+        &calldata(&s.env),
+        &1_000_000i128,
+        &deadline,
+        &MIN_TTL_LEDGERS,
+        &120u32,
+    );
+    assert_eq!(s.registry.get_task(&task_id).ttl_ledgers, MIN_TTL_LEDGERS);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Placeholder tests for unimplemented functions
 //
@@ -649,7 +752,7 @@ fn test_lock_boundary_unlock_at_minus_one_is_still_locked() {
     let s = setup();
     let first = Address::generate(&s.env);
     let second = Address::generate(&s.env);
-    let (id, unlock_at) = claim_with_lock(&s, &first, 10u32);
+    let (id, unlock_at) = claim_with_lock(&s, &first, MIN_LOCK_LEDGERS);
 
     goto_ledger(&s.env, unlock_at - 1);
 
@@ -665,7 +768,7 @@ fn test_lock_boundary_at_unlock_at_is_reclaimable() {
     let s = setup();
     let first = Address::generate(&s.env);
     let second = Address::generate(&s.env);
-    let (id, unlock_at) = claim_with_lock(&s, &first, 10u32);
+    let (id, unlock_at) = claim_with_lock(&s, &first, MIN_LOCK_LEDGERS);
 
     goto_ledger(&s.env, unlock_at);
 
@@ -683,7 +786,7 @@ fn test_lock_boundary_unlock_at_plus_one_is_reclaimable() {
     let s = setup();
     let first = Address::generate(&s.env);
     let second = Address::generate(&s.env);
-    let (id, unlock_at) = claim_with_lock(&s, &first, 10u32);
+    let (id, unlock_at) = claim_with_lock(&s, &first, MIN_LOCK_LEDGERS);
 
     goto_ledger(&s.env, unlock_at + 1);
 
