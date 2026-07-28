@@ -150,6 +150,8 @@ pub enum KeeperError {
     /// `lock_ledgers` or `ttl_ledgers` passed to `register_task` fell outside
     /// their allowed bounds.
     InvalidTaskParams = 18,
+    /// Arithmetic operation would overflow or underflow.
+    ArithmeticOverflow = 19,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -256,6 +258,27 @@ pub fn emit_deadline_extended(e: &Env, task_id: u64, new_deadline: u64) {
     );
 }
 
+pub fn emit_min_reward_updated(e: &Env, old_min: i128, new_min: i128) {
+    e.events().publish(
+        (symbol_short!("minrwd"), symbol_short!("admin")),
+        (old_min, new_min),
+    );
+}
+
+pub fn emit_fees_swept(e: &Env, treasury: &Address, amount: i128, remaining: i128) {
+    e.events().publish(
+        (symbol_short!("sweep"), symbol_short!("admin")),
+        (treasury.clone(), amount, remaining),
+    );
+}
+
+pub fn emit_initialized(e: &Env, admin: &Address, reward_token: &Address, fee_bps: u32) {
+    e.events().publish(
+        (symbol_short!("init"), symbol_short!("admin")),
+        (admin.clone(), reward_token.clone(), fee_bps),
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // TTL constants
 // ─────────────────────────────────────────────────────────────────────────────
@@ -335,7 +358,9 @@ fn next_task_id(e: &Env) -> u64 {
         .instance()
         .get(&DataKey::TaskCounter)
         .unwrap_or(0u64);
-    let next = id.checked_add(1).expect("task id overflow");
+    // Unreachable: exhausting u64 task ids requires ~1.8e19 registrations, far
+    // beyond any plausible lifetime of this contract.
+    let next = id.checked_add(1).expect("task id counter exhausted");
     e.storage().instance().set(&DataKey::TaskCounter, &next);
     next
 }
@@ -384,13 +409,15 @@ fn fee_bps(e: &Env) -> u32 {
 }
 
 /// Returns (keeper_net, protocol_fee).
-fn split_reward(reward: i128, fee_bps: u32) -> (i128, i128) {
+fn split_reward(reward: i128, fee_bps: u32) -> Result<(i128, i128), KeeperError> {
     let fee = reward
         .checked_mul(fee_bps as i128)
-        .expect("overflow")
-        .checked_div(10_000)
-        .expect("div zero");
-    (reward.checked_sub(fee).expect("underflow"), fee)
+        .ok_or(KeeperError::ArithmeticOverflow)?
+        / 10_000; // Divisor is a non-zero literal, cannot fail
+    let net = reward
+        .checked_sub(fee)
+        .ok_or(KeeperError::ArithmeticOverflow)?;
+    Ok((net, fee))
 }
 
 /// Adds `amount` to a keeper's withdrawable balance in Persistent storage.
@@ -402,24 +429,25 @@ fn split_reward(reward: i128, fee_bps: u32) -> (i128, i128) {
 /// zero-out/write), but deliberately *not* on `keeper_balance` reads — see
 /// the doc comment there for why a keeper that never returns can still see
 /// its balance entry archive.
-fn credit_keeper(e: &Env, keeper: &Address, amount: i128) {
+fn credit_keeper(e: &Env, keeper: &Address, amount: i128) -> Result<(), KeeperError> {
     let key = DataKey::KeeperReward(keeper.clone());
     let current: i128 = e.storage().persistent().get(&key).unwrap_or(0);
     let updated = current
         .checked_add(amount)
-        .expect("keeper balance overflow");
+        .ok_or(KeeperError::ArithmeticOverflow)?;
     e.storage().persistent().set(&key, &updated);
     e.storage().persistent().extend_ttl(
         &key,
         KEEPER_BALANCE_BUMP_THRESHOLD,
         KEEPER_BALANCE_BUMP_LEDGERS,
     );
+    Ok(())
 }
 
 /// Adds `amount` to the swept-able protocol fee accumulator (instance storage).
-fn accrue_fee(e: &Env, amount: i128) {
+fn accrue_fee(e: &Env, amount: i128) -> Result<(), KeeperError> {
     if amount == 0 {
-        return;
+        return Ok(());
     }
     let current: i128 = e
         .storage()
@@ -428,8 +456,9 @@ fn accrue_fee(e: &Env, amount: i128) {
         .unwrap_or(0);
     let updated = current
         .checked_add(amount)
-        .expect("fee accumulator overflow");
+        .ok_or(KeeperError::ArithmeticOverflow)?;
     e.storage().instance().set(&DataKey::FeesAccrued, &updated);
+    Ok(())
 }
 
 /// True once a claimed task's exclusive lock window has elapsed, meaning any
@@ -517,6 +546,7 @@ impl KeeperRegistry {
         e.storage().instance().set(&DataKey::TaskCounter, &0u64);
         bump_instance(&e);
 
+        emit_initialized(&e, &admin, &reward_token, fee_bps);
         log!(&e, "KeeperRegistry initialized by {}", admin);
         Ok(())
     }
@@ -756,9 +786,9 @@ impl KeeperRegistry {
         }
 
         bump_instance(&e);
-        let (keeper_net, fee) = split_reward(task.reward, fee_bps(&e));
-        credit_keeper(&e, &keeper, keeper_net);
-        accrue_fee(&e, fee);
+        let (keeper_net, fee) = split_reward(task.reward, fee_bps(&e))?;
+        credit_keeper(&e, &keeper, keeper_net)?;
+        accrue_fee(&e, fee)?;
 
         task.status = TaskStatus::Executed;
         save_task(&e, task_id, &task);
@@ -963,7 +993,9 @@ impl KeeperRegistry {
             return Err(KeeperError::InvalidReward);
         }
         bump_instance(&e);
+        let old_min: i128 = e.storage().instance().get(&DataKey::MinReward).unwrap_or(0);
         e.storage().instance().set(&DataKey::MinReward, &min_reward);
+        emit_min_reward_updated(&e, old_min, min_reward);
         log!(&e, "Min reward set to {}", min_reward);
         Ok(())
     }
@@ -1030,6 +1062,8 @@ impl KeeperRegistry {
             .set(&DataKey::FeesAccrued, &(accrued - amount));
         reward_token(&e)?.transfer(&e.current_contract_address(), &treasury, &amount);
 
+        let remaining = accrued - amount;
+        emit_fees_swept(&e, &treasury, amount, remaining);
         log!(&e, "Swept {} fees to {}", amount, treasury);
         Ok(())
     }
