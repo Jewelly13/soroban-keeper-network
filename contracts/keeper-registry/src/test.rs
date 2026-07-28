@@ -2581,3 +2581,210 @@ fn test_require_admin_distinguishes_not_initialized_from_wrong_caller() {
         Err(Ok(KeeperError::Unauthorized))
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Property tests (issue #93 / backlog 0068): compact proptest coverage per
+// I-N invariant, using the shared `invariants` module so these and any
+// future fuzz target assert the exact same thing. This is intentionally a
+// SMALL proptest per invariant, not the full-depth exploration that
+// backlog 0054-0060 (upstream issues #80/#83/#84/#85/#86) call for — those
+// remain open, separately-scoped issues; extend these in place rather than
+// duplicating them once that work lands.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// The crate root is `#![no_std]` for the on-chain WASM build; this whole
+// file only ever compiles under `#[cfg(test)]`, where `std` is always
+// linked by the test harness regardless — see the identical note in
+// `invariants.rs`.
+extern crate std;
+use std::{vec, vec::Vec};
+
+use crate::invariants::{
+    assert_admin_action_isolated, assert_fee_bounded, assert_lapsed_claim_is_expirable,
+    assert_solvent, assert_task_ids_monotonic, assert_withdrawal_live,
+};
+use proptest::prelude::*;
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(32))]
+
+    // I-1 — Solvency, across a random handful of tasks with random rewards
+    // and a mix of execute/cancel/leave-pending outcomes.
+    //
+    // `setup()` mints a fixed 10_000_000 units to `admin`; up to 5 tasks can
+    // be generated here, so each reward is capped at 1_000_000 to guarantee
+    // the sum never exceeds what's actually mintable (a proptest input that
+    // can't be funded would fail for a reason unrelated to the invariant
+    // under test).
+    #[test]
+    fn property_i1_solvency_holds_across_random_task_outcomes(
+        rewards in prop::collection::vec(1_i128..1_000_000, 1..6),
+        outcomes in prop::collection::vec(0u8..3, 1..6),
+    ) {
+        let s = setup();
+        let token = token::Client::new(&s.env, &s.token_id);
+        let keeper = Address::generate(&s.env);
+        let mut task_ids = Vec::new();
+
+        for (reward, outcome) in rewards.iter().zip(outcomes.iter()) {
+            let id = register_reward_task(&s, *reward);
+            task_ids.push(id);
+            match outcome % 3 {
+                0 => {
+                    // Execute.
+                    s.registry.claim_task(&keeper, &id);
+                    s.registry
+                        .execute_task(&keeper, &id, &Bytes::from_slice(&s.env, b"p"));
+                }
+                1 => {
+                    // Cancel.
+                    s.registry.cancel_task(&s.admin, &id);
+                }
+                _ => {
+                    // Leave Pending — still open escrow.
+                }
+            }
+        }
+
+        let balance = token.balance(&s.registry.address);
+        assert_solvent(&s.env, &s.registry, &task_ids, &[keeper], balance)
+            .expect("I-1 solvency must hold after any mix of task outcomes");
+    }
+
+    // I-2 — Escrow recoverability: a claimed task past its deadline is
+    // always expirable.
+    #[test]
+    fn property_i2_lapsed_claim_is_always_expirable(reward in 1_i128..9_000_000) {
+        let s = setup();
+        let keeper = Address::generate(&s.env);
+        let id = register_reward_task(&s, reward);
+
+        s.registry.claim_task(&keeper, &id);
+        // Past both the lock window and the task deadline (register_reward_task
+        // sets a 1-hour deadline).
+        advance(&s.env, 1000, 3_601);
+
+        let now = s.env.ledger().timestamp();
+        assert_lapsed_claim_is_expirable(&s.registry, id, now)
+            .expect("I-2: a Claimed task past its deadline must be expirable");
+    }
+
+    // I-3 — Single payout: executing a task credits the keeper exactly
+    // once; a second execute attempt is rejected, not double-paid.
+    #[test]
+    fn property_i3_single_payout_not_doubled(reward in 1_i128..9_000_000) {
+        let s = setup();
+        let keeper = Address::generate(&s.env);
+        let id = register_reward_task(&s, reward);
+
+        s.registry.claim_task(&keeper, &id);
+        let balance_before = s.registry.keeper_balance(&keeper);
+        s.registry
+            .execute_task(&keeper, &id, &Bytes::from_slice(&s.env, b"p"));
+        let balance_after_first = s.registry.keeper_balance(&keeper);
+
+        let (expected_net, _fee) = split_reward(reward, s.registry.get_fee_bps());
+        crate::invariants::assert_single_payout(balance_before, balance_after_first, expected_net)
+            .expect("I-3: first execution must credit exactly the net reward once");
+
+        // A second execute on the same (now Executed) task must be
+        // rejected, and must not touch the keeper's balance again.
+        let second = s.registry.try_execute_task(&keeper, &id, &Bytes::from_slice(&s.env, b"p2"));
+        prop_assert!(second.is_err(), "re-executing an Executed task must be rejected");
+        let balance_after_second_attempt = s.registry.keeper_balance(&keeper);
+        prop_assert_eq!(
+            balance_after_second_attempt,
+            balance_after_first,
+            "a rejected re-execution must not change the keeper's balance"
+        );
+    }
+
+    // I-4 — Fee bounding, across arbitrary reward/fee_bps combinations.
+    #[test]
+    fn property_i4_fee_bounded_across_arbitrary_inputs(
+        reward in 1_i128..i128::from(u64::MAX),
+        fee_bps in 0u32..=10_000u32,
+    ) {
+        let (keeper_net, fee) = split_reward(reward, fee_bps);
+        assert_fee_bounded(reward, fee_bps, keeper_net, fee)
+            .expect("I-4 fee bounding must hold for every reward/fee_bps combination");
+    }
+
+    // I-5 — Escrow isolation: sweeping accrued fees must never change any
+    // task's escrowed reward or any keeper's credited balance. Two tasks
+    // are registered from the same `reward`, so it's capped at half the
+    // minted supply.
+    #[test]
+    fn property_i5_sweep_fees_isolated_from_escrow_and_keeper_balances(
+        reward in 1_i128..4_500_000,
+    ) {
+        let s = setup();
+        let keeper = Address::generate(&s.env);
+        let executed_id = register_reward_task(&s, reward);
+        let pending_id = register_reward_task(&s, reward);
+
+        s.registry.claim_task(&keeper, &executed_id);
+        s.registry
+            .execute_task(&keeper, &executed_id, &Bytes::from_slice(&s.env, b"p"));
+
+        let task_rewards_before = vec![
+            (executed_id, s.registry.get_task(&executed_id).reward),
+            (pending_id, s.registry.get_task(&pending_id).reward),
+        ];
+        let keeper_balances_before = vec![(keeper.clone(), s.registry.keeper_balance(&keeper))];
+
+        let accrued = s.registry.fees_accrued();
+        if accrued > 0 {
+            let treasury = Address::generate(&s.env);
+            s.registry.sweep_fees(&s.admin, &treasury, &accrued);
+        }
+
+        let task_rewards_after = vec![
+            (executed_id, s.registry.get_task(&executed_id).reward),
+            (pending_id, s.registry.get_task(&pending_id).reward),
+        ];
+        let keeper_balances_after = vec![(keeper.clone(), s.registry.keeper_balance(&keeper))];
+
+        assert_admin_action_isolated(
+            &task_rewards_before,
+            &task_rewards_after,
+            &keeper_balances_before,
+            &keeper_balances_after,
+        )
+        .expect("I-5: sweep_fees must never touch task escrow or keeper balances");
+    }
+
+    // I-6 — Withdrawal liveness: a keeper's credited balance is always
+    // withdrawable, including while the contract is paused.
+    #[test]
+    fn property_i6_withdrawal_live_while_paused(reward in 1_i128..9_000_000) {
+        let s = setup();
+        let keeper = Address::generate(&s.env);
+        let id = register_reward_task(&s, reward);
+
+        s.registry.claim_task(&keeper, &id);
+        s.registry
+            .execute_task(&keeper, &id, &Bytes::from_slice(&s.env, b"p"));
+
+        s.registry.pause(&s.admin);
+        assert_withdrawal_live(&s.registry, &keeper)
+            .expect("I-6: a keeper's balance must be withdrawable even while paused");
+    }
+
+    // I-7 — Monotonic task ids: registering N tasks in a row always yields
+    // strictly increasing, non-repeating ids. Up to 7 tasks, so each
+    // reward is capped at 1_000_000 to stay within the minted supply.
+    #[test]
+    fn property_i7_task_ids_strictly_increasing(
+        rewards in prop::collection::vec(1_i128..1_000_000, 2..8),
+    ) {
+        let s = setup();
+        let mut ids = Vec::new();
+        for reward in &rewards {
+            ids.push(register_reward_task(&s, *reward));
+        }
+
+        assert_task_ids_monotonic(&ids)
+            .expect("I-7: task ids must be strictly increasing and never reused");
+    }
+}
