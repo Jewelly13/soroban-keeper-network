@@ -21,6 +21,7 @@ soroban-sdk = { version = "22.0.1" }
 
 [dev-dependencies]
 soroban-sdk = { version = "22.0.1", features = ["testutils"] }
+proptest = "1.4"
 
 # Note: release profile is defined once at the workspace root Cargo.toml.
 # Profiles in non-root packages are ignored by Cargo, so it is not repeated here.

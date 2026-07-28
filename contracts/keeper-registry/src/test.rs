@@ -2581,3 +2581,836 @@ fn test_require_admin_distinguishes_not_initialized_from_wrong_caller() {
         Err(Ok(KeeperError::Unauthorized))
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Property Tests (Invariants I-1, I-2, I-3)
+// ─────────────────────────────────────────────────────────────────────────────
+
+extern crate std;
+
+use proptest::prelude::*;
+use std::format;
+use std::string::String;
+use std::vec;
+use std::vec::Vec;
+use crate::test::reentrant_token::NO_ERROR_CODE;
+
+#[derive(Clone, Debug)]
+struct PropertyTaskSpec {
+    owner_idx: usize,
+    reward: i128,
+    deadline_offset: u64,
+    ttl_ledgers: u32,
+    lock_ledgers: u32,
+}
+
+fn reward_strategy() -> impl Strategy<Value = i128> {
+    prop_oneof![
+        Just(1i128),
+        Just(100i128),
+        Just(1_000_000i128),
+        1i128..2_000_000i128,
+    ]
+}
+
+fn deadline_offset_strategy() -> impl Strategy<Value = u64> {
+    prop_oneof![Just(1u64), Just(60u64), Just(3_600u64), 1u64..7_200u64]
+}
+
+fn ttl_ledgers_strategy() -> impl Strategy<Value = u32> {
+    prop_oneof![
+        Just(MIN_TTL_LEDGERS),
+        Just(MIN_TTL_LEDGERS + 1),
+        1_500u32..5_000u32,
+    ]
+}
+
+fn lock_ledgers_strategy() -> impl Strategy<Value = u32> {
+    prop_oneof![
+        Just(MIN_LOCK_LEDGERS),
+        Just(MAX_LOCK_LEDGERS),
+        MIN_LOCK_LEDGERS..240u32,
+    ]
+}
+
+fn property_task_strategy() -> impl Strategy<Value = PropertyTaskSpec> {
+    (
+        0usize..3,
+        reward_strategy(),
+        deadline_offset_strategy(),
+        ttl_ledgers_strategy(),
+        lock_ledgers_strategy(),
+    )
+        .prop_map(
+            |(owner_idx, reward, deadline_offset, ttl_ledgers, lock_ledgers)| PropertyTaskSpec {
+                owner_idx,
+                reward,
+                deadline_offset,
+                ttl_ledgers,
+                lock_ledgers,
+            },
+        )
+}
+
+#[derive(Clone, Debug)]
+enum SolvencyAction {
+    Register(PropertyTaskSpec),
+    Claim { task_idx: usize, keeper_idx: usize },
+    Execute { task_idx: usize, keeper_idx: usize },
+    Cancel { task_idx: usize },
+    Expire { task_idx: usize },
+    IncreaseReward { task_idx: usize, amount: i128 },
+    Withdraw { keeper_idx: usize },
+    Advance { ledgers: u32, seconds: u64 },
+}
+
+fn solvency_action_strategy() -> impl Strategy<Value = SolvencyAction> {
+    prop_oneof![
+        3 => property_task_strategy().prop_map(SolvencyAction::Register),
+        2 => (0usize..5, 0usize..3).prop_map(|(t, k)| SolvencyAction::Claim { task_idx: t, keeper_idx: k }),
+        2 => (0usize..5, 0usize..3).prop_map(|(t, k)| SolvencyAction::Execute { task_idx: t, keeper_idx: k }),
+        2 => (0usize..5).prop_map(|t| SolvencyAction::Cancel { task_idx: t }),
+        2 => (0usize..5).prop_map(|t| SolvencyAction::Expire { task_idx: t }),
+        2 => (0usize..5, 1i128..50_000i128).prop_map(|(t, a)| SolvencyAction::IncreaseReward { task_idx: t, amount: a }),
+        2 => (0usize..3).prop_map(|k| SolvencyAction::Withdraw { keeper_idx: k }),
+        2 => (0u32..5u32, 0u64..300u64).prop_map(|(l, s)| SolvencyAction::Advance { ledgers: l, seconds: s }),
+    ]
+}
+
+#[derive(Clone, Debug)]
+enum ModelTaskStatus {
+    Pending,
+    Claimed { keeper_idx: usize, claim_ledger: u32 },
+    Executed,
+    Cancelled,
+    Expired,
+}
+
+#[derive(Clone, Debug)]
+struct ModelTask {
+    owner_idx: usize,
+    reward: i128,
+    deadline: u64,
+    lock_ledgers: u32,
+    status: ModelTaskStatus,
+}
+
+#[derive(Clone, Debug)]
+struct AccountingModel {
+    tasks: Vec<ModelTask>,
+    keeper_balances: [i128; 3],
+    fees_accrued: i128,
+    executed_ops: Vec<String>,
+}
+
+impl AccountingModel {
+    fn new() -> Self {
+        Self {
+            tasks: vec![],
+            keeper_balances: [0, 0, 0],
+            fees_accrued: 0,
+            executed_ops: vec![],
+        }
+    }
+
+    fn expected_registry_balance(&self) -> i128 {
+        let open_escrow: i128 = self
+            .tasks
+            .iter()
+            .filter(|task| matches!(task.status, ModelTaskStatus::Pending | ModelTaskStatus::Claimed { .. }))
+            .map(|task| task.reward)
+            .sum();
+        open_escrow
+            + self.keeper_balances.iter().sum::<i128>()
+            + self.fees_accrued
+    }
+}
+
+fn model_lock_expired(task: &ModelTask, current_sequence: u32) -> bool {
+    match task.status {
+        ModelTaskStatus::Claimed { claim_ledger, .. } => {
+            current_sequence >= claim_ledger.saturating_add(task.lock_ledgers)
+        }
+        _ => false,
+    }
+}
+
+fn make_property_owners(s: &Setup) -> Vec<Address> {
+    let owners = vec![
+        s.admin.clone(),
+        Address::generate(&s.env),
+        Address::generate(&s.env),
+    ];
+    let asset = token::StellarAssetClient::new(&s.env, &s.token_id);
+    for owner in owners.iter().skip(1) {
+        asset.mint(owner, &10_000_000i128);
+    }
+    owners
+}
+
+fn make_property_keepers(env: &Env) -> Vec<Address> {
+    vec![
+        Address::generate(env),
+        Address::generate(env),
+        Address::generate(env),
+    ]
+}
+
+fn register_property_task(s: &Setup, owner: &Address, spec: &PropertyTaskSpec) -> u64 {
+    let deadline = s.env.ledger().timestamp() + spec.deadline_offset;
+    s.registry.register_task(
+        owner,
+        &TaskType::Liquidation,
+        &calldata(&s.env),
+        &spec.reward,
+        &deadline,
+        &spec.ttl_ledgers,
+        &spec.lock_ledgers,
+    )
+}
+
+fn proptest_seed_hint() -> String {
+    std::env::var("PROPTEST_CASE_ID")
+        .or_else(|_| std::env::var("PROPTEST_SEED"))
+        .unwrap_or_else(|_| String::from("proptest-managed"))
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    // Invariant I-1 from docs/ARCHITECTURE.md / Issue 0050:
+    // registry balance == open escrow + keeper credited balances + accrued fees.
+    #[test]
+    fn test_i1_solvency(actions in proptest::collection::vec(solvency_action_strategy(), 6..18)) {
+        let s = setup();
+        let owners = make_property_owners(&s);
+        let keepers = make_property_keepers(&s.env);
+        let token = token::Client::new(&s.env, &s.token_id);
+        let planned_actions = actions.clone();
+        let mut task_ids = Vec::new();
+        let mut model = AccountingModel::new();
+
+        for action in actions {
+            match action {
+                SolvencyAction::Register(spec) => {
+                    if task_ids.len() >= 5 {
+                        continue;
+                    }
+                    let owner = &owners[spec.owner_idx % owners.len()];
+                    let id = register_property_task(&s, owner, &spec);
+                    task_ids.push(id);
+                    model.tasks.push(ModelTask {
+                        owner_idx: spec.owner_idx % owners.len(),
+                        reward: spec.reward,
+                        deadline: s.env.ledger().timestamp() + spec.deadline_offset,
+                        lock_ledgers: spec.lock_ledgers,
+                        status: ModelTaskStatus::Pending,
+                    });
+                    model.executed_ops.push(format!(
+                        "register(task_id={id}, owner_idx={}, reward={})",
+                        spec.owner_idx % owners.len(),
+                        spec.reward
+                    ));
+                }
+                SolvencyAction::Claim { task_idx, keeper_idx } => {
+                    if task_ids.is_empty() {
+                        continue;
+                    }
+                    let idx = task_idx % task_ids.len();
+                    let id = task_ids[idx];
+                    let keeper = &keepers[keeper_idx % keepers.len()];
+                    let current_time = s.env.ledger().timestamp();
+                    let current_sequence = s.env.ledger().sequence();
+                    let task = &model.tasks[idx];
+                    let valid = current_time < task.deadline
+                        && match task.status {
+                            ModelTaskStatus::Pending => true,
+                            ModelTaskStatus::Claimed { .. } => model_lock_expired(task, current_sequence),
+                            _ => false,
+                        };
+                    if valid {
+                        let res = s.registry.try_claim_task(keeper, &id);
+                        prop_assert!(
+                            res.is_ok(),
+                            "I-1 claim failed for valid model state; seed={} actions={:?} model={:?}",
+                            proptest_seed_hint(),
+                            planned_actions,
+                            model
+                        );
+                        model.tasks[idx].status = ModelTaskStatus::Claimed {
+                            keeper_idx: keeper_idx % keepers.len(),
+                            claim_ledger: current_sequence,
+                        };
+                        model.executed_ops.push(format!(
+                            "claim(task_id={id}, keeper_idx={})",
+                            keeper_idx % keepers.len()
+                        ));
+                    }
+                }
+                SolvencyAction::Execute { task_idx, keeper_idx } => {
+                    if task_ids.is_empty() {
+                        continue;
+                    }
+                    let idx = task_idx % task_ids.len();
+                    let id = task_ids[idx];
+                    let keeper_idx = keeper_idx % keepers.len();
+                    let keeper = &keepers[keeper_idx];
+                    let current_time = s.env.ledger().timestamp();
+                    let valid = current_time < model.tasks[idx].deadline
+                        && matches!(
+                            model.tasks[idx].status,
+                            ModelTaskStatus::Claimed { keeper_idx: k, .. } if k == keeper_idx
+                        );
+                    if valid {
+                        let res = s.registry.try_execute_task(
+                            keeper,
+                            &id,
+                            &Bytes::from_slice(&s.env, b"prop"),
+                        );
+                        prop_assert!(
+                            res.is_ok(),
+                            "I-1 execute failed for valid model state; seed={} actions={:?} model={:?}",
+                            proptest_seed_hint(),
+                            planned_actions,
+                            model
+                        );
+                        let reward = model.tasks[idx].reward;
+                        let (keeper_net, fee) = split_reward(reward, 300u32);
+                        model.keeper_balances[keeper_idx] += keeper_net;
+                        model.fees_accrued += fee;
+                        model.tasks[idx].status = ModelTaskStatus::Executed;
+                        model.executed_ops.push(format!(
+                            "execute(task_id={id}, keeper_idx={keeper_idx}, keeper_net={keeper_net}, fee={fee})"
+                        ));
+                    }
+                }
+                SolvencyAction::Cancel { task_idx } => {
+                    if task_ids.is_empty() {
+                        continue;
+                    }
+                    let idx = task_idx % task_ids.len();
+                    let id = task_ids[idx];
+                    let owner = &owners[model.tasks[idx].owner_idx];
+                    let current_sequence = s.env.ledger().sequence();
+                    let valid = match model.tasks[idx].status {
+                        ModelTaskStatus::Pending => true,
+                        ModelTaskStatus::Claimed { .. } => model_lock_expired(&model.tasks[idx], current_sequence),
+                        _ => false,
+                    };
+                    if valid {
+                        let res = s.registry.try_cancel_task(owner, &id);
+                        prop_assert!(
+                            res.is_ok(),
+                            "I-1 cancel failed for valid model state; seed={} actions={:?} model={:?}",
+                            proptest_seed_hint(),
+                            planned_actions,
+                            model
+                        );
+                        model.tasks[idx].status = ModelTaskStatus::Cancelled;
+                        model.executed_ops.push(format!("cancel(task_id={id})"));
+                    }
+                }
+                SolvencyAction::Expire { task_idx } => {
+                    if task_ids.is_empty() {
+                        continue;
+                    }
+                    let idx = task_idx % task_ids.len();
+                    let id = task_ids[idx];
+                    let valid = s.env.ledger().timestamp() >= model.tasks[idx].deadline
+                        && matches!(
+                            model.tasks[idx].status,
+                            ModelTaskStatus::Pending | ModelTaskStatus::Claimed { .. }
+                        );
+                    if valid {
+                        let res = s.registry.try_expire_task(&id);
+                        prop_assert!(
+                            res.is_ok(),
+                            "I-1 expire failed for valid model state; seed={} actions={:?} model={:?}",
+                            proptest_seed_hint(),
+                            planned_actions,
+                            model
+                        );
+                        model.tasks[idx].status = ModelTaskStatus::Expired;
+                        model.executed_ops.push(format!("expire(task_id={id})"));
+                    }
+                }
+                SolvencyAction::IncreaseReward { task_idx, amount } => {
+                    if task_ids.is_empty() {
+                        continue;
+                    }
+                    let idx = task_idx % task_ids.len();
+                    let id = task_ids[idx];
+                    let owner = &owners[model.tasks[idx].owner_idx];
+                    if matches!(
+                        model.tasks[idx].status,
+                        ModelTaskStatus::Pending | ModelTaskStatus::Claimed { .. }
+                    ) {
+                        let res = s.registry.try_increase_reward(owner, &id, &amount);
+                        prop_assert!(
+                            res.is_ok(),
+                            "I-1 top-up failed for valid model state; seed={} actions={:?} model={:?}",
+                            proptest_seed_hint(),
+                            planned_actions,
+                            model
+                        );
+                        model.tasks[idx].reward += amount;
+                        model.executed_ops.push(format!(
+                            "increase_reward(task_id={id}, amount={amount})"
+                        ));
+                    }
+                }
+                SolvencyAction::Withdraw { keeper_idx } => {
+                    let keeper_idx = keeper_idx % keepers.len();
+                    let keeper = &keepers[keeper_idx];
+                    let expected = model.keeper_balances[keeper_idx];
+                    if expected > 0 {
+                        let res = s.registry.try_withdraw_rewards(keeper);
+                        prop_assert!(
+                            matches!(res, Ok(Ok(amount)) if amount == expected),
+                            "I-1 withdraw failed for valid model state; seed={} actions={:?} model={:?} result={:?}",
+                            proptest_seed_hint()
+                            ,
+                            planned_actions,
+                            model,
+                            res
+                        );
+                        model.keeper_balances[keeper_idx] = 0;
+                        model.executed_ops.push(format!(
+                            "withdraw(keeper_idx={keeper_idx}, amount={expected})"
+                        ));
+                    }
+                }
+                SolvencyAction::Advance { ledgers, seconds } => {
+                    advance(&s.env, ledgers, seconds);
+                    model.executed_ops.push(format!(
+                        "advance(ledgers={ledgers}, seconds={seconds})"
+                    ));
+                }
+            }
+
+            let registry_balance = token.balance(&s.registry.address);
+            let observed_keeper_sum: i128 = keepers.iter().map(|keeper| s.registry.keeper_balance(keeper)).sum();
+            let expected_keeper_sum: i128 = model.keeper_balances.iter().sum();
+            let observed_fees = s.registry.fees_accrued();
+            let expected_balance = model.expected_registry_balance();
+
+            prop_assert_eq!(
+                observed_keeper_sum,
+                expected_keeper_sum,
+                "Invariant I-1 keeper balances drifted; seed={} actions={:?} ops={:?} model={:?}",
+                proptest_seed_hint(),
+                planned_actions,
+                model.executed_ops
+                ,
+                model
+            );
+            prop_assert_eq!(
+                observed_fees,
+                model.fees_accrued,
+                "Invariant I-1 fees drifted; seed={} actions={:?} ops={:?} model={:?}",
+                proptest_seed_hint(),
+                planned_actions,
+                model.executed_ops
+                ,
+                model
+            );
+            prop_assert_eq!(
+                registry_balance,
+                expected_balance,
+                "Invariant I-1 solvency violated; seed={} actions={:?} ops={:?} model={:?} observed_registry_balance={} expected_balance={}",
+                proptest_seed_hint(),
+                planned_actions,
+                model.executed_ops,
+                model,
+                registry_balance,
+                expected_balance
+            );
+        }
+    }
+
+    // Invariant I-2 from docs/ARCHITECTURE.md:
+    // every escrowed reward has a reachable terminal resolution path.
+    #[test]
+    fn test_i2_escrow_recoverability(
+        spec in property_task_strategy(),
+    ) {
+        let cancel_setup = setup();
+        let cancel_owners = make_property_owners(&cancel_setup);
+        let cancel_owner = &cancel_owners[spec.owner_idx % cancel_owners.len()];
+        let cancel_id = register_property_task(&cancel_setup, cancel_owner, &spec);
+        prop_assert!(
+            cancel_setup.registry.try_cancel_task(cancel_owner, &cancel_id).is_ok(),
+            "Invariant I-2 cancel path unreachable; seed={} task={:?}",
+            proptest_seed_hint(),
+            spec
+        );
+        prop_assert_eq!(
+            cancel_setup.registry.get_task(&cancel_id).status,
+            TaskStatus::Cancelled,
+            "Invariant I-2 cancel path did not terminate; seed={} task={:?}",
+            proptest_seed_hint(),
+            spec
+        );
+
+        let execute_setup = setup();
+        let execute_owners = make_property_owners(&execute_setup);
+        let execute_owner = &execute_owners[spec.owner_idx % execute_owners.len()];
+        let execute_keeper = Address::generate(&execute_setup.env);
+        let execute_id = register_property_task(&execute_setup, execute_owner, &spec);
+        prop_assert!(
+            execute_setup.registry.try_claim_task(&execute_keeper, &execute_id).is_ok(),
+            "Invariant I-2 claim path unreachable; seed={} task={:?}",
+            proptest_seed_hint(),
+            spec
+        );
+        prop_assert!(
+            execute_setup
+                .registry
+                .try_execute_task(&execute_keeper, &execute_id, &Bytes::from_slice(&execute_setup.env, b"i2"))
+                .is_ok(),
+            "Invariant I-2 execute path unreachable; seed={} task={:?}",
+            proptest_seed_hint(),
+            spec
+        );
+        let (keeper_net, fee) = split_reward(spec.reward, 300u32);
+        prop_assert!(
+            matches!(
+                execute_setup.registry.try_withdraw_rewards(&execute_keeper),
+                Ok(Ok(amount)) if amount == keeper_net
+            ),
+            "Invariant I-2 withdraw path unreachable; seed={} task={:?}",
+            proptest_seed_hint(),
+            spec
+        );
+        prop_assert_eq!(
+            token::Client::new(&execute_setup.env, &execute_setup.token_id)
+                .balance(&execute_setup.registry.address),
+            fee,
+            "Invariant I-2 execute path left unresolved escrow; seed={} task={:?}",
+            proptest_seed_hint(),
+            spec
+        );
+
+        let expire_setup = setup();
+        let expire_owners = make_property_owners(&expire_setup);
+        let expire_owner = &expire_owners[spec.owner_idx % expire_owners.len()];
+        let expire_id = register_property_task(&expire_setup, expire_owner, &spec);
+        // Issue 0005 reference: keep the simulated expiry within a live TTL
+        // window so this property keeps exercising recoverability rather than
+        // archival/restore host behavior. Once Issue 0005 is fixed this range
+        // can widen without changing the assertions.
+        advance(&expire_setup.env, 1, spec.deadline_offset + 1);
+        prop_assert!(
+            expire_setup.registry.try_expire_task(&expire_id).is_ok(),
+            "Invariant I-2 expire path unreachable; seed={} task={:?}",
+            proptest_seed_hint(),
+            spec
+        );
+        prop_assert_eq!(
+            expire_setup.registry.get_task(&expire_id).status,
+            TaskStatus::Expired,
+            "Invariant I-2 expire path did not terminate; seed={} task={:?}",
+            proptest_seed_hint(),
+            spec
+        );
+        prop_assert_eq!(
+            token::Client::new(&expire_setup.env, &expire_setup.token_id)
+                .balance(&expire_setup.registry.address),
+            0i128,
+            "Invariant I-2 expire path left escrow stranded; seed={} task={:?}",
+            proptest_seed_hint(),
+            spec
+        );
+    }
+
+    // Invariant I-3 from docs/ARCHITECTURE.md:
+    // every reward is paid out exactly once across sequential and reentrant attempts.
+    #[test]
+    fn test_i3_single_payout(
+        spec in property_task_strategy(),
+        path in 0u8..5,
+        different_second_caller in any::<bool>(),
+    ) {
+        match path {
+            0 => {
+                let s = setup();
+                let owners = make_property_owners(&s);
+                let owner = &owners[spec.owner_idx % owners.len()];
+                let other_owner = &owners[(spec.owner_idx + 1) % owners.len()];
+                let token = token::Client::new(&s.env, &s.token_id);
+                let task_id = register_property_task(&s, owner, &spec);
+                let owner_before = token.balance(owner);
+                let payer = if different_second_caller { other_owner } else { owner };
+                let sequence = vec![
+                    format!("cancel(task_id={task_id})"),
+                    format!("cancel-again(task_id={task_id}, different_second_caller={different_second_caller})"),
+                ];
+
+                prop_assert!(
+                    s.registry.try_cancel_task(owner, &task_id).is_ok(),
+                    "Invariant I-3 cancel first call failed; seed={} path=cancel task={:?} ops={:?}",
+                    proptest_seed_hint(),
+                    spec,
+                    sequence
+                );
+                let second = s.registry.try_cancel_task(payer, &task_id);
+                prop_assert!(
+                    matches!(second, Err(Ok(_))),
+                    "Invariant I-3 cancel second call must return typed contract error; seed={} task={:?} second={:?} ops={:?}",
+                    proptest_seed_hint(),
+                    spec,
+                    second,
+                    sequence
+                );
+                prop_assert_eq!(
+                    token.balance(owner) - owner_before,
+                    spec.reward,
+                    "Invariant I-3 cancel paid wrong amount; seed={} task={:?} ops={:?}",
+                    proptest_seed_hint(),
+                    spec,
+                    sequence
+                );
+                prop_assert_eq!(
+                    token.balance(&s.registry.address),
+                    0i128,
+                    "Invariant I-3 cancel left positive registry balance; seed={} task={:?} ops={:?}",
+                    proptest_seed_hint(),
+                    spec,
+                    sequence
+                );
+            }
+            1 => {
+                let s = setup();
+                let owners = make_property_owners(&s);
+                let owner = &owners[spec.owner_idx % owners.len()];
+                let keepers = make_property_keepers(&s.env);
+                let keeper = &keepers[0];
+                let other_keeper = &keepers[1];
+                let token = token::Client::new(&s.env, &s.token_id);
+                let task_id = register_property_task(&s, owner, &spec);
+                let keeper_before = token.balance(keeper);
+                let execute_caller = if different_second_caller { other_keeper } else { keeper };
+                let withdraw_caller = if different_second_caller { other_keeper } else { keeper };
+                let (keeper_net, fee) = split_reward(spec.reward, 300u32);
+                let sequence = vec![
+                    format!("claim(task_id={task_id}, keeper=0)"),
+                    format!("execute(task_id={task_id}, keeper=0)"),
+                    format!("execute-again(task_id={task_id}, different_second_caller={different_second_caller})"),
+                    format!("withdraw(keeper=0)"),
+                    format!("withdraw-again(different_second_caller={different_second_caller})"),
+                ];
+
+                prop_assert!(
+                    s.registry.try_claim_task(keeper, &task_id).is_ok(),
+                    "Invariant I-3 execute path claim failed; seed={} task={:?} ops={:?}",
+                    proptest_seed_hint(),
+                    spec,
+                    sequence
+                );
+                prop_assert!(
+                    s.registry
+                        .try_execute_task(keeper, &task_id, &Bytes::from_slice(&s.env, b"i3"))
+                        .is_ok(),
+                    "Invariant I-3 execute first call failed; seed={} task={:?} ops={:?}",
+                    proptest_seed_hint(),
+                    spec,
+                    sequence
+                );
+                let second_execute = s.registry.try_execute_task(
+                    execute_caller,
+                    &task_id,
+                    &Bytes::from_slice(&s.env, b"i3"),
+                );
+                prop_assert!(
+                    matches!(second_execute, Err(Ok(_))),
+                    "Invariant I-3 execute second call must return typed contract error; seed={} task={:?} second={:?} ops={:?}",
+                    proptest_seed_hint(),
+                    spec,
+                    second_execute,
+                    sequence
+                );
+                prop_assert!(
+                    matches!(s.registry.try_withdraw_rewards(keeper), Ok(Ok(amount)) if amount == keeper_net),
+                    "Invariant I-3 withdraw first call failed; seed={} task={:?} ops={:?}",
+                    proptest_seed_hint(),
+                    spec,
+                    sequence
+                );
+                let second_withdraw = s.registry.try_withdraw_rewards(withdraw_caller);
+                prop_assert!(
+                    matches!(second_withdraw, Err(Ok(_))),
+                    "Invariant I-3 withdraw second call must return typed contract error; seed={} task={:?} second={:?} ops={:?}",
+                    proptest_seed_hint(),
+                    spec,
+                    second_withdraw,
+                    sequence
+                );
+                prop_assert_eq!(
+                    token.balance(keeper) - keeper_before,
+                    keeper_net,
+                    "Invariant I-3 execute/withdraw transferred wrong keeper amount; seed={} task={:?} ops={:?}",
+                    proptest_seed_hint(),
+                    spec,
+                    sequence
+                );
+                prop_assert_eq!(
+                    token.balance(&s.registry.address),
+                    fee,
+                    "Invariant I-3 execute/withdraw left wrong registry balance; seed={} task={:?} ops={:?}",
+                    proptest_seed_hint(),
+                    spec,
+                    sequence
+                );
+            }
+            2 => {
+                let s = setup();
+                let owners = make_property_owners(&s);
+                let owner = &owners[spec.owner_idx % owners.len()];
+                let token = token::Client::new(&s.env, &s.token_id);
+                let task_id = register_property_task(&s, owner, &spec);
+                let owner_before = token.balance(owner);
+                let sequence = vec![
+                    format!("advance(deadline_offset_plus_one={})", spec.deadline_offset + 1),
+                    format!("expire(task_id={task_id})"),
+                    format!("expire-again(task_id={task_id})"),
+                ];
+
+                advance(&s.env, 1, spec.deadline_offset + 1);
+                prop_assert!(
+                    s.registry.try_expire_task(&task_id).is_ok(),
+                    "Invariant I-3 expire first call failed; seed={} task={:?} ops={:?}",
+                    proptest_seed_hint(),
+                    spec,
+                    sequence
+                );
+                let second = s.registry.try_expire_task(&task_id);
+                prop_assert!(
+                    matches!(second, Err(Ok(_))),
+                    "Invariant I-3 expire second call must return typed contract error; seed={} task={:?} second={:?} ops={:?}",
+                    proptest_seed_hint(),
+                    spec,
+                    second,
+                    sequence
+                );
+                prop_assert_eq!(
+                    token.balance(owner) - owner_before,
+                    spec.reward,
+                    "Invariant I-3 expire paid wrong amount; seed={} task={:?} ops={:?}",
+                    proptest_seed_hint(),
+                    spec,
+                    sequence
+                );
+                prop_assert_eq!(
+                    token.balance(&s.registry.address),
+                    0i128,
+                    "Invariant I-3 expire left positive registry balance; seed={} task={:?} ops={:?}",
+                    proptest_seed_hint(),
+                    spec,
+                    sequence
+                );
+            }
+            3 => {
+                let env = Env::default();
+                env.mock_all_auths();
+                let admin = Address::generate(&env);
+                let token_id = env.register(reentrant_token::ReentrantToken, ());
+                let mock_token = reentrant_token::ReentrantTokenClient::new(&env, &token_id);
+                mock_token.mint(&admin, &10_000_000i128);
+
+                let registry_id = env.register(KeeperRegistry, ());
+                let registry = KeeperRegistryClient::new(&env, &registry_id);
+                registry.initialize(&admin, &token_id, &300u32);
+
+                let deadline = env.ledger().timestamp() + spec.deadline_offset;
+                let task_id = registry.register_task(
+                    &admin,
+                    &TaskType::Liquidation,
+                    &calldata(&env),
+                    &spec.reward,
+                    &deadline,
+                    &spec.ttl_ledgers,
+                    &spec.lock_ledgers,
+                );
+                let sequence = vec![
+                    format!("arm-reentrant-cancel(task_id={task_id})"),
+                    format!("cancel(task_id={task_id})"),
+                ];
+
+                mock_token.arm(&registry.address, &task_id, &admin);
+                prop_assert!(
+                    registry.try_cancel_task(&admin, &task_id).is_ok(),
+                    "Invariant I-3 reentrant cancel outer call failed; seed={} task={:?} ops={:?}",
+                    proptest_seed_hint(),
+                    spec,
+                    sequence
+                );
+                let code = mock_token.reentry_error_code();
+                if code != NO_ERROR_CODE {
+                    prop_assert_eq!(
+                        code,
+                        KeeperError::InvalidTaskStatus as u32,
+                        "Invariant I-3 reentrant cancel decoded unexpected error; seed={} task={:?} ops={:?}",
+                        proptest_seed_hint(),
+                        spec,
+                        sequence
+                    );
+                }
+                prop_assert!(mock_token.reentry_rejected());
+                prop_assert_eq!(mock_token.refund_count(), 1);
+                prop_assert_eq!(mock_token.balance(&admin), 10_000_000i128);
+                prop_assert_eq!(mock_token.balance(&registry_id), 0i128);
+            }
+            4 => {
+                let env = Env::default();
+                env.mock_all_auths();
+                let admin = Address::generate(&env);
+                let token_id = env.register(reentrant_token_expire::ExpireReentrantToken, ());
+                let token = reentrant_token_expire::ExpireReentrantTokenClient::new(&env, &token_id);
+                token.set_balance(&admin, &5_000_000i128);
+
+                let registry_id = env.register(KeeperRegistry, ());
+                let registry = KeeperRegistryClient::new(&env, &registry_id);
+                registry.initialize(&admin, &token_id, &300u32);
+
+                let reward = spec.reward.min(1_000_000i128);
+                let deadline = env.ledger().timestamp() + spec.deadline_offset.min(60);
+                let task_id = registry.register_task(
+                    &admin,
+                    &TaskType::Liquidation,
+                    &calldata(&env),
+                    &reward,
+                    &deadline,
+                    &spec.ttl_ledgers,
+                    &spec.lock_ledgers,
+                );
+                let sequence = vec![
+                    format!("advance(deadline_offset_plus_one={})", spec.deadline_offset.min(60) + 1),
+                    format!("arm-reentrant-expire(task_id={task_id})"),
+                    format!("expire(task_id={task_id})"),
+                ];
+
+                advance(&env, 1, spec.deadline_offset.min(60) + 1);
+                token.arm(&registry.address, &task_id);
+                prop_assert!(
+                    registry.try_expire_task(&task_id).is_ok(),
+                    "Invariant I-3 reentrant expire outer call failed; seed={} task={:?} ops={:?}",
+                    proptest_seed_hint(),
+                    spec,
+                    sequence
+                );
+                prop_assert_ne!(
+                    token.reentrant_code(),
+                    0u32,
+                    "Invariant I-3 reentrant expire must reject the nested payout attempt; seed={} task={:?} ops={:?}",
+                    proptest_seed_hint(),
+                    spec,
+                    sequence
+                );
+                prop_assert_eq!(token.balance(&admin), 5_000_000i128);
+                prop_assert_eq!(token.balance(&registry_id), 0i128);
+                prop_assert_eq!(registry.get_task(&task_id).status, TaskStatus::Expired);
+            }
+            _ => unreachable!(),
+        }
+    }
+}
