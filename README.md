@@ -338,6 +338,9 @@ All events use two-topic format `(verb_symbol, noun_symbol)` for efficient filte
 | `TaskExpired` | `("exp", "task")` | `(task_id,)` |
 | `TaskCancelled` | `("cancel", "task")` | `(task_id, owner)` |
 | `RewardsWithdrawn` | `("withdraw", "reward")` | `(keeper, amount)` |
+| `Initialized` | `("init", "admin")` | `(admin, reward_token, fee_bps)` — emitted at most once |
+| `MinRewardUpdated` | `("minrwd", "admin")` | `(old_min, new_min)` |
+| `FeesSweep` | `("sweep", "admin")` | `(treasury, amount, remaining)` |
 
 #### Task Lifecycle State Machine
 
