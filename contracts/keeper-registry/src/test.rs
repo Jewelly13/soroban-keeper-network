@@ -14,9 +14,7 @@
 
 use soroban_sdk::{
     testutils::{Address as _, Deployer as _, Events as _, Ledger, MockAuth, MockAuthInvoke},
-    token, Address, Bytes, Env, IntoVal,
-    testutils::{Address as _, Deployer as _, Events as _, Ledger},
-    token, Address, Bytes, Env, TryIntoVal,
+    token, Address, Bytes, Env, IntoVal, TryIntoVal,
 };
 
 use crate::{
@@ -411,7 +409,6 @@ fn test_register_increments_task_counter() {
 
 #[test]
 fn test_register_task_ttl_shorter_than_deadline_fails() {
-fn test_register_task_with_max_calldata_succeeds() {
     let env = Env::default();
     env.mock_all_auths();
 
@@ -442,6 +439,24 @@ fn test_register_task_with_max_calldata_succeeds() {
         Err(Ok(KeeperError::TtlTooShort))
     );
     // Nothing was escrowed and no task was created.
+    assert_eq!(registry.task_count(), 0u64);
+}
+
+#[test]
+fn test_register_task_with_max_calldata_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    token::StellarAssetClient::new(&env, &token_id).mint(&admin, &5_000_000i128);
+
+    let registry_id = env.register(KeeperRegistry, ());
+    let registry = KeeperRegistryClient::new(&env, &registry_id);
+    registry.initialize(&admin, &token_id, &300u32);
+
     // Exactly at the cap — the largest accepted payload.
     let max_calldata = Bytes::from_array(&env, &[0u8; MAX_CALLDATA_LEN as usize]);
     let id = registry.register_task(
@@ -543,6 +558,9 @@ fn test_expire_task_succeeds_past_old_ttl_boundary() {
 
     assert_eq!(token.balance(&s.admin), before);
     assert_eq!(s.registry.get_task(&id).status, TaskStatus::Expired);
+}
+
+#[test]
 fn test_register_task_with_empty_calldata_succeeds() {
     let env = Env::default();
     env.mock_all_auths();
