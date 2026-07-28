@@ -147,7 +147,31 @@ pub enum KeeperError {
     // than reused so the two branches don't collide on the same discriminant.
     /// `calldata` exceeds [`MAX_CALLDATA_LEN`].
     CalldataTooLarge = 17,
+    /// `lock_ledgers` or `ttl_ledgers` passed to `register_task` fell outside
+    /// their allowed bounds.
+    InvalidTaskParams = 18,
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Task parameter bounds
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Stellar closes a ledger roughly every 5 seconds. A lock window shorter than
+/// this gives the claiming keeper no realistic chance to build and submit its
+/// `execute_task` transaction before another keeper can reclaim the task out
+/// from under it.
+const MIN_LOCK_LEDGERS: u32 = 12; // ~1 minute
+
+/// A lock window longer than this lets a single unresponsive keeper hold a
+/// task hostage for the better part of a day, with no possibility of
+/// takeover until `expire_task` becomes callable at the deadline.
+const MAX_LOCK_LEDGERS: u32 = 17_280; // ~1 day
+
+/// Persistent storage entries need enough runway to survive from
+/// registration through claim and execution without lapsing mid-flight.
+/// Below this, the TTL extension is not worth writing and risks the entry
+/// (and its escrowed reward) becoming inaccessible before a keeper can act.
+const MIN_TTL_LEDGERS: u32 = 1_000; // ~83 minutes
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Events — emitted for off-chain keeper bots to consume
@@ -510,8 +534,10 @@ impl KeeperRegistry {
     //                  CalldataTooLarge otherwise
     //   reward       — XLM stroops escrowed as bounty
     //   deadline     — unix timestamp after which the task expires
-    //   ttl_ledgers  — how long to keep the storage entry alive
-    //   lock_ledgers — ledgers the claimer holds exclusive rights
+    //   ttl_ledgers  — how long to keep the storage entry alive; must be at
+    //                  least `MIN_TTL_LEDGERS`
+    //   lock_ledgers — ledgers the claimer holds exclusive rights; must be in
+    //                  `[MIN_LOCK_LEDGERS, MAX_LOCK_LEDGERS]`
     //
     // Returns the new task_id.
 
@@ -543,6 +569,12 @@ impl KeeperRegistry {
         }
         if calldata.len() > MAX_CALLDATA_LEN {
             return Err(KeeperError::CalldataTooLarge);
+        }
+        if !(MIN_LOCK_LEDGERS..=MAX_LOCK_LEDGERS).contains(&lock_ledgers) {
+            return Err(KeeperError::InvalidTaskParams);
+        }
+        if ttl_ledgers < MIN_TTL_LEDGERS {
+            return Err(KeeperError::InvalidTaskParams);
         }
 
         bump_instance(&e);
@@ -745,10 +777,10 @@ impl KeeperRegistry {
 
     // ── cancel_task ──────────────────────────────────────────────────────────
     //
-    // The owner reclaims a task that no keeper has picked up yet. Only Pending
-    // tasks can be cancelled — once a keeper has claimed one, the owner must
-    // wait for execution or for the deadline to pass (expire_task), so a keeper
-    // that has started work can't have the reward pulled out from under it.
+    // The owner reclaims a task. Pending tasks can be cancelled immediately.
+    // Claimed tasks can also be cancelled by the owner once the claimer's lock
+    // period has expired (`lock_expired(&e, &task) == true`), so a keeper that
+    // has started work has exclusive time to execute before escrow can be pulled.
 
     pub fn cancel_task(e: Env, owner: Address, task_id: u64) -> Result<(), KeeperError> {
         owner.require_auth();
@@ -757,8 +789,14 @@ impl KeeperRegistry {
         if task.owner != owner {
             return Err(KeeperError::NotTaskOwner);
         }
-        if task.status != TaskStatus::Pending {
-            return Err(KeeperError::InvalidTaskStatus);
+        match task.status {
+            TaskStatus::Pending => {}
+            TaskStatus::Claimed => {
+                if !lock_expired(&e, &task) {
+                    return Err(KeeperError::LockPeriodActive);
+                }
+            }
+            _ => return Err(KeeperError::InvalidTaskStatus),
         }
 
         bump_instance(&e);
@@ -843,9 +881,38 @@ impl KeeperRegistry {
 
     // ── pause / unpause ───────────────────────────────────────────────────────
     //
-    // Admin emergency circuit breaker. While paused, register_task/claim_task/
-    // execute_task are blocked, but expire_task and withdraw_rewards remain open
-    // so funds can always be recovered even during an incident.
+    // Admin emergency circuit breaker. The rule of thumb: anything that opens
+    // new exposure (new escrow, new claims, new execution payouts) is blocked;
+    // anything that only lets value flow back out to whoever already owns it
+    // stays open, so an incident response can never itself become a fund
+    // freeze. Read-only views are never gated.
+    //
+    // Verified against `require_not_paused(&e)?` (or its absence) at the top
+    // of each function, current as of the pause-policy-matrix test suite in
+    // `test.rs` (`test_pause_policy_matrix_entry_point_by_entry_point` et al.)
+    // — that test is the source of truth if this table and the code ever
+    // drift apart again.
+    //
+    // | Entry point       | While paused | Why                                   |
+    // |--------------------|-------------|----------------------------------------|
+    // | `register_task`    | BLOCKED     | opens new escrow exposure              |
+    // | `claim_task`       | BLOCKED     | opens new keeper exposure              |
+    // | `execute_task`     | BLOCKED     | pays out new rewards                   |
+    // | `increase_reward`  | BLOCKED     | opens new escrow exposure              |
+    // | `extend_deadline`  | NOT gated   | **known bug**, tracked separately — see|
+    // |                    | (allowed)   | TODO next to the test below. Should    |
+    // |                    |             | arguably be blocked (it doesn't touch  |
+    // |                    |             | funds either way, but was likely meant |
+    // |                    |             | to follow register/claim/execute).     |
+    // | `cancel_task`      | allowed     | owner reclaiming pending-task escrow;  |
+    // |                    |             | liveness, not new exposure             |
+    // | `expire_task`      | allowed     | permissionless fund recovery           |
+    // | `withdraw_rewards` | allowed     | keeper pulling already-earned balance  |
+    // | read-only views    | allowed     | side-effect-free, never gated          |
+    //
+    // `set_fee_bps`/`set_min_reward`/`transfer_admin`/`upgrade`/`sweep_fees`
+    // are admin-only (`require_admin`) and were never in scope for the pause
+    // gate at all — pausing doesn't restrict what the admin itself can do.
 
     pub fn pause(e: Env, admin: Address) -> Result<(), KeeperError> {
         require_admin(&e, &admin)?;
