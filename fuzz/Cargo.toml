@@ -1,0 +1,38 @@
+[package]
+name = "keeper-registry-fuzz"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# This crate is NOT part of the workspace to avoid including libfuzzer-sys
+# in normal builds. Only fuzz targets should depend on it.
+
+[features]
+# Enable arbitrary data generation for all fuzz targets
+arbitrary = []
+
+[dependencies]
+keeper-registry = { path = "../contracts/keeper-registry" }
+soroban-sdk = { version = "22.0.1", features = ["testutils"] }
+libfuzzer-sys = { version = "0.4", optional = true }
+arbitrary = { version = "1", features = ["derive"], optional = true }
+
+[build-dependencies]
+soroban-sdk = { version = "22.0.1" }
+
+[profile.release]
+# Fuzzing needs all optimizations disabled for better crash detection
+opt-level = 0
+debug = true
+overflow-checks = true
+debug-assertions = true
+codegen-units = 1
+panic = "abort"  # Critical for fuzzing - we want to detect all panics
+lto = false
+
+[profile.dev]
+opt-level = 0
+debug = true
+overflow-checks = true
+debug-assertions = true
+codegen-units = 1
