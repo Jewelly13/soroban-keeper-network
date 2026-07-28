@@ -2813,3 +2813,369 @@ proptest! {
             .expect("I-7: task ids must be strictly increasing and never reused");
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Verifier mocks (#96-#106) — minimal, test-only contracts following the
+// established `mod reentrant_token { ... }` local-mock-contract pattern.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A verifier whose `verify` always returns `true` — the happy-path mock for
+/// #108.
+mod always_approve_verifier {
+    use soroban_sdk::{contract, contractimpl, Address, Bytes, Env};
+
+    use crate::Task;
+
+    #[contract]
+    pub struct AlwaysApproveVerifier;
+
+    #[contractimpl]
+    impl AlwaysApproveVerifier {
+        pub fn verify(_env: Env, _task: Task, _keeper: Address, _proof: Bytes) -> bool {
+            true
+        }
+    }
+}
+
+/// A verifier whose `verify` always returns `false` — the rejection-path
+/// mock for #109.
+mod always_reject_verifier {
+    use soroban_sdk::{contract, contractimpl, Address, Bytes, Env};
+
+    use crate::Task;
+
+    #[contract]
+    pub struct AlwaysRejectVerifier;
+
+    #[contractimpl]
+    impl AlwaysRejectVerifier {
+        pub fn verify(_env: Env, _task: Task, _keeper: Address, _proof: Bytes) -> bool {
+            false
+        }
+    }
+}
+
+/// A verifier whose `verify` always panics — the worst-case mock for #110,
+/// distinct from `always_reject_verifier`: a `false` return is a normal,
+/// recoverable rejection `execute_task` handles gracefully, while a panic
+/// is a genuinely unrecoverable host error that aborts the whole
+/// transaction (see `IKeeperVerifier`'s doc comment for why).
+mod panicking_verifier {
+    use soroban_sdk::{contract, contractimpl, panic_with_error, Address, Bytes, Env};
+
+    use crate::{KeeperError, Task};
+
+    #[contract]
+    pub struct PanickingVerifier;
+
+    #[contractimpl]
+    impl PanickingVerifier {
+        pub fn verify(env: Env, _task: Task, _keeper: Address, _proof: Bytes) -> bool {
+            // Any panic value works to exercise the "verifier panics" path;
+            // panic_with_error is used here (rather than a bare panic!())
+            // purely so the failure is visible as a proper contract error in
+            // test output rather than an opaque WASM trap message.
+            panic_with_error!(&env, KeeperError::Unauthorized);
+        }
+    }
+}
+
+/// Registers a task with `verifier` attached, funded and deadlined the same
+/// way `register_reward_task` is, so the verifier-specific tests don't
+/// duplicate that boilerplate.
+fn register_task_with_verifier(s: &Setup, reward: i128, verifier: &Address) -> u64 {
+    let deadline = s.env.ledger().timestamp() + 3_600;
+    s.registry.register_task(
+        &s.admin,
+        &TaskType::Liquidation,
+        &calldata(&s.env),
+        &reward,
+        &deadline,
+        &17_280u32,
+        &120u32,
+        &Some(verifier.clone()),
+    )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #107 — update_verifier is rejected once a task is claimed
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_update_verifier_rejected_once_task_is_claimed() {
+    let s = setup();
+    let verifier_id = s.env.register(always_approve_verifier::AlwaysApproveVerifier, ());
+    let task_id = register_task_with_verifier(&s, 1_000_000i128, &verifier_id);
+
+    let keeper = Address::generate(&s.env);
+    s.registry.claim_task(&keeper, &task_id);
+
+    let new_verifier = Address::generate(&s.env);
+    let result = s
+        .registry
+        .try_update_verifier(&s.admin, &task_id, &Some(new_verifier.clone()));
+    assert_eq!(result, Err(Ok(KeeperError::InvalidTaskStatus)));
+
+    // The task's verifier field must be unchanged after the rejected attempt.
+    let task = s.registry.get_task(&task_id);
+    assert_eq!(task.verifier, Some(verifier_id));
+    assert_ne!(task.verifier, Some(new_verifier));
+}
+
+#[test]
+fn test_update_verifier_succeeds_while_pending() {
+    // Sanity check alongside the rejection test above: the restriction is
+    // specifically "not once claimed", not "never" — a Pending task's
+    // verifier can still be changed freely.
+    let s = setup();
+    let task_id = register_default_task(&s); // no verifier attached yet
+
+    let verifier_id = s
+        .env
+        .register(always_approve_verifier::AlwaysApproveVerifier, ());
+    s.registry
+        .update_verifier(&s.admin, &task_id, &Some(verifier_id.clone()));
+
+    let task = s.registry.get_task(&task_id);
+    assert_eq!(task.verifier, Some(verifier_id));
+}
+
+#[test]
+fn test_update_verifier_rejects_non_owner() {
+    let s = setup();
+    let task_id = register_default_task(&s);
+    let stranger = Address::generate(&s.env);
+    let verifier_id = s
+        .env
+        .register(always_approve_verifier::AlwaysApproveVerifier, ());
+
+    assert_eq!(
+        s.registry
+            .try_update_verifier(&stranger, &task_id, &Some(verifier_id)),
+        Err(Ok(KeeperError::NotTaskOwner))
+    );
+}
+
+#[test]
+fn test_update_verifier_rejected_when_paused() {
+    let s = setup();
+    let task_id = register_default_task(&s);
+    let verifier_id = s
+        .env
+        .register(always_approve_verifier::AlwaysApproveVerifier, ());
+
+    s.registry.pause(&s.admin);
+    assert_eq!(
+        s.registry
+            .try_update_verifier(&s.admin, &task_id, &Some(verifier_id)),
+        Err(Ok(KeeperError::ContractPaused))
+    );
+}
+
+#[test]
+fn test_update_verifier_emits_event() {
+    let s = setup();
+    let task_id = register_default_task(&s);
+    let verifier_id = s
+        .env
+        .register(always_approve_verifier::AlwaysApproveVerifier, ());
+
+    s.registry
+        .update_verifier(&s.admin, &task_id, &Some(verifier_id.clone()));
+
+    let expected_topic: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("verifier"), symbol_short!("task")).into_val(&s.env);
+    let found = s.env.events().all().iter().any(|(contract, topics, _)| {
+        contract == s.registry.address && topics == expected_topic
+    });
+    assert!(found, "VerifierUpdated event must be emitted");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #108 — execute_task with a verifier that always approves
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_execute_task_with_always_approve_verifier_matches_no_verifier_outcome() {
+    let s = setup();
+    let verifier_id = s.env.register(always_approve_verifier::AlwaysApproveVerifier, ());
+    let reward = 1_000_000i128;
+    let task_id = register_task_with_verifier(&s, reward, &verifier_id);
+
+    let keeper = Address::generate(&s.env);
+    s.registry.claim_task(&keeper, &task_id);
+
+    let proof = Bytes::from_slice(&s.env, b"proof-bytes");
+    s.registry.execute_task(&keeper, &task_id, &proof);
+
+    // Check events immediately after the call that emits them: each
+    // top-level client call is its own host invocation, and
+    // `s.env.events().all()` only reflects the most recent one — any
+    // further contract calls (even read-only ones like `get_task`) start a
+    // new invocation and the previous one's events are no longer visible.
+    let all_events = s.env.events().all();
+    let verfail_topic: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("verfail"), symbol_short!("task")).into_val(&s.env);
+    let verfail_fired = all_events.iter().any(|(contract, topics, _)| {
+        contract == s.registry.address && topics == verfail_topic
+    });
+    assert!(
+        !verfail_fired,
+        "TaskVerificationFailed must not fire when the verifier approves"
+    );
+
+    let exec_topic: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("exec"), symbol_short!("task")).into_val(&s.env);
+    let exec_fired = all_events.iter().any(|(contract, topics, _)| {
+        contract == s.registry.address && topics == exec_topic
+    });
+    assert!(exec_fired, "TaskExecuted must still fire");
+
+    // Same outcome as the no-verifier path: full net reward credited, fee
+    // accrued, task Executed.
+    let (expected_net, expected_fee) = split_reward(reward, 300u32);
+    assert_eq!(s.registry.keeper_balance(&keeper), expected_net);
+    assert_eq!(s.registry.fees_accrued(), expected_fee);
+
+    let task = s.registry.get_task(&task_id);
+    assert_eq!(task.status, TaskStatus::Executed);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #109 — execute_task with a verifier that always rejects
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_execute_task_with_always_reject_verifier() {
+    let s = setup();
+    let verifier_id = s.env.register(always_reject_verifier::AlwaysRejectVerifier, ());
+    let reward = 1_000_000i128;
+    let task_id = register_task_with_verifier(&s, reward, &verifier_id);
+
+    let keeper = Address::generate(&s.env);
+    s.registry.claim_task(&keeper, &task_id);
+
+    let proof = Bytes::from_slice(&s.env, b"first-attempt-proof");
+    let result = s.registry.try_execute_task(&keeper, &task_id, &proof);
+    assert_eq!(result, Err(Ok(KeeperError::VerificationFailed)));
+
+    // Note: we don't assert TaskVerificationFailed's presence in
+    // `s.env.events().all()` here. Soroban's host rolls back a whole call
+    // frame — events included — whenever that frame's top-level function
+    // returns `Err` (see `with_frame`/`call_n_internal` in
+    // soroban-env-host), even though the error itself is "recoverable" from
+    // the caller's perspective via `try_`. So an event published right
+    // before an `Err` return is never observable by any caller, in any
+    // Soroban contract; `emit_verification_failed`'s call site in
+    // `execute_task` can't be exercised by a test that also checks the
+    // `Err` result. What we *can* and do verify below is the actually
+    // observable contract: the typed error, and that state didn't change.
+
+    // Task remains Claimed — not Executed, not reverted to Pending.
+    let task = s.registry.get_task(&task_id);
+    assert_eq!(task.status, TaskStatus::Claimed);
+    assert_eq!(task.claimer, Some(keeper.clone()));
+
+    // No token transfer / keeper crediting occurred.
+    assert_eq!(s.registry.keeper_balance(&keeper), 0i128);
+    assert_eq!(s.registry.fees_accrued(), 0i128);
+
+    // A second execute_task call (different proof bytes, same always-reject
+    // verifier) fails the same way — the rejection is repeatable, not a
+    // one-shot state change.
+    let proof2 = Bytes::from_slice(&s.env, b"second-attempt-different-proof");
+    let result2 = s.registry.try_execute_task(&keeper, &task_id, &proof2);
+    assert_eq!(result2, Err(Ok(KeeperError::VerificationFailed)));
+
+    let task_after_retry = s.registry.get_task(&task_id);
+    assert_eq!(task_after_retry.status, TaskStatus::Claimed);
+    assert_eq!(task_after_retry.claimer, Some(keeper));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #110 — execute_task against a panicking verifier must not permanently
+// brick the task
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Per #100's investigation (see IKeeperVerifier's doc comment in lib.rs,
+// citing soroban-env-host's Host::try_call): Soroban's host only recovers
+// *typed contract errors* across a try_invoke_contract call. A genuine
+// panic in the callee is a non-recoverable host error and propagates,
+// aborting the entire calling transaction — it is NOT caught as a
+// VerificationFailed rejection. This test demonstrates that concretely,
+// and confirms expire_task is the real, working recovery path once the
+// deadline passes — proving the eventual-recovery fallback actually holds
+// even in this worst case.
+
+/// Shared setup for both panicking-verifier tests below: a task with a
+/// verifier that always panics, claimed by a keeper.
+fn setup_task_with_panicking_verifier() -> (Setup, u64, Address, i128) {
+    let s = setup();
+    let verifier_id = s.env.register(panicking_verifier::PanickingVerifier, ());
+    let reward = 1_000_000i128;
+    let deadline = s.env.ledger().timestamp() + 3_600;
+    let task_id = s
+        .registry
+        .register_task(
+            &s.admin,
+            &TaskType::Liquidation,
+            &calldata(&s.env),
+            &reward,
+            &deadline,
+            &17_280u32,
+            &120u32,
+            &Some(verifier_id),
+        );
+
+    let keeper = Address::generate(&s.env);
+    s.registry.claim_task(&keeper, &task_id);
+    (s, task_id, keeper, reward)
+}
+
+/// The panicking verifier is not isolated: `execute_task`'s own call
+/// propagates the panic rather than returning a recoverable
+/// `VerificationFailed` error. `#[should_panic]` is the idiomatic Rust way
+/// to assert this (this crate is `#![no_std]`, so `std::panic::catch_unwind`
+/// isn't available even in `#[cfg(test)]` code) — the same abort-the-whole-
+/// transaction behavior any real caller would see, per the host semantics
+/// documented on `IKeeperVerifier`.
+#[test]
+#[should_panic]
+fn test_execute_task_against_panicking_verifier_panics() {
+    let (s, task_id, keeper, _reward) = setup_task_with_panicking_verifier();
+    let proof = Bytes::from_slice(&s.env, b"proof");
+    s.registry.execute_task(&keeper, &task_id, &proof);
+}
+
+/// The recovery path: since the panic aborts the whole transaction rather
+/// than being caught (proven by the `#[should_panic]` test above), the task
+/// is never touched by the failed attempt and remains `Claimed` — this test
+/// confirms `expire_task` still successfully returns the escrow to the
+/// owner once the deadline passes, exactly as it would for any other
+/// stuck-`Claimed` task. This is the concrete proof that Invariant I-2
+/// (escrow recoverability) holds even for a permanently-panicking verifier:
+/// the eventual-recovery fallback #100 concluded on actually works.
+#[test]
+fn test_expire_task_recovers_escrow_from_a_task_stuck_behind_a_panicking_verifier() {
+    let (s, task_id, keeper, reward) = setup_task_with_panicking_verifier();
+
+    // Deliberately never call execute_task here — the test above already
+    // proves that call panics; this test only needs the pre-panic state
+    // (Claimed, unexecuted) to demonstrate expire_task's recovery, and a
+    // panic would abort this test function before reaching the assertions
+    // below.
+    let task_before_expiry = s.registry.get_task(&task_id);
+    assert_eq!(task_before_expiry.status, TaskStatus::Claimed);
+    assert_eq!(task_before_expiry.claimer, Some(keeper.clone()));
+    assert_eq!(s.registry.keeper_balance(&keeper), 0i128);
+
+    let token = token::Client::new(&s.env, &s.token_id);
+    let owner_balance_before = token.balance(&s.admin);
+
+    advance(&s.env, 1, 3_601);
+    s.registry.expire_task(&task_id);
+
+    let task_after_expiry = s.registry.get_task(&task_id);
+    assert_eq!(task_after_expiry.status, TaskStatus::Expired);
+    assert_eq!(token.balance(&s.admin), owner_balance_before + reward);
+}
