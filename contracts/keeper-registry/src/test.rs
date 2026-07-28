@@ -87,6 +87,7 @@ fn register_reward_task(s: &Setup, reward: i128) -> u64 {
         &deadline,
         &17_280u32,
         &120u32,
+        &None,
     )
 }
 
@@ -192,7 +193,7 @@ fn test_split_reward_invariants() {
 #[test]
 fn test_version_is_exposed() {
     let s = setup();
-    assert_eq!(s.registry.version(), 2u32);
+    assert_eq!(s.registry.version(), 3u32);
 }
 
 #[test]
@@ -281,6 +282,7 @@ fn test_register_task_success() {
         &deadline,
         &17_280u32,
         &120u32,
+        &None,
     );
 
     assert_eq!(task_id, 1u64);
@@ -321,6 +323,7 @@ fn test_register_task_escrows_reward() {
         &(env.ledger().timestamp() + 3_600),
         &17_280u32,
         &120u32,
+        &None,
     );
 
     // Owner balance decreased by the escrowed reward.
@@ -351,6 +354,7 @@ fn test_register_task_zero_reward_fails() {
             &(env.ledger().timestamp() + 3_600),
             &17_280u32,
             &120u32,
+            &None,
         ),
         Err(Ok(KeeperError::InvalidReward))
     );
@@ -380,6 +384,7 @@ fn test_register_task_past_deadline_fails() {
             &past,
             &17_280u32,
             &120u32,
+            &None,
         ),
         Err(Ok(KeeperError::DeadlinePassed))
     );
@@ -410,6 +415,7 @@ fn test_register_increments_task_counter() {
             &deadline,
             &17_280u32,
             &60u32,
+            &None,
         );
         assert_eq!(id, expected_id);
     }
@@ -441,6 +447,7 @@ fn test_register_task_with_max_calldata_succeeds() {
         &(env.ledger().timestamp() + 3_600),
         &17_280u32,
         &120u32,
+        &None,
     );
     assert_eq!(registry.get_task(&id).calldata.len(), MAX_CALLDATA_LEN);
 }
@@ -469,6 +476,7 @@ fn test_register_task_over_max_calldata_fails() {
             &(env.ledger().timestamp() + 3_600),
             &17_280u32,
             &120u32,
+            &None,
         ),
         Err(Ok(KeeperError::CalldataTooLarge))
     );
@@ -501,6 +509,7 @@ fn test_register_task_with_empty_calldata_succeeds() {
         &(env.ledger().timestamp() + 3_600),
         &17_280u32,
         &120u32,
+        &None,
     );
     assert_eq!(registry.get_task(&id).calldata.len(), 0);
 }
@@ -518,6 +527,7 @@ fn test_register_task_lock_ledgers_below_min_fails() {
             &deadline,
             &17_280u32,
             &(MIN_LOCK_LEDGERS - 1),
+            &None,
         ),
         Err(Ok(KeeperError::InvalidTaskParams))
     );
@@ -535,6 +545,7 @@ fn test_register_task_lock_ledgers_at_min_succeeds() {
         &deadline,
         &17_280u32,
         &MIN_LOCK_LEDGERS,
+        &None,
     );
     assert_eq!(s.registry.get_task(&task_id).lock_ledgers, MIN_LOCK_LEDGERS);
 }
@@ -552,6 +563,7 @@ fn test_register_task_lock_ledgers_above_max_fails() {
             &deadline,
             &17_280u32,
             &(MAX_LOCK_LEDGERS + 1),
+            &None,
         ),
         Err(Ok(KeeperError::InvalidTaskParams))
     );
@@ -569,6 +581,7 @@ fn test_register_task_lock_ledgers_at_max_succeeds() {
         &deadline,
         &17_280u32,
         &MAX_LOCK_LEDGERS,
+        &None,
     );
     assert_eq!(s.registry.get_task(&task_id).lock_ledgers, MAX_LOCK_LEDGERS);
 }
@@ -586,6 +599,7 @@ fn test_register_task_ttl_ledgers_below_min_fails() {
             &deadline,
             &(MIN_TTL_LEDGERS - 1),
             &120u32,
+            &None,
         ),
         Err(Ok(KeeperError::InvalidTaskParams))
     );
@@ -603,6 +617,7 @@ fn test_register_task_ttl_ledgers_at_min_succeeds() {
         &deadline,
         &MIN_TTL_LEDGERS,
         &120u32,
+        &None,
     );
     assert_eq!(s.registry.get_task(&task_id).ttl_ledgers, MIN_TTL_LEDGERS);
 }
@@ -744,6 +759,7 @@ fn claim_with_lock(s: &Setup, keeper: &Address, lock_ledgers: u32) -> (u64, u32)
         &deadline,
         &17_280u32,
         &lock_ledgers,
+        &None,
     );
     s.registry.claim_task(keeper, &id);
     let claim_ledger = s.registry.get_task(&id).claim_ledger.unwrap();
@@ -820,6 +836,7 @@ fn test_lock_window_extending_past_deadline_is_blocked_by_deadline_first() {
         &deadline,
         &17_280u32,
         &1_000u32,
+        &None,
     );
     s.registry.claim_task(&first, &id);
 
@@ -1271,6 +1288,7 @@ fn test_expire_task_reentrancy_pays_refund_exactly_once() {
         &deadline,
         &17_280u32,
         &120u32,
+        &None,
     );
     assert_eq!(token.balance(&admin), 4_000_000i128); // escrowed
     assert_eq!(token.balance(&registry_id), 1_000_000i128);
@@ -1627,6 +1645,7 @@ fn test_pause_blocks_registration_but_allows_withdraw() {
             &(s.env.ledger().timestamp() + 3_600),
             &17_280u32,
             &60u32,
+            &None,
         ),
         Err(Ok(KeeperError::ContractPaused))
     );
@@ -1711,6 +1730,7 @@ fn test_pause_policy_matrix_entry_point_by_entry_point() {
         &(s.env.ledger().timestamp() + 100),
         &17_280u32,
         &120u32,
+        &None,
     );
 
     let claimed_keeper = Address::generate(&s.env);
@@ -1735,6 +1755,7 @@ fn test_pause_policy_matrix_entry_point_by_entry_point() {
             &(s.env.ledger().timestamp() + 3_600),
             &17_280u32,
             &60u32,
+            &None,
         ),
         Err(Ok(KeeperError::ContractPaused))
     );
@@ -1900,6 +1921,7 @@ fn test_set_min_reward_rejects_below_floor() {
             &(s.env.ledger().timestamp() + 3_600),
             &17_280u32,
             &60u32,
+            &None,
         ),
         Err(Ok(KeeperError::InvalidReward))
     );
@@ -1912,6 +1934,7 @@ fn test_set_min_reward_rejects_below_floor() {
         &(s.env.ledger().timestamp() + 3_600),
         &17_280u32,
         &60u32,
+        &None,
     );
     assert_eq!(id, 1u64);
 }
@@ -2321,6 +2344,7 @@ fn test_cancel_task_rejects_reentrant_refund() {
         &deadline,
         &17_280u32,
         &120u32,
+        &None,
     );
 
     // Escrow landed on the registry, owner is down the reward.
@@ -2379,6 +2403,7 @@ fn test_register_task_before_init_fails() {
             &(env.ledger().timestamp() + 3_600),
             &17_280u32,
             &120u32,
+            &None,
         ),
         Err(Ok(KeeperError::NotInitialized))
     );
