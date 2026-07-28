@@ -16,11 +16,12 @@ Closes #<!-- issue number -->
 
 ## Checklist
 
-- [ ] `make ci` passes (required CI checks)
-- [ ] `make check` passes (ci + lint) — or explained why lint warnings are acceptable
+- [ ] `make ci` passes (required formatting, test, and WASM build checks)
+- [ ] `make check` passes, or any clippy warnings are explained in the PR (clippy is advisory in CI)
 - [ ] Added/updated tests for the change
 - [ ] Updated docs / CHANGELOG where relevant
 - [ ] The PR is scoped to a single concern
+- [ ] No sensitive data is included in the code, repository files, or commits
 
 ## Notes for reviewers
 
