@@ -1,5 +1,30 @@
-pub fn cancel_task(e: Env, owner: Address, task_id: u64) -> Result<(), KeeperError> {
-    owner.require_auth();
+//! # Soroban Keeper Network — Keeper Registry Contract
+//!
+//! This is the on-chain coordination layer of the Soroban Keeper Network.
+//! dApps register automation tasks (liquidations, oracle pushes, TTL extensions…)
+//! with an XLM reward bounty. Permissionless keeper bots compete to execute them.
+//!
+//! ## Implemented surface (MVP complete)
+//! - Full schema: storage keys, types, errors, and events
+//! - `initialize` / `register_task` — deploy, configure, and post funded tasks
+//! - `claim_task` — first-come-first-served keeper locking with re-claim after
+//!   the lock window elapses
+//! - `execute_task` — proof submission, reward split, keeper crediting
+//! - `cancel_task` / `expire_task` — owner refund and permissionless expiry
+//! - `withdraw_rewards` — keeper pulls its accrued balance (CEI-safe)
+//! - Admin: `pause`/`unpause`, `set_fee_bps`, `transfer_admin`, `upgrade`,
+//!   `sweep_fees`
+//! - Read-only views — `get_task`, `task_count`, `keeper_balance`,
+//!   `fees_accrued`, `is_paused`, etc.
+//!
+//! ## Where contributors come in
+//! The MVP is functional; the open issues now target Phase 2 (see README
+//! Roadmap): on-chain execution verifiers, batch registration, keeper
+//! staking/reputation, and an events indexer. See CONTRIBUTING.md.
+//!
+//! ## Storage Layout
+//! - Instance:   Admin, FeeBps, Paused, TaskCounter, RewardToken, FeesAccrued
+//! - Persistent: Task(id) → Task struct, KeeperReward(address) → i128
 
 #![no_std]
 
@@ -285,32 +310,109 @@ fn require_not_paused(e: &Env) -> Result<(), KeeperError> {
     } else {
         Ok(())
     }
-    if task.status != TaskStatus::Pending {
-        return Err(KeeperError::InvalidTaskStatus);
+}
+
+fn require_admin(e: &Env, caller: &Address) -> Result<(), KeeperError> {
+    // An admin key that hasn't been set yet means `initialize` was never
+    // called — that's a different failure than an authenticated caller who
+    // simply isn't the admin, so it gets its own error rather than being
+    // folded into Unauthorized.
+    let admin: Address = e
+        .storage()
+        .instance()
+        .get(&DataKey::Admin)
+        .ok_or(KeeperError::NotInitialized)?;
+    caller.require_auth();
+    if *caller != admin {
+        return Err(KeeperError::Unauthorized);
     }
+    Ok(())
+}
 
-    bump_instance(&e);
+fn next_task_id(e: &Env) -> u64 {
+    let id: u64 = e
+        .storage()
+        .instance()
+        .get(&DataKey::TaskCounter)
+        .unwrap_or(0u64);
+    let next = id.checked_add(1).expect("task id overflow");
+    e.storage().instance().set(&DataKey::TaskCounter, &next);
+    next
+}
 
-    // Effects before interaction: a re-entrant cancel must find the task
-    // already Cancelled and be rejected by the status guard above.
-    let refund = task.reward;
-    task.status = TaskStatus::Cancelled;
-    save_task(&e, task_id, &task);
+fn load_task(e: &Env, task_id: u64) -> Result<Task, KeeperError> {
+    e.storage()
+        .persistent()
+        .get(&DataKey::Task(task_id))
+        .ok_or(KeeperError::TaskNotFound)
+}
 
-    // Interaction
-    reward_token(&e)?.transfer(
-        &e.current_contract_address(),
-        &owner,
-        &refund,
+fn save_task(e: &Env, task_id: u64, task: &Task) {
+    e.storage().persistent().set(&DataKey::Task(task_id), task);
+    e.storage().persistent().extend_ttl(
+        &DataKey::Task(task_id),
+        task.ttl_ledgers,
+        task.ttl_ledgers,
     );
+}
 
-    emit_task_cancelled(&e, task_id, &owner);
-    log!(
-        &e,
-        "Task {} cancelled, {} refunded to {}",
-        task_id,
-        refund,
-        owner
+fn reward_token(e: &Env) -> Result<token::Client<'_>, KeeperError> {
+    let addr: Address = e
+        .storage()
+        .instance()
+        .get(&DataKey::RewardToken)
+        .ok_or(KeeperError::NotInitialized)?;
+    Ok(token::Client::new(e, &addr))
+}
+
+/// Protocol fee applied when `FeeBps` has never been written. Kept at zero so
+/// an uninitialized or partially-migrated registry can never silently skim
+/// from a keeper's reward: a fee is a transfer of value away from the keeper,
+/// and defaulting to charging one on a contract whose configuration is
+/// unknown is the more surprising of the two failure modes.
+pub const DEFAULT_FEE_BPS: u32 = 0;
+
+/// Single source of truth for the current protocol fee. Every read of
+/// `FeeBps` — views and the execution path alike — must go through this, so
+/// a caller can never observe a fee rate that differs from the rate the
+/// contract would actually apply.
+fn fee_bps(e: &Env) -> u32 {
+    e.storage()
+        .instance()
+        .get(&DataKey::FeeBps)
+        .unwrap_or(DEFAULT_FEE_BPS)
+}
+
+/// Returns (keeper_net, protocol_fee).
+fn split_reward(reward: i128, fee_bps: u32) -> (i128, i128) {
+    let fee = reward
+        .checked_mul(fee_bps as i128)
+        .expect("overflow")
+        .checked_div(10_000)
+        .expect("div zero");
+    (reward.checked_sub(fee).expect("underflow"), fee)
+}
+
+/// Adds `amount` to a keeper's withdrawable balance in Persistent storage.
+/// Shared by `execute_task` (credit) and used as the source of truth for
+/// `withdraw_rewards`. Kept as a single helper so the CEI invariant lives in
+/// one place.
+///
+/// TTL is renewed here (on credit) and in `withdraw_rewards` (on
+/// zero-out/write), but deliberately *not* on `keeper_balance` reads — see
+/// the doc comment there for why a keeper that never returns can still see
+/// its balance entry archive.
+fn credit_keeper(e: &Env, keeper: &Address, amount: i128) {
+    let key = DataKey::KeeperReward(keeper.clone());
+    let current: i128 = e.storage().persistent().get(&key).unwrap_or(0);
+    let updated = current
+        .checked_add(amount)
+        .expect("keeper balance overflow");
+    e.storage().persistent().set(&key, &updated);
+    e.storage().persistent().extend_ttl(
+        &key,
+        KEEPER_BALANCE_BUMP_THRESHOLD,
+        KEEPER_BALANCE_BUMP_LEDGERS,
     );
 }
 
@@ -698,18 +800,20 @@ impl KeeperRegistry {
         }
 
         bump_instance(&e);
-        // Refund the escrow, then mark cancelled (CEI: state after transfer is
-        // safe here because status guards prevent re-entry into a fresh cancel).
-        reward_token(&e)?.transfer(&e.current_contract_address(), &owner, &task.reward);
+        // Effects before interaction: a re-entrant cancel must find the task
+        // already Cancelled and be rejected by the status guard above.
+        let refund = task.reward;
         task.status = TaskStatus::Cancelled;
         save_task(&e, task_id, &task);
+
+        reward_token(&e)?.transfer(&e.current_contract_address(), &owner, &refund);
 
         emit_task_cancelled(&e, task_id, &owner);
         log!(
             &e,
             "Task {} cancelled, {} refunded to {}",
             task_id,
-            task.reward,
+            refund,
             owner
         );
         Ok(())

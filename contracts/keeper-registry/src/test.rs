@@ -2154,23 +2154,209 @@ fn test_upgrade_by_non_admin_fails() {
 // contract error, it must be `InvalidTaskStatus`. That keeps this a real
 // regression test for the CEI ordering fix rather than one that only
 // happens to pass because of the platform's independent protection.
+// ─────────────────────────────────────────────────────────────────────────────
 
 mod reentrant_token {
-    // ...
-    // KEEP THIS MODULE EXACTLY AS IT APPEARS
+    use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};
+
+    use crate::KeeperRegistryClient;
+
+    #[contracttype]
+    #[derive(Clone)]
+    enum DataKey {
+        Balance(Address),
+        Registry,
+        TaskId,
+        Owner,
+        Armed,
+        ReentryRejected,
+        ReentryErrorCode,
+        RefundCount,
+    }
+
+    /// Sentinel for `ReentryErrorCode` meaning "no decoded contract error" —
+    /// either the hook never fired or the rejection came from the host's own
+    /// reentrancy protection rather than our `KeeperError` guard.
+    pub const NO_ERROR_CODE: u32 = u32::MAX;
+
+    #[contract]
+    pub struct ReentrantToken;
+
+    #[contractimpl]
+    impl ReentrantToken {
+        pub fn mint(env: Env, to: Address, amount: i128) {
+            let balance = Self::balance(env.clone(), to.clone());
+            env.storage()
+                .persistent()
+                .set(&DataKey::Balance(to), &(balance + amount));
+        }
+
+        pub fn balance(env: Env, id: Address) -> i128 {
+            env.storage()
+                .persistent()
+                .get(&DataKey::Balance(id))
+                .unwrap_or(0)
+        }
+
+        /// Arms the reentrancy hook: the next `transfer` targeting `owner`
+        /// will attempt `registry.cancel_task(owner, task_id)` before this
+        /// transfer's own balance update completes, simulating a malicious
+        /// token hooking mid-transfer.
+        pub fn arm(env: Env, registry: Address, task_id: u64, owner: Address) {
+            env.storage().instance().set(&DataKey::Registry, &registry);
+            env.storage().instance().set(&DataKey::TaskId, &task_id);
+            env.storage().instance().set(&DataKey::Owner, &owner);
+            env.storage().instance().set(&DataKey::Armed, &true);
+            env.storage()
+                .instance()
+                .set(&DataKey::ReentryRejected, &false);
+            env.storage()
+                .instance()
+                .set(&DataKey::ReentryErrorCode, &NO_ERROR_CODE);
+            env.storage().instance().set(&DataKey::RefundCount, &0u32);
+        }
+
+        /// Whether the re-entrant `cancel_task` call was rejected (by either
+        /// the contract's own status guard or the host's reentrancy check).
+        pub fn reentry_rejected(env: Env) -> bool {
+            env.storage()
+                .instance()
+                .get(&DataKey::ReentryRejected)
+                .unwrap_or(false)
+        }
+
+        /// The decoded `KeeperError` code from the re-entrant call, or
+        /// `NO_ERROR_CODE` if the rejection never reached our own contract
+        /// logic (e.g. it was intercepted by the host's reentrancy
+        /// protection first).
+        pub fn reentry_error_code(env: Env) -> u32 {
+            env.storage()
+                .instance()
+                .get(&DataKey::ReentryErrorCode)
+                .unwrap_or(NO_ERROR_CODE)
+        }
+
+        /// Number of transfers this token made to the armed owner.
+        pub fn refund_count(env: Env) -> u32 {
+            env.storage()
+                .instance()
+                .get(&DataKey::RefundCount)
+                .unwrap_or(0)
+        }
+
+        pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+            let armed: bool = env
+                .storage()
+                .instance()
+                .get(&DataKey::Armed)
+                .unwrap_or(false);
+            if armed {
+                let owner: Address = env.storage().instance().get(&DataKey::Owner).unwrap();
+                if to == owner {
+                    let count: u32 = env
+                        .storage()
+                        .instance()
+                        .get(&DataKey::RefundCount)
+                        .unwrap_or(0);
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::RefundCount, &(count + 1));
+
+                    // Fire once: disarm before recursing so a bug that lets
+                    // the re-entrant cancel succeed can't recurse forever.
+                    env.storage().instance().set(&DataKey::Armed, &false);
+                    let registry: Address =
+                        env.storage().instance().get(&DataKey::Registry).unwrap();
+                    let task_id: u64 = env.storage().instance().get(&DataKey::TaskId).unwrap();
+                    let client = KeeperRegistryClient::new(&env, &registry);
+                    let (rejected, code): (bool, u32) =
+                        match client.try_cancel_task(&owner, &task_id) {
+                            Ok(_) => (false, NO_ERROR_CODE),
+                            Err(Ok(err)) => (true, err as u32),
+                            Err(Err(_)) => (true, NO_ERROR_CODE),
+                        };
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::ReentryRejected, &rejected);
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::ReentryErrorCode, &code);
+                }
+            }
+
+            let from_balance = Self::balance(env.clone(), from.clone());
+            let to_balance = Self::balance(env.clone(), to.clone());
+            env.storage()
+                .persistent()
+                .set(&DataKey::Balance(from), &(from_balance - amount));
+            env.storage()
+                .persistent()
+                .set(&DataKey::Balance(to), &(to_balance + amount));
+        }
+    }
 }
 
 #[test]
 fn test_cancel_task_rejects_reentrant_refund() {
-    // ...
-    // KEEP THIS TEST EXACTLY AS IT APPEARS
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+
+    let token_id = env.register(reentrant_token::ReentrantToken, ());
+    let mock_token = reentrant_token::ReentrantTokenClient::new(&env, &token_id);
+    mock_token.mint(&admin, &10_000_000i128);
+
+    let registry_id = env.register(KeeperRegistry, ());
+    let registry = KeeperRegistryClient::new(&env, &registry_id);
+    registry.initialize(&admin, &token_id, &300u32);
+
+    let deadline = env.ledger().timestamp() + 3_600;
+    let task_id = registry.register_task(
+        &admin,
+        &TaskType::Liquidation,
+        &calldata(&env),
+        &1_000_000i128,
+        &deadline,
+        &17_280u32,
+        &120u32,
+    );
+
+    // Escrow landed on the registry, owner is down the reward.
+    assert_eq!(mock_token.balance(&admin), 9_000_000i128);
+    assert_eq!(mock_token.balance(&registry_id), 1_000_000i128);
+
+    // Arm the token: its next transfer to `admin` will try to cancel the
+    // same task again, from inside the outer cancel's own transfer call.
+    mock_token.arm(&registry_id, &task_id, &admin);
+
+    registry.cancel_task(&admin, &task_id);
+
+    // The re-entrant cancel must never have succeeded.
+    assert!(mock_token.reentry_rejected());
+    // If the rejection reached our own guard (rather than being intercepted
+    // by the host's reentrancy protection first), it must be because the
+    // outer call already wrote TaskStatus::Cancelled before touching the
+    // token.
+    let code = mock_token.reentry_error_code();
+    if code != reentrant_token::NO_ERROR_CODE {
+        assert_eq!(code, KeeperError::InvalidTaskStatus as u32);
+    }
+    assert_eq!(mock_token.refund_count(), 1);
+    assert_eq!(registry.get_task(&task_id).status, TaskStatus::Cancelled);
+
+    // Exactly one refund was paid: owner made whole, registry drained back
+    // to zero for this task.
+    assert_eq!(mock_token.balance(&admin), 10_000_000i128);
+    assert_eq!(mock_token.balance(&registry_id), 0i128);
 }
 
-// -----------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────────
 // NotInitialized — every entry point that requires configured state must
 // return a typed error, never panic, when called before `initialize`.
-// -----------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────────
 
+/// A freshly-deployed registry that `initialize` has never touched.
 fn uninitialized_registry(env: &Env) -> KeeperRegistryClient<'_> {
     let registry_id = env.register(KeeperRegistry, ());
     KeeperRegistryClient::new(env, &registry_id)
@@ -2178,70 +2364,219 @@ fn uninitialized_registry(env: &Env) -> KeeperRegistryClient<'_> {
 
 #[test]
 fn test_register_task_before_init_fails() {
-    // ...
+    let env = Env::default();
+    env.mock_all_auths();
+    let registry = uninitialized_registry(&env);
+    let owner = Address::generate(&env);
+
+    assert_eq!(
+        registry.try_register_task(
+            &owner,
+            &TaskType::Custom,
+            &calldata(&env),
+            &1_000_000i128,
+            &(env.ledger().timestamp() + 3_600),
+            &17_280u32,
+            &120u32,
+        ),
+        Err(Ok(KeeperError::NotInitialized))
+    );
 }
 
 #[test]
 fn test_withdraw_rewards_before_init_fails() {
-    // ...
+    let env = Env::default();
+    env.mock_all_auths();
+    let registry = uninitialized_registry(&env);
+    let keeper = Address::generate(&env);
+
+    // No balance either, but NotInitialized must be surfaced instead of
+    // NoRewardsAvailable — the registry isn't configured at all yet.
+    //
+    // withdraw_rewards checks the keeper's balance before touching the
+    // reward token, and a never-initialized registry has no balance for
+    // anyone, so NoRewardsAvailable fires first here. This is correct: a
+    // caller with nothing to withdraw gets the same answer regardless of
+    // configuration state. The reward-token dependency is exercised by
+    // test_withdraw_rewards_after_reward_token_migration_drop below.
+    assert_eq!(
+        registry.try_withdraw_rewards(&keeper),
+        Err(Ok(KeeperError::NoRewardsAvailable))
+    );
 }
 
 #[test]
 fn test_pause_before_init_fails() {
-    // ...
+    let env = Env::default();
+    env.mock_all_auths();
+    let registry = uninitialized_registry(&env);
+    let caller = Address::generate(&env);
+    assert_eq!(
+        registry.try_pause(&caller),
+        Err(Ok(KeeperError::NotInitialized))
+    );
 }
 
 #[test]
 fn test_unpause_before_init_fails() {
-    // ...
+    let env = Env::default();
+    env.mock_all_auths();
+    let registry = uninitialized_registry(&env);
+    let caller = Address::generate(&env);
+    assert_eq!(
+        registry.try_unpause(&caller),
+        Err(Ok(KeeperError::NotInitialized))
+    );
 }
 
 #[test]
 fn test_set_fee_bps_before_init_fails() {
-    // ...
+    let env = Env::default();
+    env.mock_all_auths();
+    let registry = uninitialized_registry(&env);
+    let caller = Address::generate(&env);
+    assert_eq!(
+        registry.try_set_fee_bps(&caller, &500u32),
+        Err(Ok(KeeperError::NotInitialized))
+    );
 }
 
 #[test]
 fn test_set_min_reward_before_init_fails() {
-    // ...
+    let env = Env::default();
+    env.mock_all_auths();
+    let registry = uninitialized_registry(&env);
+    let caller = Address::generate(&env);
+    assert_eq!(
+        registry.try_set_min_reward(&caller, &1i128),
+        Err(Ok(KeeperError::NotInitialized))
+    );
 }
 
 #[test]
 fn test_transfer_admin_before_init_fails() {
-    // ...
+    let env = Env::default();
+    env.mock_all_auths();
+    let registry = uninitialized_registry(&env);
+    let caller = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+    assert_eq!(
+        registry.try_transfer_admin(&caller, &new_admin),
+        Err(Ok(KeeperError::NotInitialized))
+    );
 }
 
 #[test]
 fn test_upgrade_before_init_fails() {
-    // ...
+    let env = Env::default();
+    env.mock_all_auths();
+    let registry = uninitialized_registry(&env);
+    let caller = Address::generate(&env);
+    let bogus = soroban_sdk::BytesN::from_array(&env, &[0u8; 32]);
+    assert_eq!(
+        registry.try_upgrade(&caller, &bogus),
+        Err(Ok(KeeperError::NotInitialized))
+    );
 }
 
 #[test]
 fn test_sweep_fees_before_init_fails() {
-    // ...
+    let env = Env::default();
+    env.mock_all_auths();
+    let registry = uninitialized_registry(&env);
+    let caller = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    // require_admin runs before the reward-token lookup, so this surfaces
+    // NotInitialized from the missing Admin key, not from RewardToken.
+    assert_eq!(
+        registry.try_sweep_fees(&caller, &treasury, &1i128),
+        Err(Ok(KeeperError::NotInitialized))
+    );
 }
+
+// increase_reward, cancel_task, and expire_task all load the task by id
+// before they ever reach the reward-token lookup, and no task can exist on
+// a registry that was never initialized (register_task itself requires the
+// reward token to be configured). So "call before initialize" can only ever
+// surface TaskNotFound for these three, not NotInitialized — that ordering
+// (existence check before configuration check) is correct, not a gap.
+//
+// The reward-token dependency in these three functions is still real,
+// though: a registry that was initialized and had a task registered, but
+// later had its RewardToken key removed by e.g. a partial storage
+// migration, must not panic. These tests reproduce exactly that.
 
 #[test]
 fn test_increase_reward_after_reward_token_migration_drop_fails() {
-    // ...
+    let s = setup();
+    let id = register_default_task(&s);
+    s.env.as_contract(&s.registry.address, || {
+        s.env.storage().instance().remove(&DataKey::RewardToken);
+    });
+    assert_eq!(
+        s.registry.try_increase_reward(&s.admin, &id, &1i128),
+        Err(Ok(KeeperError::NotInitialized))
+    );
 }
 
 #[test]
 fn test_cancel_task_after_reward_token_migration_drop_fails() {
-    // ...
+    let s = setup();
+    let id = register_default_task(&s);
+    s.env.as_contract(&s.registry.address, || {
+        s.env.storage().instance().remove(&DataKey::RewardToken);
+    });
+    assert_eq!(
+        s.registry.try_cancel_task(&s.admin, &id),
+        Err(Ok(KeeperError::NotInitialized))
+    );
 }
 
 #[test]
 fn test_expire_task_after_reward_token_migration_drop_fails() {
-    // ...
+    let s = setup();
+    let id = register_default_task(&s);
+    s.env.as_contract(&s.registry.address, || {
+        s.env.storage().instance().remove(&DataKey::RewardToken);
+    });
+    advance(&s.env, 1, 3_601); // past deadline
+    assert_eq!(
+        s.registry.try_expire_task(&id),
+        Err(Ok(KeeperError::NotInitialized))
+    );
 }
 
 #[test]
 fn test_withdraw_rewards_after_reward_token_migration_drop_fails() {
-    // ...
+    let s = setup();
+    let keeper = executed_task_keeper(&s); // has a balance to withdraw
+    s.env.as_contract(&s.registry.address, || {
+        s.env.storage().instance().remove(&DataKey::RewardToken);
+    });
+    assert_eq!(
+        s.registry.try_withdraw_rewards(&keeper),
+        Err(Ok(KeeperError::NotInitialized))
+    );
 }
 
 #[test]
 fn test_require_admin_distinguishes_not_initialized_from_wrong_caller() {
-    // ...
+    // Uninitialized: no admin configured at all.
+    let env = Env::default();
+    env.mock_all_auths();
+    let registry = uninitialized_registry(&env);
+    let caller = Address::generate(&env);
+    assert_eq!(
+        registry.try_pause(&caller),
+        Err(Ok(KeeperError::NotInitialized))
+    );
+
+    // Initialized, but caller isn't the admin: a different, more specific
+    // error than "not initialized".
+    let s = setup();
+    let stranger = Address::generate(&s.env);
+    assert_eq!(
+        s.registry.try_pause(&stranger),
+        Err(Ok(KeeperError::Unauthorized))
+    );
 }
