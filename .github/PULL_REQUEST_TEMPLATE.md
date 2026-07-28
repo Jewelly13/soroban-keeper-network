@@ -16,9 +16,8 @@ Closes #<!-- issue number -->
 
 ## Checklist
 
-- [ ] `cargo test -p keeper-registry` passes
-- [ ] `cargo fmt --all -- --check` is clean
-- [ ] `cargo clippy --all-targets -- -D warnings` is clean
+- [ ] `make ci` passes (required CI checks)
+- [ ] `make check` passes (ci + lint) — or explained why lint warnings are acceptable
 - [ ] Added/updated tests for the change
 - [ ] Updated docs / CHANGELOG where relevant
 - [ ] The PR is scoped to a single concern

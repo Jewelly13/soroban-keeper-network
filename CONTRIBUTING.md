@@ -82,14 +82,16 @@ rustup target list --installed | grep wasm32
 cd examples/keeper-bot && npm install && cd ../..
 
 # Run tests (should all pass on a clean checkout)
-cargo test --all --features testutils
+cargo test --workspace --locked
 
 # Build WASM
-cargo build --release --target wasm32-unknown-unknown --package keeper-registry
+cargo build --locked --release --target wasm32-unknown-unknown --package keeper-registry
 
-# Check formatting and lints (must be clean before PR)
-cargo fmt --all -- --check
-cargo clippy --all --all-targets --all-features -- -D warnings
+# Run all required CI checks locally
+make ci
+
+# Optionally run stricter checks (includes clippy)
+make check
 ```
 
 ---
@@ -178,9 +180,8 @@ git checkout -b feature/your-feature-name
 Before opening a PR:
 
 - [ ] Branch is based on `main`
-- [ ] `cargo fmt --all` passes (no formatting diff)
-- [ ] `cargo clippy --all --all-targets --all-features -- -D warnings` passes
-- [ ] All existing tests pass: `cargo test --all --features testutils`
+- [ ] `make ci` passes (format check, tests, WASM build)
+- [ ] `make check` passes (ci + clippy) — or explain why clippy warnings are acceptable
 - [ ] New code has corresponding test coverage
 - [ ] No `TODO`, `FIXME`, or `unwrap()` added without a comment explaining why
 - [ ] No sensitive data (keys, credentials) in any file
@@ -275,6 +276,7 @@ not unix timestamp. Existing tasks with in-flight claims are unaffected.
 - **Style**: ES2022+, `"use strict"`, CommonJS (`require`).
 - **No TypeScript** in the example (to keep it beginner-friendly). A TypeScript version is welcome as a separate example.
 - **Linting**: ESLint with the config in `examples/keeper-bot/.eslintrc.json`.
+- **Lockfile**: The keeper bot example does not currently commit `package-lock.json` to keep the repository lightweight. However, contributors working on the bot should consider evaluating whether committing the lockfile would improve reproducibility, especially if encountering version-related issues. Discuss this in an issue before submitting a PR that adds the lockfile.
 
 ---
 
@@ -352,6 +354,8 @@ Closes #<!-- issue number -->
 4. Address all review comments. Mark conversations resolved after addressing.
 5. Maintainer squash-merges the PR with a conventional commit message.
 6. Delete the feature branch after merge.
+
+**Note on Dependabot PRs**: Automated dependency update PRs from Dependabot follow the same review process as all other pull requests. Maintainers will review the changelog, check for breaking changes, and verify CI passes before merging.
 
 ### Review Turnaround
 

@@ -669,7 +669,23 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-main().catch((err) => {
-  console.error("Fatal error:", err);
-  process.exit(1);
-});
+// ─────────────────────────────────────────────────────────────────────────────
+// Module exports for testing
+// ─────────────────────────────────────────────────────────────────────────────
+
+module.exports = {
+  isPermanentError,
+  withRetry,
+  fetchPendingTasks,
+  validateAndLoadConfig,
+  keeperLoop,
+  sleep,
+};
+
+// Only run main() when executed directly, not when imported for testing
+if (require.main === module) {
+  main().catch((err) => {
+    console.error("Fatal error:", err);
+    process.exit(1);
+  });
+}
