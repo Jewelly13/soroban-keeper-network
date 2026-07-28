@@ -362,42 +362,30 @@ async function readContract(server, sourcePublicKey, networkPassphrase, contract
  */
 async function fetchPendingTasks(server, contractId, startLedger) {
   const tasks = [];
-  let cursor = null;
-  let pages = 0;
+  try {
+    // Query TaskRegistered events
+    const response = await server.getEvents({
+      startLedger,
+      filters: [
+        {
+          type: "contract",
+          contractIds: [contractId],
+          topics: [REGISTRY_EVENTS.taskRegistered],
+        },
+      ],
+      limit: 100,
+    });
 
-  const filters = [
-    {
-      type: "contract",
-      contractIds: [contractId],
-      topics: [REGISTRY_EVENTS.taskRegistered],
-    },
-  ];
+    for (const event of response.events || []) {
+      try {
+        const [taskIdVal, , rewardVal, deadlineVal] = event.value.value();
+        const taskId = scValToNative(taskIdVal);
+        const reward = scValToNative(rewardVal);
+        const deadline = scValToNative(deadlineVal);
 
-  while (pages < CONFIG.eventsMaxPages) {
-    try {
-      const request = {
-        filters,
-        limit: CONFIG.eventsPageSize,
-      };
-
-      if (cursor) {
-        request.cursor = cursor;
-      } else {
-        request.startLedger = startLedger;
-      }
-
-      const response = await server.getEvents(request);
-
-      for (const event of response.events || []) {
-        try {
-          const [taskIdVal, , rewardVal, deadlineVal] = event.value.value();
-          const taskId = scValToNative(taskIdVal);
-          const reward = scValToNative(rewardVal);
-          const deadline = scValToNative(deadlineVal);
-          tasks.push({ taskId, reward, deadline });
-        } catch (e) {
-          // Skip malformed events
-        }
+        tasks.push({ taskId, reward, deadline });
+      } catch (e) {
+        // Skip malformed events
       }
 
       pages++;
@@ -526,29 +514,6 @@ async function keeperLoop(
       }
 
       try {
-        // Pre-flight check: is the task actually claimable right now? This
-        // is a read-only simulation, so it costs nothing. It confirms the
-        // task is still pending and not locked by another keeper.
-        const claimable = await readContract(
-          server,
-          keypair.publicKey(),
-          networkPassphrase,
-          contractId,
-          "is_claimable",
-          [nativeToScVal(task.taskId, { type: "u64" })]
-        );
-
-        if (!claimable) {
-          console.log(
-            `  ⏩  Skipping task ${task.taskId} — not claimable (already claimed or finished)`
-          );
-          continue;
-        }
-
-        // The pre-check is advisory, not a lock. A competitor can still
-        // claim the task in the interval between our simulation and our
-        // submission. The `claim_task` call can still fail, which is
-        // normal and expected.
         console.log(
           `  📌  Attempting to claim task ${task.taskId} (reward: ${task.reward})...`
         );
@@ -742,7 +707,23 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-main().catch((err) => {
-  console.error("Fatal error:", err);
-  process.exit(1);
-});
+// ─────────────────────────────────────────────────────────────────────────────
+// Module exports for testing
+// ─────────────────────────────────────────────────────────────────────────────
+
+module.exports = {
+  isPermanentError,
+  withRetry,
+  fetchPendingTasks,
+  validateAndLoadConfig,
+  keeperLoop,
+  sleep,
+};
+
+// Only run main() when executed directly, not when imported for testing
+if (require.main === module) {
+  main().catch((err) => {
+    console.error("Fatal error:", err);
+    process.exit(1);
+  });
+}
