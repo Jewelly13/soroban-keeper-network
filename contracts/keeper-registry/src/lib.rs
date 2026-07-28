@@ -881,9 +881,38 @@ impl KeeperRegistry {
 
     // ── pause / unpause ───────────────────────────────────────────────────────
     //
-    // Admin emergency circuit breaker. While paused, register_task/claim_task/
-    // execute_task are blocked, but expire_task and withdraw_rewards remain open
-    // so funds can always be recovered even during an incident.
+    // Admin emergency circuit breaker. The rule of thumb: anything that opens
+    // new exposure (new escrow, new claims, new execution payouts) is blocked;
+    // anything that only lets value flow back out to whoever already owns it
+    // stays open, so an incident response can never itself become a fund
+    // freeze. Read-only views are never gated.
+    //
+    // Verified against `require_not_paused(&e)?` (or its absence) at the top
+    // of each function, current as of the pause-policy-matrix test suite in
+    // `test.rs` (`test_pause_policy_matrix_entry_point_by_entry_point` et al.)
+    // — that test is the source of truth if this table and the code ever
+    // drift apart again.
+    //
+    // | Entry point       | While paused | Why                                   |
+    // |--------------------|-------------|----------------------------------------|
+    // | `register_task`    | BLOCKED     | opens new escrow exposure              |
+    // | `claim_task`       | BLOCKED     | opens new keeper exposure              |
+    // | `execute_task`     | BLOCKED     | pays out new rewards                   |
+    // | `increase_reward`  | BLOCKED     | opens new escrow exposure              |
+    // | `extend_deadline`  | NOT gated   | **known bug**, tracked separately — see|
+    // |                    | (allowed)   | TODO next to the test below. Should    |
+    // |                    |             | arguably be blocked (it doesn't touch  |
+    // |                    |             | funds either way, but was likely meant |
+    // |                    |             | to follow register/claim/execute).     |
+    // | `cancel_task`      | allowed     | owner reclaiming pending-task escrow;  |
+    // |                    |             | liveness, not new exposure             |
+    // | `expire_task`      | allowed     | permissionless fund recovery           |
+    // | `withdraw_rewards` | allowed     | keeper pulling already-earned balance  |
+    // | read-only views    | allowed     | side-effect-free, never gated          |
+    //
+    // `set_fee_bps`/`set_min_reward`/`transfer_admin`/`upgrade`/`sweep_fees`
+    // are admin-only (`require_admin`) and were never in scope for the pause
+    // gate at all — pausing doesn't restrict what the admin itself can do.
 
     pub fn pause(e: Env, admin: Address) -> Result<(), KeeperError> {
         require_admin(&e, &admin)?;

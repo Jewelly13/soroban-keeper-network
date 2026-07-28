@@ -1663,6 +1663,203 @@ fn test_pause_by_non_admin_fails() {
     );
 }
 
+/// Table-driven coverage of the full pause policy, entry point by entry
+/// point — see the `pause`/`unpause` doc comment in `lib.rs` for the table
+/// this test verifies against and keeps in sync.
+///
+/// Ground truth is "does the function call `require_not_paused(&e)?`",
+/// checked directly against the code (not the old prose-only doc comment,
+/// which undersold the policy — it only mentioned
+/// register_task/claim_task/execute_task/expire_task/withdraw_rewards and
+/// said nothing about increase_reward, extend_deadline, or cancel_task):
+///
+///   - BLOCKED while paused (asserted via `try_*` -> `ContractPaused`):
+///     `register_task`, `claim_task`, `execute_task`, `increase_reward`.
+///   - Allowed while paused, and asserted to have their full intended
+///     effect (not just "didn't error"): `cancel_task` (refund + status),
+///     `expire_task` (refund + status), `withdraw_rewards` (balance
+///     transferred + zeroed).
+///   - `extend_deadline` is asserted to match its *current* (buggy)
+///     behavior — it has no `require_not_paused` call at all, so it
+///     currently succeeds while paused. That is almost certainly wrong
+///     (it was likely meant to follow register/claim/execute) but fixing it
+///     is out of scope here; seeing this assertion start failing is the
+///     signal that someone fixed the gap without updating this test.
+///   - Read-only views are asserted to keep working throughout.
+///   - Finally, unpause restores every previously-blocked entry point —
+///     a one-way pause would itself be a serious bug.
+#[test]
+fn test_pause_policy_matrix_entry_point_by_entry_point() {
+    let s = setup();
+    let token = token::Client::new(&s.env, &s.token_id);
+
+    // ── Arrange: every task needs to exist *before* pausing, since
+    // register_task itself is blocked once paused.
+    let claim_target_id = register_default_task(&s); // Pending -> claim_task blocked
+    let increase_target_id = register_default_task(&s); // Pending -> increase_reward blocked
+    let cancel_target_id = register_default_task(&s); // Pending -> cancel_task allowed
+    let extend_target_id = register_default_task(&s); // Pending -> extend_deadline (bug: allowed)
+
+    // Short deadline so it can expire without dragging the other tasks'
+    // (default +3_600s) deadlines past their own while paused.
+    let expire_target_id = s.registry.register_task(
+        &s.admin,
+        &TaskType::Liquidation,
+        &calldata(&s.env),
+        &1_000_000i128,
+        &(s.env.ledger().timestamp() + 100),
+        &17_280u32,
+        &120u32,
+    );
+
+    let claimed_keeper = Address::generate(&s.env);
+    let claimed_task_id = register_default_task(&s);
+    s.registry.claim_task(&claimed_keeper, &claimed_task_id); // Claimed -> execute_task blocked
+
+    // Credited before pausing, since execute_task (the only way to credit a
+    // keeper) is itself blocked once paused.
+    let paid_keeper = executed_task_keeper(&s); // has a withdrawable balance
+
+    // ── Act: pause.
+    s.registry.pause(&s.admin);
+    assert!(s.registry.is_paused());
+
+    // ── BLOCKED: register_task.
+    assert_eq!(
+        s.registry.try_register_task(
+            &s.admin,
+            &TaskType::Custom,
+            &calldata(&s.env),
+            &100_000i128,
+            &(s.env.ledger().timestamp() + 3_600),
+            &17_280u32,
+            &60u32,
+        ),
+        Err(Ok(KeeperError::ContractPaused))
+    );
+
+    // ── BLOCKED: claim_task.
+    assert_eq!(
+        s.registry
+            .try_claim_task(&Address::generate(&s.env), &claim_target_id),
+        Err(Ok(KeeperError::ContractPaused))
+    );
+    assert_eq!(
+        s.registry.get_task(&claim_target_id).status,
+        TaskStatus::Pending
+    ); // untouched
+
+    // ── BLOCKED: execute_task.
+    assert_eq!(
+        s.registry.try_execute_task(
+            &claimed_keeper,
+            &claimed_task_id,
+            &Bytes::from_slice(&s.env, b"p"),
+        ),
+        Err(Ok(KeeperError::ContractPaused))
+    );
+    assert_eq!(
+        s.registry.get_task(&claimed_task_id).status,
+        TaskStatus::Claimed
+    ); // untouched
+
+    // ── BLOCKED: increase_reward.
+    assert_eq!(
+        s.registry
+            .try_increase_reward(&s.admin, &increase_target_id, &1i128),
+        Err(Ok(KeeperError::ContractPaused))
+    );
+    assert_eq!(
+        s.registry.get_task(&increase_target_id).reward,
+        1_000_000i128
+    ); // untouched
+
+    // ── extend_deadline: NOT gated in the current code — this is a known
+    // gap, tracked as a separate bug (see the doc comment above `pause` in
+    // lib.rs). Asserting current behavior, not desired behavior.
+    // TODO: once extend_deadline gains a `require_not_paused(&e)?` check,
+    // flip this to `try_extend_deadline` -> `Err(Ok(KeeperError::ContractPaused))`.
+    let old_deadline = s.registry.get_task(&extend_target_id).deadline;
+    s.registry
+        .extend_deadline(&s.admin, &extend_target_id, &(old_deadline + 3_600));
+    assert_eq!(
+        s.registry.get_task(&extend_target_id).deadline,
+        old_deadline + 3_600
+    );
+
+    // ── ALLOWED: cancel_task — must actually refund and flip status, not
+    // just "not error".
+    let admin_before_cancel = token.balance(&s.admin);
+    s.registry.cancel_task(&s.admin, &cancel_target_id);
+    assert_eq!(
+        s.registry.get_task(&cancel_target_id).status,
+        TaskStatus::Cancelled
+    );
+    assert_eq!(token.balance(&s.admin), admin_before_cancel + 1_000_000i128);
+
+    // ── ALLOWED: expire_task, once its deadline passes — also must actually
+    // refund and flip status. Advance just enough to pass this task's short
+    // deadline without also passing the other (default +3_600s) tasks'.
+    advance(&s.env, 5, 101);
+    let admin_before_expire = token.balance(&s.admin);
+    s.registry.expire_task(&expire_target_id);
+    assert_eq!(
+        s.registry.get_task(&expire_target_id).status,
+        TaskStatus::Expired
+    );
+    assert_eq!(token.balance(&s.admin), admin_before_expire + 1_000_000i128);
+
+    // ── ALLOWED: withdraw_rewards — must actually transfer and zero the
+    // balance, not just "not error".
+    assert_eq!(token.balance(&paid_keeper), 0i128);
+    assert_eq!(s.registry.withdraw_rewards(&paid_keeper), 970_000i128);
+    assert_eq!(token.balance(&paid_keeper), 970_000i128);
+    assert_eq!(s.registry.keeper_balance(&paid_keeper), 0i128);
+
+    // ── ALLOWED: read-only views never gate on pause.
+    assert!(s.registry.is_paused());
+    assert_eq!(s.registry.fees_accrued(), 30_000i128);
+    assert!(s.registry.task_count() >= 6);
+    assert_eq!(s.registry.admin(), Some(s.admin.clone()));
+    assert_eq!(s.registry.get_fee_bps(), 300u32);
+
+    // ── Unpause: every previously-blocked entry point must work again — a
+    // one-way pause would itself be a serious liveness bug.
+    s.registry.unpause(&s.admin);
+    assert!(!s.registry.is_paused());
+
+    // register_task works again.
+    let new_id = register_default_task(&s);
+    assert_eq!(s.registry.get_task(&new_id).status, TaskStatus::Pending);
+
+    // claim_task works again.
+    let claimer = Address::generate(&s.env);
+    s.registry.claim_task(&claimer, &claim_target_id);
+    assert_eq!(
+        s.registry.get_task(&claim_target_id).status,
+        TaskStatus::Claimed
+    );
+
+    // execute_task works again.
+    s.registry.execute_task(
+        &claimed_keeper,
+        &claimed_task_id,
+        &Bytes::from_slice(&s.env, b"proof"),
+    );
+    assert_eq!(
+        s.registry.get_task(&claimed_task_id).status,
+        TaskStatus::Executed
+    );
+
+    // increase_reward works again.
+    s.registry
+        .increase_reward(&s.admin, &increase_target_id, &1i128);
+    assert_eq!(
+        s.registry.get_task(&increase_target_id).reward,
+        1_000_001i128
+    );
+}
+
 #[test]
 fn test_set_fee_bps_affects_future_executions() {
     let s = setup();
