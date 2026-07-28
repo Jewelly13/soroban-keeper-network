@@ -229,10 +229,21 @@ A **shared, permissionless, on-chain coordination layer** where:
 #### FR-3: Task Execution
 - `execute_task` MUST only be callable by the current `claimer`.
 - MUST reject if task deadline has passed.
+- If the task has a `verifier` attached, MUST call `verifier.verify(task,
+  keeper, proof)` and reject with `VerificationFailed` (emitting
+  `TaskVerificationFailed`) without crediting, transferring, or mutating
+  task status if it returns `false`. A task with no verifier is unaffected.
 - MUST credit `(reward * (10000 - fee_bps) / 10000)` to the keeper's balance.
 - Protocol fee MUST remain in the contract (swept separately by admin).
 - MUST emit `TaskExecuted` with net reward and proof bytes.
 - Task status MUST transition to `Executed` (immutable after this point).
+
+#### FR-3a: Verifier Update
+- `update_verifier` MUST only be callable by the task owner.
+- MUST only be callable when task is in `Pending` state — once claimed, a
+  keeper has begun acting on the terms it saw at claim time; see
+  `IKeeperVerifier`'s doc comment for the griefing-protection rationale.
+- MUST emit `VerifierUpdated`.
 
 #### FR-4: Task Cancellation
 - `cancel_task` MUST only be callable by the task owner.
@@ -254,7 +265,8 @@ A **shared, permissionless, on-chain coordination layer** where:
 
 #### FR-7: Admin Controls
 - `pause`/`unpause` MUST gate `register_task`, `claim_task`, `execute_task`,
-  and `increase_reward` — all four open new escrow or reward exposure.
+  `increase_reward`, and `update_verifier` — all five open new escrow,
+  reward, or task-outcome exposure.
 - `pause`/`unpause` MUST NOT gate `cancel_task`, `expire_task`, or
   `withdraw_rewards` — these only let already-escrowed value flow back to
   whoever already owns it, which must always stay available so an admin
@@ -340,6 +352,8 @@ All events use two-topic format `(verb_symbol, noun_symbol)` for efficient filte
 | `TaskExpired` | `("exp", "task")` | `(task_id,)` |
 | `TaskCancelled` | `("cancel", "task")` | `(task_id, owner)` |
 | `RewardsWithdrawn` | `("withdraw", "reward")` | `(keeper, amount)` |
+| `TaskVerificationFailed` | `("verfail", "task")` | `(task_id, keeper)` |
+| `VerifierUpdated` | `("verifier", "task")` | `(task_id, verifier)` |
 
 #### Task Lifecycle State Machine
 
@@ -391,17 +405,34 @@ let task_id = registry.register_task(
     &(env.ledger().timestamp() + 3600), // deadline: 1 hour from now
     &17_280u32,                       // TTL: ~1 day
     &120u32,                          // lock: ~10 minutes
+    &None,                            // verifier: None = trust the proof (see below)
 );
 ```
 
-**Step 3 — React to execution** (optional Phase 2 — verifier interface):
+**Step 3 — Optional on-chain proof verification**:
+
+A task owner may attach a verifier contract — any address implementing
+`IKeeperVerifier` — either at registration (above) or afterward via
+`update_verifier` while the task is still `Pending`:
 
 ```rust
-// Your contract implements this trait (Phase 2 only)
-pub trait IKeeperVerifiable {
-    fn verify_execution(env: Env, task_id: u64, proof: Bytes) -> bool;
+pub trait IKeeperVerifier {
+    /// Returns true if `proof` is a valid attestation that `keeper`
+    /// performed the off-chain action `task` describes.
+    fn verify(env: Env, task: Task, keeper: Address, proof: Bytes) -> bool;
 }
 ```
+
+When a task has a verifier attached, `execute_task` calls it before
+crediting the keeper's reward. A `false` result rejects the call with
+`VerificationFailed` (and fires a `TaskVerificationFailed` event) without
+transferring anything or changing the task's status, so the keeper may
+retry with a different proof. A task with no verifier behaves exactly as
+before this feature existed — this is a strictly opt-in, additive path.
+
+See `IKeeperVerifier`'s doc comment in `contracts/keeper-registry/src/lib.rs`
+for the trust model and the documented failure semantics of a verifier that
+panics rather than returning `false`.
 
 ---
 
