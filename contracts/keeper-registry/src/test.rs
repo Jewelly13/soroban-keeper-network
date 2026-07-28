@@ -465,7 +465,7 @@ fn test_register_task_with_max_calldata_succeeds() {
         &max_calldata,
         &1_000_000i128,
         &(env.ledger().timestamp() + 3_600),
-        &17_280u32,
+        &20_000u32,
         &120u32,
     );
     assert_eq!(registry.get_task(&id).calldata.len(), MAX_CALLDATA_LEN);
@@ -584,7 +584,7 @@ fn test_register_task_with_empty_calldata_succeeds() {
         &empty,
         &1_000_000i128,
         &(env.ledger().timestamp() + 3_600),
-        &17_280u32,
+        &20_000u32,
         &120u32,
     );
     assert_eq!(registry.get_task(&id).calldata.len(), 0);
@@ -724,7 +724,7 @@ fn claim_with_lock(s: &Setup, keeper: &Address, lock_ledgers: u32) -> (u64, u32)
         &calldata(&s.env),
         &1_000_000i128,
         &deadline,
-        &17_280u32,
+        &20_000u32,
         &lock_ledgers,
     );
     s.registry.claim_task(keeper, &id);
@@ -800,7 +800,7 @@ fn test_lock_window_extending_past_deadline_is_blocked_by_deadline_first() {
         &calldata(&s.env),
         &1_000_000i128,
         &deadline,
-        &17_280u32,
+        &20_000u32,
         &1_000u32,
     );
     s.registry.claim_task(&first, &id);
@@ -1179,7 +1179,7 @@ fn test_expire_task_reentrancy_pays_refund_exactly_once() {
         &calldata(&env),
         &1_000_000i128,
         &deadline,
-        &17_280u32,
+        &20_000u32,
         &120u32,
     );
     assert_eq!(token.balance(&admin), 4_000_000i128); // escrowed
