@@ -517,17 +517,18 @@ npm run start:testnet
 
 ### Known Design Decisions
 
-1. **No on-chain execution verification (MVP)** — The registry trusts the claimer to submit proof. A malicious keeper could claim-and-execute-fake. Phase 2 adds an optional verifier callback.
+1. **On-chain execution verification is optional** — By default (`verifier: None`) the registry trusts the claimer to submit proof, same as the original MVP. A task owner can attach an `IKeeperVerifier` contract via `register_task`/`update_verifier` to gate crediting on a custom on-chain check instead. See [`docs/VERIFIER_SECURITY.md`](docs/VERIFIER_SECURITY.md) for the security considerations of attaching a third-party verifier.
 2. **Fee sweep is manual** — Protocol fees are batched and swept by admin. In Phase 2 this flows automatically to a staking/treasury contract.
 3. **No slashing (MVP)** — Unresponsive keepers lose their lock but face no economic penalty. Phase 2 introduces staking + slashing.
 
 ### Security Properties
 
-- **No re-entrancy** — State transitions happen before token transfers (CEI pattern throughout).
+- **No re-entrancy** — State transitions happen before token transfers (CEI pattern throughout); this also holds for the verifier call in `execute_task`, which runs before any crediting and cannot re-enter the registry (see [`docs/VERIFIER_SECURITY.md`](docs/VERIFIER_SECURITY.md)).
 - **Auth on all mutations** — Every write function calls `address.require_auth()`.
 - **Overflow protection** — `overflow-checks = true` in release profile + `checked_*` arithmetic.
 - **Bounded storage** — No dynamic `Vec` in storage; all reads are O(1) by key.
 - **Upgrade is admin-gated** — WASM upgrade requires admin auth; new WASM must be pre-uploaded.
+- **Third-party verifiers cannot move funds** — a verifier can only approve/reject; see [`docs/VERIFIER_SECURITY.md`](docs/VERIFIER_SECURITY.md) for the full threat-model walkthrough (proof-size griefing, resource-budget cost, panic isolation, fund-safety).
 
 ### Audit Plan
 
