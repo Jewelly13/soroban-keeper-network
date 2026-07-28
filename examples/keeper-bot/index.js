@@ -21,10 +21,13 @@
  *   # or: RUN_ONCE=true node index.js
  *
  * This example already includes:
- *   - Comprehensive startup validation for all config settings.
- *   - Retry with exponential back-off + jitter on transient RPC errors.
- *   - Graceful shutdown (SIGINT/SIGTERM) that drains the in-flight round.
- *   - Permissionless expiry of stale tasks to refund owners.
+ *   - Comprehensive startup validation for all config settings
+ *   - Retry with exponential back-off + jitter on transient RPC errors
+ *   - Graceful shutdown (SIGINT/SIGTERM) that drains the in-flight round
+ *   - Permissionless expiry of stale tasks to refund owners
+ *   - Read-only views (`keeper_balance`, etc.) are evaluated via simulation
+ *     through `readContract`, not submitted as signed transactions — see
+ *     that function's doc comment for why this matters
  *
  * Production keepers should additionally add:
  *   - Persistent task state DB (SQLite / Redis) to avoid double-claiming
@@ -277,6 +280,38 @@ async function invokeContract(server, keypair, networkPassphrase, contractId, me
   return simulateAndSend(server, keypair, networkPassphrase, tx);
 }
 
+/**
+ * Evaluates a read-only contract function via simulation.
+ *
+ * No transaction is signed, submitted, or confirmed, and no sequence number
+ * is consumed — this is safe (and cheap) to call on every polling round.
+ * Use `invokeContract` instead for anything that mutates state, since that
+ * is the only path that actually submits.
+ *
+ * Note: simulation still builds a transaction envelope, so `server.getAccount`
+ * requires the source account to already exist (be funded) on-chain — the
+ * same requirement `invokeContract` has today. A brand-new, unfunded keeper
+ * key will throw here.
+ */
+async function readContract(server, sourcePublicKey, networkPassphrase, contractId, method, args) {
+  const account = await server.getAccount(sourcePublicKey);
+  const contract = new Contract(contractId);
+
+  const tx = new TransactionBuilder(account, {
+    fee: BASE_FEE,
+    networkPassphrase,
+  })
+    .addOperation(contract.call(method, ...args))
+    .setTimeout(30)
+    .build();
+
+  const sim = await server.simulateTransaction(tx);
+  if (SorobanRpc.Api.isSimulationError(sim)) {
+    throw new Error(`Simulation failed: ${sim.error}`);
+  }
+  return sim.result ? scValToNative(sim.result.retval) : null;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Task fetching — reads pending tasks by querying events
 // ─────────────────────────────────────────────────────────────────────────────
@@ -409,26 +444,36 @@ async function keeperLoop(server, keypair, networkPassphrase, contractId) {
         summary.errors.push(err);
       }
     }
-
-    // Check and withdraw rewards
-    const balanceResult = await invokeContract(
-      server, keypair, networkPassphrase, contractId, "keeper_balance",
-      [nativeToScVal(keypair.publicKey(), { type: "address" })]
-    );
-    if (balanceResult.returnValue) {
-      const balance = BigInt(scValToNative(balanceResult.returnValue) || 0);
-      console.log(`  💎  Accumulated reward balance: ${balance} stroops`);
-
-      if (balance >= CONFIG.withdrawThreshold) {
-        console.log(`  💸  Withdrawing ${balance} stroops...`);
-        await invokeContract(server, keypair, networkPassphrase, contractId, "withdraw_rewards", [
-          nativeToScVal(keypair.publicKey(), { type: "address" }),
-        ]);
-        console.log(`  ✅  Withdrawal complete!`);
-      }
-    }
   } catch (err) {
     console.error(`❌  Keeper loop error: ${err.message}`);
+    summary.errors.push(err);
+  }
+
+  // Check accumulated rewards and withdraw if above threshold. This is a
+  // read-only view, so it goes through `readContract` (simulation only) and
+  // costs nothing — no fee, no sequence number, no submitted transaction.
+  // We still check it every round rather than tracking the balance locally:
+  // simulation makes the read free enough that the extra round-trip isn't
+  // worth trading away the guarantee of reading current on-chain state.
+  try {
+    const rawBalance = await readContract(
+      server, keypair.publicKey(), networkPassphrase, contractId, "keeper_balance",
+      [nativeToScVal(keypair.publicKey(), { type: "address" })]
+    );
+    const balance = BigInt(rawBalance || 0);
+    console.log(`  💎  Accumulated reward balance: ${balance} stroops`);
+
+    if (balance >= CONFIG.withdrawThreshold) {
+      console.log(`  💸  Withdrawing ${balance} stroops...`);
+      // withdraw_rewards mutates state, so it still goes through the
+      // submitting path.
+      await invokeContract(server, keypair, networkPassphrase, contractId, "withdraw_rewards", [
+        nativeToScVal(keypair.publicKey(), { type: "address" }),
+      ]);
+      console.log(`  ✅  Withdrawal complete!`);
+    }
+  } catch (err) {
+    console.warn(`  ⚠️  Balance check failed: ${err.message}`);
     summary.errors.push(err);
   }
   return summary;
