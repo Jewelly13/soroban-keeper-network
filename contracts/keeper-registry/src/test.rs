@@ -1034,16 +1034,88 @@ fn test_cancel_by_non_owner_fails() {
 }
 
 #[test]
-fn test_cancel_claimed_task_fails() {
+fn test_cancel_claimed_task_while_lock_active_fails() {
     let s = setup();
     let keeper = Address::generate(&s.env);
     let id = register_default_task(&s);
     s.registry.claim_task(&keeper, &id);
-    // Owner can no longer cancel once a keeper is working on it.
+
+    // Advance 100 ledgers while lock period (default 120 ledgers) is still active
+    advance(&s.env, 100, 0);
+
+    // Owner cannot cancel while keeper holds an active lock window.
     assert_eq!(
         s.registry.try_cancel_task(&s.admin, &id),
-        Err(Ok(KeeperError::InvalidTaskStatus))
+        Err(Ok(KeeperError::LockPeriodActive))
     );
+}
+
+#[test]
+fn test_cancel_claimed_task_after_lock_lapsed_succeeds() {
+    let s = setup();
+    let keeper = Address::generate(&s.env);
+    let token = token::Client::new(&s.env, &s.token_id);
+    let before = token.balance(&s.admin);
+    let id = register_default_task(&s);
+    s.registry.claim_task(&keeper, &id);
+
+    // Advance ledgers past lock_ledgers (default 120 ledgers)
+    advance(&s.env, 120, 0);
+
+    // Owner reclaims escrow once claimer's lock window has lapsed
+    s.registry.cancel_task(&s.admin, &id);
+
+    assert_eq!(token.balance(&s.admin), before);
+    assert_eq!(s.registry.get_task(&id).status, TaskStatus::Cancelled);
+}
+
+#[test]
+fn test_cancel_claimed_task_boundary_unlock_at_minus_one_fails() {
+    let s = setup();
+    let keeper = Address::generate(&s.env);
+    let (id, unlock_at) = claim_with_lock(&s, &keeper, 10u32);
+
+    goto_ledger(&s.env, unlock_at - 1);
+
+    // Lock is still active at unlock_at - 1
+    assert_eq!(
+        s.registry.try_cancel_task(&s.admin, &id),
+        Err(Ok(KeeperError::LockPeriodActive))
+    );
+}
+
+#[test]
+fn test_cancel_claimed_task_boundary_at_unlock_at_succeeds() {
+    let s = setup();
+    let keeper = Address::generate(&s.env);
+    let token = token::Client::new(&s.env, &s.token_id);
+    let before = token.balance(&s.admin);
+    let (id, unlock_at) = claim_with_lock(&s, &keeper, 10u32);
+
+    goto_ledger(&s.env, unlock_at);
+
+    // Lock lapses at unlock_at, allowing task owner to cancel
+    s.registry.cancel_task(&s.admin, &id);
+
+    assert_eq!(token.balance(&s.admin), before);
+    assert_eq!(s.registry.get_task(&id).status, TaskStatus::Cancelled);
+}
+
+#[test]
+fn test_cancel_claimed_task_boundary_unlock_at_plus_one_succeeds() {
+    let s = setup();
+    let keeper = Address::generate(&s.env);
+    let token = token::Client::new(&s.env, &s.token_id);
+    let before = token.balance(&s.admin);
+    let (id, unlock_at) = claim_with_lock(&s, &keeper, 10u32);
+
+    goto_ledger(&s.env, unlock_at + 1);
+
+    // Lock is expired at unlock_at + 1
+    s.registry.cancel_task(&s.admin, &id);
+
+    assert_eq!(token.balance(&s.admin), before);
+    assert_eq!(s.registry.get_task(&id).status, TaskStatus::Cancelled);
 }
 
 #[test]

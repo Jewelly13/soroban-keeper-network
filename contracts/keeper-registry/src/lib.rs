@@ -777,10 +777,10 @@ impl KeeperRegistry {
 
     // ── cancel_task ──────────────────────────────────────────────────────────
     //
-    // The owner reclaims a task that no keeper has picked up yet. Only Pending
-    // tasks can be cancelled — once a keeper has claimed one, the owner must
-    // wait for execution or for the deadline to pass (expire_task), so a keeper
-    // that has started work can't have the reward pulled out from under it.
+    // The owner reclaims a task. Pending tasks can be cancelled immediately.
+    // Claimed tasks can also be cancelled by the owner once the claimer's lock
+    // period has expired (`lock_expired(&e, &task) == true`), so a keeper that
+    // has started work has exclusive time to execute before escrow can be pulled.
 
     pub fn cancel_task(e: Env, owner: Address, task_id: u64) -> Result<(), KeeperError> {
         owner.require_auth();
@@ -789,8 +789,14 @@ impl KeeperRegistry {
         if task.owner != owner {
             return Err(KeeperError::NotTaskOwner);
         }
-        if task.status != TaskStatus::Pending {
-            return Err(KeeperError::InvalidTaskStatus);
+        match task.status {
+            TaskStatus::Pending => {}
+            TaskStatus::Claimed => {
+                if !lock_expired(&e, &task) {
+                    return Err(KeeperError::LockPeriodActive);
+                }
+            }
+            _ => return Err(KeeperError::InvalidTaskStatus),
         }
 
         bump_instance(&e);
