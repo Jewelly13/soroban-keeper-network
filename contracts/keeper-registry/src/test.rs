@@ -727,7 +727,8 @@ fn test_reclaim_after_lock_window_elapses() {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // lock_expired boundary — pins the exact ledger the lock lifts, per issue #33.
-// A small `lock_ledgers` (10) keeps the arithmetic easy to follow.
+// A small `lock_ledgers` (12, the protocol minimum) keeps the arithmetic easy
+// to follow.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Registers a task with the given `lock_ledgers`, claims it as `keeper`, and
@@ -1081,7 +1082,7 @@ fn test_cancel_claimed_task_after_lock_lapsed_succeeds() {
 fn test_cancel_claimed_task_boundary_unlock_at_minus_one_fails() {
     let s = setup();
     let keeper = Address::generate(&s.env);
-    let (id, unlock_at) = claim_with_lock(&s, &keeper, 10u32);
+    let (id, unlock_at) = claim_with_lock(&s, &keeper, 12u32);
 
     goto_ledger(&s.env, unlock_at - 1);
 
@@ -1098,7 +1099,7 @@ fn test_cancel_claimed_task_boundary_at_unlock_at_succeeds() {
     let keeper = Address::generate(&s.env);
     let token = token::Client::new(&s.env, &s.token_id);
     let before = token.balance(&s.admin);
-    let (id, unlock_at) = claim_with_lock(&s, &keeper, 10u32);
+    let (id, unlock_at) = claim_with_lock(&s, &keeper, 12u32);
 
     goto_ledger(&s.env, unlock_at);
 
@@ -1115,7 +1116,7 @@ fn test_cancel_claimed_task_boundary_unlock_at_plus_one_succeeds() {
     let keeper = Address::generate(&s.env);
     let token = token::Client::new(&s.env, &s.token_id);
     let before = token.balance(&s.admin);
-    let (id, unlock_at) = claim_with_lock(&s, &keeper, 10u32);
+    let (id, unlock_at) = claim_with_lock(&s, &keeper, 12u32);
 
     goto_ledger(&s.env, unlock_at + 1);
 
