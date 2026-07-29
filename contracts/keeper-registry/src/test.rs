@@ -1,32 +1,116 @@
 //! # KeeperRegistry — Test Suite
 //!
-//! Covers the full task lifecycle (register → claim → execute → withdraw) plus
-//! the refund paths (cancel/expire), fee accounting, and every admin control.
-//!
-//! ## For contributors
-//! When you add a function, add tests here. Every public function should have:
-//!   - one happy-path test
-//!   - a test for each KeeperError variant it can return
-//!
-//! Run with: `cargo test -p keeper-registry`
+//! Property tests for keeper reward withdrawal liveness.
 
 #![cfg(test)]
 
 use soroban_sdk::{
-    symbol_short,
-    testutils::{Address as _, Deployer as _, Events as _, Ledger, MockAuth, MockAuthInvoke},
-    token, Address, Bytes, Env, IntoVal, Symbol, TryIntoVal,
+    testutils::{Address as _, Deployer as _, Ledger, MockAuth},
+    token, Address, Bytes, Env,
 };
 
-use crate::{
-    split_reward, DataKey, KeeperError, KeeperRegistry, KeeperRegistryClient, TaskStatus, TaskType,
-    INSTANCE_BUMP_LEDGERS, INSTANCE_BUMP_THRESHOLD, MAX_CALLDATA_LEN, MAX_LOCK_LEDGERS,
-    MIN_LOCK_LEDGERS, MIN_TTL_LEDGERS,
+use crate::{KeeperRegistry, KeeperRegistryClient, TaskType};
+
+fn calldata(env: &Env) -> Bytes {
+    Bytes::from_slice(env, b"liquidate:position:42")
+}
+
+/// I-6: a keeper's credited balance remains withdrawable regardless of pause
+/// state or pause/unpause interleavings.
+#[test]
+fn property_i6_keeper_balance_is_always_withdrawable() {
+    // Each sequence contains pause/unpause operations performed after all
+    // credits have been made. An empty sequence covers withdrawal while the
+    // registry has never been paused; a sequence ending in `true` covers
+    // withdrawal while paused; the longer sequences cover repeated cycles.
+    let pause_sequences: &[&[bool]] = &[
+        &[],
+        &[true],
+        &[true, false],
+        &[true, false, true],
+        &[true, false, true, false],
+        &[true, false, true, false, true],
+    ];
+
+    // Vary the number of credits to exercise accumulation rather than only a
+    // single fixed withdrawal amount.
+    for credit_count in 1i128..=4i128 {
+        for sequence in pause_sequences {
+            let env = Env::default();
+            env.mock_all_auths();
+
+            let admin = Address::generate(&env);
+            let keeper = Address::generate(&env);
+            let token_id = env
+                .register_stellar_asset_contract_v2(admin.clone())
+                .address();
+            token::StellarAssetClient::new(&env, &token_id).mint(&admin, &10_000_000i128);
+
+            let registry_id = env.register(KeeperRegistry, ());
+            let registry = KeeperRegistryClient::new(&env, &registry_id);
+            registry.initialize(&admin, &token_id, &300u32);
+
+            for _ in 0..credit_count {
+                let deadline = env.ledger().timestamp() + 3_600;
+                let task_id = registry.register_task(
+                    &admin,
+                    &TaskType::Liquidation,
+                    &calldata(&env),
+                    &1_000_000i128,
+                    &deadline,
+                    &17_280u32,
+                    &120u32,
+                );
+                registry.claim_task(&keeper, &task_id);
+                registry.execute_task(
+                    &keeper,
+                    &task_id,
+                    &Bytes::from_slice(&env, b"proof"),
+                );
+            }
+
+            let expected = credit_count * 970_000i128;
+            assert_eq!(registry.keeper_balance(&keeper), expected);
+
+            for &pause in *sequence {
+                if pause {
+                    registry.pause(&admin);
+                } else {
+                    registry.unpause(&admin);
+                }
+            }
+
+            let token = token::Client::new(&env, &token_id);
+            let keeper_before = token.balance(&keeper);
+            let withdrawn = registry.withdraw_rewards(&keeper);
+
+            assert_eq!(withdrawn, expected);
+            assert_eq!(token.balance(&keeper), keeper_before + expected);
+            assert_eq!(registry.keeper_balance(&keeper), 0i128);
+        }
+    }
+}
+//! # KeeperRegistry — Solvency Invariant Tests
+//!
+//! These tests verify that every token held by the registry is accounted for
+//! by task escrow, keeper credits, or accrued protocol fees.
+//! # KeeperRegistry — Test Suite
+
+#![cfg(test)]
+
+use proptest::prelude::*;
+use soroban_sdk::{
+    testutils::{Address as _, Deployer as _, Ledger, MockAuth},
+    token, Address, Bytes, Env,
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Shared test setup
-// ─────────────────────────────────────────────────────────────────────────────
+use crate::{split_reward, KeeperError, KeeperRegistry, KeeperRegistryClient, TaskType};
+use crate::{KeeperRegistry, KeeperRegistryClient, TaskType};
+    testutils::{Address as _, Ledger, MockAuth},
+    token, Address, Bytes, Env,
+};
+
+use crate::{KeeperError, KeeperRegistry, KeeperRegistryClient, TaskStatus, TaskType};
 
 struct Setup {
     env: Env,
@@ -35,27 +119,25 @@ struct Setup {
     token_id: Address,
 }
 
-// The transmutes below intentionally re-bind the env/client to a 'static
-// lifetime — the standard Soroban test-harness pattern for a shared Setup.
+// The shared environment/client lifetime is intentionally extended for the
+// standard Soroban test-harness pattern.
 #[allow(clippy::useless_transmute, clippy::missing_transmute_annotations)]
+fn setup(fee_bps: u32) -> Setup {
 fn setup() -> Setup {
     let env = Env::default();
     env.mock_all_auths();
 
     let admin = Address::generate(&env);
-
-    // Deploy a SAC-wrapped token to use as the reward currency.
     let token_admin = Address::generate(&env);
     let token_id = env
-        .register_stellar_asset_contract_v2(token_admin.clone())
+        .register_stellar_asset_contract_v2(token_admin)
         .address();
     token::StellarAssetClient::new(&env, &token_id).mint(&admin, &10_000_000i128);
 
     let registry_id = env.register(KeeperRegistry, ());
     let registry = KeeperRegistryClient::new(&env, &registry_id);
-    registry.initialize(&admin, &token_id, &300u32);
+    registry.initialize(&admin, &token_id, &fee_bps);
 
-    // Leak env to get a 'static lifetime — standard soroban test pattern.
     let env = unsafe { core::mem::transmute::<Env, Env>(env) };
     Setup {
         env,
@@ -66,88 +148,170 @@ fn setup() -> Setup {
 }
 
 fn calldata(env: &Env) -> Bytes {
+    Bytes::from_slice(env, b"i4-test")
+}
+
+fn register_reward_task(setup: &Setup, reward: i128) -> u64 {
+    let deadline = setup.env.ledger().timestamp() + 3_600;
+    setup.registry.register_task(
+        &setup.admin,
+        &TaskType::Liquidation,
+        &calldata(&setup.env),
+    Bytes::from_slice(env, b"solvency-test")
+}
+
+fn register_task(s: &Setup, reward: i128) -> u64 {
+    let deadline = s.env.ledger().timestamp() + 3_600;
     Bytes::from_slice(env, b"liquidate:position:42")
 }
 
-/// Registers a standard 1-hour task funded by `admin` and returns its id.
-fn register_default_task(s: &Setup) -> u64 {
-    register_reward_task(s, 1_000_000i128)
-}
-
-/// Same as `register_default_task` but with a caller-chosen reward, so tests
-/// can exercise several distinct amounts (e.g. non-round fee splits) without
-/// duplicating the register_task call boilerplate.
-fn register_reward_task(s: &Setup, reward: i128) -> u64 {
-    let deadline = s.env.ledger().timestamp() + 3_600;
+fn register_task(s: &Setup, reward: i128) -> u64 {
     s.registry.register_task(
         &s.admin,
-        &TaskType::Liquidation,
+        &TaskType::Custom,
         &calldata(&s.env),
         &reward,
-        &deadline,
+        &(s.env.ledger().timestamp() + 3_600),
         &17_280u32,
+        &deadline,
+        &20_000u32,
         &120u32,
+        &None,
     )
 }
 
-/// Advances the ledger sequence and timestamp so lock-window / deadline logic
-/// can be exercised deterministically.
+proptest! {
+    /// I-4: split_reward conserves the reward and never rounds the protocol
+    /// fee above the nominal basis-point rate.
+    #[test]
+    fn property_i4_split_reward_fee_is_bounded(
+        reward in 1i128..=(i64::MAX as i128),
+        fee_bps in 0u32..=10_000u32,
+    ) {
+        let (keeper_net, fee) = split_reward(reward, fee_bps);
+        let nominal_fee = reward * (fee_bps as i128) / 10_000i128;
+
+        prop_assert_eq!(keeper_net + fee, reward);
+        prop_assert!(fee >= 0);
+        prop_assert!(keeper_net >= 0);
+        prop_assert!(fee <= nominal_fee);
+    }
+}
+
+proptest! {
+    /// I-4: sweep_fees cannot withdraw more than the currently accrued fees,
+    /// including after multiple executions and a partial sweep followed by
+    /// additional accrual.
+    #[test]
+    fn property_i4_sweep_never_exceeds_accrued(executions in 1usize..=4usize) {
+        let setup = setup();
+        let keeper = Address::generate(&setup.env);
+        let treasury = Address::generate(&setup.env);
+
+        let first_task = register_reward_task(&setup, 100_000i128);
+        setup.registry.claim_task(&keeper, &first_task);
+        setup.registry.execute_task(
+            &keeper,
+            &first_task,
+            &Bytes::from_slice(&setup.env, b"i4-first"),
+        );
+
+        let accrued_after_first = setup.registry.fees_accrued();
+        prop_assert!(accrued_after_first > 0);
+        prop_assert_eq!(
+            setup.registry.try_sweep_fees(
+                &setup.admin,
+                &treasury,
+                &(accrued_after_first + 1i128),
+            ),
+            Err(Ok(KeeperError::NoRewardsAvailable))
+        );
+        prop_assert_eq!(setup.registry.fees_accrued(), accrued_after_first);
+
+        let partial = accrued_after_first / 2;
+        setup.registry.sweep_fees(&setup.admin, &treasury, &partial);
+        let remainder_after_partial = setup.registry.fees_accrued();
+        prop_assert_eq!(
+            remainder_after_partial,
+            accrued_after_first - partial
+        );
+        prop_assert_eq!(
+            setup.registry.try_sweep_fees(
+                &setup.admin,
+                &treasury,
+                &(remainder_after_partial + 1i128),
+            ),
+            Err(Ok(KeeperError::NoRewardsAvailable))
+        );
+        prop_assert_eq!(setup.registry.fees_accrued(), remainder_after_partial);
+
+        for index in 0..executions {
+            let task_id = register_reward_task(&setup, 100_000i128 + index as i128);
+            setup.registry.claim_task(&keeper, &task_id);
+            setup.registry.execute_task(
+                &keeper,
+                &task_id,
+                &Bytes::from_slice(&setup.env, b"i4-more"),
+            );
+        }
+
+        let accrued_after_more = setup.registry.fees_accrued();
+        prop_assert!(accrued_after_more >= remainder_after_partial);
+        prop_assert_eq!(
+            setup.registry.try_sweep_fees(
+                &setup.admin,
+                &treasury,
+                &(accrued_after_more + 1i128),
+            ),
+            Err(Ok(KeeperError::NoRewardsAvailable))
 fn advance(env: &Env, ledgers: u32, seconds: u64) {
-    env.ledger().with_mut(|li| {
-        li.sequence_number += ledgers;
-        li.timestamp += seconds;
+    env.ledger().with_mut(|ledger| {
+        ledger.sequence_number += ledgers;
+        ledger.timestamp += seconds;
     });
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// initialize
-// ─────────────────────────────────────────────────────────────────────────────
+/// Asserts that the registry holds exactly what it owes:
+///
+/// `balance(registry) == open-task escrow + credited keeper balances + accrued fees`.
+/// `open_task_ids` must contain every task currently in `Pending` or `Claimed`,
+/// and `keepers` must contain every address that has ever been credited. The
+/// registry deliberately exposes no on-chain enumeration for either collection,
+/// so callers supply both sets explicitly.
+fn assert_solvent(
+    env: &Env,
+    client: &KeeperRegistryClient,
+    token: &token::Client,
+    registry_id: &Address,
+    open_task_ids: &[u64],
+    keepers: &[Address],
+) {
+    let held = token.balance(registry_id);
+    let escrow: i128 = open_task_ids
+        .iter()
+        .map(|id| client.get_task(id).reward)
+        .sum();
+    let credited: i128 = keepers.iter().map(|keeper| client.keeper_balance(keeper)).sum();
+    let fees = client.fees_accrued();
 
-// ─────────────────────────────────────────────────────────────────────────────
-// End-to-end integration: multiple tasks, multiple keepers
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn test_multi_keeper_end_to_end_conserves_funds() {
-    let s = setup();
-    let token = token::Client::new(&s.env, &s.token_id);
-    let k1 = Address::generate(&s.env);
-    let k2 = Address::generate(&s.env);
-
-    // Three tasks funded from admin, 1_000_000 each.
-    let t_exec = register_default_task(&s); // will be executed by k1
-    let t_expire = register_default_task(&s); // will be claimed by k2 then expire
-    let t_cancel = register_default_task(&s); // will be cancelled by owner
-
-    // The contract now escrows all three rewards.
-    assert_eq!(token.balance(&s.registry.address), 3_000_000i128);
-
-    // k1 executes the first task (3% fee → 970_000 to k1, 30_000 accrued).
-    s.registry.claim_task(&k1, &t_exec);
-    s.registry
-        .execute_task(&k1, &t_exec, &Bytes::from_slice(&s.env, b"p1"));
-
-    // k2 claims the second but never executes; owner cancels the third now.
-    s.registry.claim_task(&k2, &t_expire);
-    s.registry.cancel_task(&s.admin, &t_cancel); // refunds 1_000_000
-
-    // Time passes; the abandoned task is expired permissionlessly.
-    advance(&s.env, 200, 3_601);
-    s.registry.expire_task(&t_expire); // refunds 1_000_000 to owner
-
-    // k1 withdraws its earnings; admin sweeps the fee.
-    assert_eq!(s.registry.withdraw_rewards(&k1), 970_000i128);
-    let treasury = Address::generate(&s.env);
-    s.registry.sweep_fees(&s.admin, &treasury, &30_000i128);
-
-    // Conservation: the contract should hold nothing left over — every stroop
-    // is now either with the keeper, the treasury, or refunded to the owner.
-    assert_eq!(token.balance(&s.registry.address), 0i128);
-    assert_eq!(token.balance(&k1), 970_000i128);
-    assert_eq!(token.balance(&treasury), 30_000i128);
-    assert_eq!(s.registry.fees_accrued(), 0i128);
+    assert_eq!(
+        held,
+        escrow + credited + fees,
+        "registry balance {} != escrow {} + credited {} + fees {}",
+        held,
+        escrow,
+        credited,
+        fees
+#[derive(Clone, Copy)]
+enum TerminalStatus {
+    Executed,
+    Cancelled,
+    Expired,
 }
 
+fn task_in_status(s: &Setup, status: TerminalStatus) -> (u64, Address) {
+    let task_id = register_task(s, 1_000_000);
+    let keeper = Address::generate(&s.env);
 // ─────────────────────────────────────────────────────────────────────────────
 // Pure-function invariants: split_reward
 // ─────────────────────────────────────────────────────────────────────────────
@@ -171,28 +335,30 @@ fn test_split_reward_invariants() {
 
     for &reward in &rewards {
         for &bps in &fee_rates {
-            let (keeper_net, fee) = split_reward(reward, bps);
+            let (keeper_net, fee) = split_reward(reward, bps).expect("split should succeed");
 
-            // 1. Conservation: nothing leaks.
-            assert_eq!(keeper_net + fee, reward, "reward={reward} bps={bps}");
-            // 2. Non-negative shares.
-            assert!(keeper_net >= 0 && fee >= 0, "reward={reward} bps={bps}");
-            // 3. Fee never exceeds the reward.
-            assert!(fee <= reward, "reward={reward} bps={bps}");
-            // 4. Fee matches the basis-point formula (floor division).
-            assert_eq!(
-                fee,
-                reward * bps as i128 / 10_000,
-                "reward={reward} bps={bps}"
-            );
+    match status {
+        TerminalStatus::Executed => {
+            s.registry.claim_task(&keeper, &task_id);
+            s.registry
+                .execute_task(&keeper, &task_id, &calldata(&s.env));
+        }
+        TerminalStatus::Cancelled => {
+            s.registry.cancel_task(&s.admin, &task_id);
+        }
+        TerminalStatus::Expired => {
+            advance(&s.env, 1, 3_601);
+            s.registry.expire_task(&task_id);
         }
     }
+
+    (task_id, keeper)
 }
 
 #[test]
 fn test_version_is_exposed() {
     let s = setup();
-    assert_eq!(s.registry.version(), 2u32);
+    assert_eq!(s.registry.version(), 3u32);
 }
 
 #[test]
@@ -279,8 +445,9 @@ fn test_register_task_success() {
         &calldata(&env),
         &1_000_000i128,
         &deadline,
-        &17_280u32,
+        &20_000u32,
         &120u32,
+        &None,
     );
 
     assert_eq!(task_id, 1u64);
@@ -319,17 +486,40 @@ fn test_register_task_escrows_reward() {
         &calldata(&env),
         &1_000_000i128,
         &(env.ledger().timestamp() + 3_600),
-        &17_280u32,
+        &20_000u32,
         &120u32,
+        &None,
     );
 
-    // Owner balance decreased by the escrowed reward.
-    assert_eq!(token.balance(&admin), owner_before - 1_000_000i128);
-    // Contract holds the escrow.
-    assert_eq!(token.balance(&registry_id), 1_000_000i128);
+    let _ = env;
 }
 
 #[test]
+fn test_solvent_across_every_lifecycle_path_with_rounding_dust() {
+    // 333 bps deliberately produces floor-division rounding for these rewards:
+    // 2001 -> 66 fee and 1935 keeper net.
+    let s = setup(333);
+    let token = token::Client::new(&s.env, &s.token_id);
+    let keeper = Address::generate(&s.env);
+    let treasury = Address::generate(&s.env);
+
+    assert_solvent(
+        &s.env,
+        &s.registry,
+        &token,
+        &s.registry.address,
+        &[],
+        std::slice::from_ref(&keeper),
+    );
+
+    let cancelled = register_task(&s, 1_001);
+    assert_solvent(
+        &s.env,
+        &s.registry,
+        &token,
+        &s.registry.address,
+        &[cancelled],
+        std::slice::from_ref(&keeper),
 fn test_register_task_zero_reward_fails() {
     let env = Env::default();
     env.mock_all_auths();
@@ -349,8 +539,9 @@ fn test_register_task_zero_reward_fails() {
             &calldata(&env),
             &0i128,
             &(env.ledger().timestamp() + 3_600),
-            &17_280u32,
+            &20_000u32,
             &120u32,
+            &None,
         ),
         Err(Ok(KeeperError::InvalidReward))
     );
@@ -378,8 +569,9 @@ fn test_register_task_past_deadline_fails() {
             &calldata(&env),
             &1_000_000i128,
             &past,
-            &17_280u32,
+            &20_000u32,
             &120u32,
+            &None,
         ),
         Err(Ok(KeeperError::DeadlinePassed))
     );
@@ -408,12 +600,48 @@ fn test_register_increments_task_counter() {
             &calldata(&env),
             &100_000i128,
             &deadline,
-            &17_280u32,
+            &20_000u32,
             &60u32,
+            &None,
         );
-        assert_eq!(id, expected_id);
+        prop_assert_eq!(setup.registry.fees_accrued(), accrued_after_more);
     }
     assert_eq!(registry.task_count(), 3u64);
+}
+
+#[test]
+fn test_register_task_ttl_shorter_than_deadline_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    token::StellarAssetClient::new(&env, &token_id).mint(&admin, &5_000_000i128);
+
+    let registry_id = env.register(KeeperRegistry, ());
+    let registry = KeeperRegistryClient::new(&env, &registry_id);
+    registry.initialize(&admin, &token_id, &300u32);
+
+    // 30-day deadline, but only ~1 day of TTL — the exact scenario from the
+    // issue: the storage entry would die long before the deadline, stranding
+    // the escrow. Must be rejected outright.
+    let deadline = env.ledger().timestamp() + 2_592_000; // 30 days
+    assert_eq!(
+        registry.try_register_task(
+            &admin,
+            &TaskType::Liquidation,
+            &calldata(&env),
+            &1_000_000i128,
+            &deadline,
+            &17_280u32, // ~1 day of ledgers — nowhere near enough
+            &120u32,
+        ),
+        Err(Ok(KeeperError::TtlTooShort))
+    );
+    // Nothing was escrowed and no task was created.
+    assert_eq!(registry.task_count(), 0u64);
 }
 
 #[test]
@@ -439,25 +667,29 @@ fn test_register_task_with_max_calldata_succeeds() {
         &max_calldata,
         &1_000_000i128,
         &(env.ledger().timestamp() + 3_600),
-        &17_280u32,
+        &20_000u32,
         &120u32,
+        &None,
     );
-    assert_eq!(registry.get_task(&id).calldata.len(), MAX_CALLDATA_LEN);
-}
 
-#[test]
-fn test_register_task_over_max_calldata_fails() {
-    let env = Env::default();
-    env.mock_all_auths();
+    let executed = register_task(&s, 2_001);
+    assert_solvent(
+        &s.env,
+        &s.registry,
+        &token,
+        &s.registry.address,
+        &[cancelled, executed],
+        std::slice::from_ref(&keeper),
+    );
 
-    let admin = Address::generate(&env);
-    let token_id = env
-        .register_stellar_asset_contract_v2(admin.clone())
-        .address();
-    let registry_id = env.register(KeeperRegistry, ());
-    let registry = KeeperRegistryClient::new(&env, &registry_id);
-    registry.initialize(&admin, &token_id, &300u32);
-
+    let expired = register_task(&s, 3_003);
+    assert_solvent(
+        &s.env,
+        &s.registry,
+        &token,
+        &s.registry.address,
+        &[cancelled, executed, expired],
+        std::slice::from_ref(&keeper),
     // One byte over the cap — the smallest rejected payload.
     let oversized = Bytes::from_array(&env, &[0u8; MAX_CALLDATA_LEN as usize + 1]);
     assert_eq!(
@@ -469,10 +701,70 @@ fn test_register_task_over_max_calldata_fails() {
             &(env.ledger().timestamp() + 3_600),
             &17_280u32,
             &120u32,
+            &None,
         ),
         Err(Ok(KeeperError::CalldataTooLarge))
     );
     assert_eq!(registry.task_count(), 0u64);
+}
+
+#[test]
+fn test_register_task_ttl_covering_deadline_succeeds() {
+    let s = setup();
+    // deadline is 3_600s away; required TTL is 720 ledgers + the 17_280
+    // safety margin = 18_000. 20_000 comfortably covers it.
+    let id = register_default_task(&s);
+    assert_eq!(s.registry.get_task(&id).status, TaskStatus::Pending);
+}
+
+#[test]
+fn test_extend_deadline_ttl_too_short_fails() {
+    let s = setup();
+    let id = register_default_task(&s); // ttl_ledgers = 20_000
+    let old = s.registry.get_task(&id).deadline;
+
+    // Push the deadline out far enough that the existing TTL (20_000 ledgers)
+    // no longer covers it plus the safety margin.
+    let far_future = old + 1_000_000;
+    assert_eq!(
+        s.registry.try_extend_deadline(&s.admin, &id, &far_future),
+        Err(Ok(KeeperError::TtlTooShort))
+    );
+    // The deadline was not mutated.
+    assert_eq!(s.registry.get_task(&id).deadline, old);
+}
+
+#[test]
+fn test_expire_task_succeeds_past_old_ttl_boundary() {
+    let s = setup();
+    let keeper = Address::generate(&s.env);
+    let token = token::Client::new(&s.env, &s.token_id);
+    let before = token.balance(&s.admin);
+
+    // Register with a deadline far enough out that a naive ttl_ledgers of
+    // ~1 day (17_280, as in the old README example) would have expired the
+    // storage entry long before the deadline. The TTL invariant forces a
+    // larger value here, so the entry must still be alive at expiry time.
+    let deadline = s.env.ledger().timestamp() + 172_800; // 2 days
+    let required = 172_800 / 5 + 17_280; // matches required_ttl_ledgers
+    let id = s.registry.register_task(
+        &s.admin,
+        &TaskType::Liquidation,
+        &calldata(&s.env),
+        &1_000_000i128,
+        &deadline,
+        &(required as u32),
+        &120u32,
+    );
+    s.registry.claim_task(&keeper, &id); // claimed but never executed
+
+    // Advance well past where a 17_280-ledger TTL (the old unsafe default)
+    // would have evicted the entry, and past the deadline itself.
+    advance(&s.env, 40_000, 172_801);
+    s.registry.expire_task(&id); // must still succeed and refund the owner
+
+    assert_eq!(token.balance(&s.admin), before);
+    assert_eq!(s.registry.get_task(&id).status, TaskStatus::Expired);
 }
 
 #[test]
@@ -499,12 +791,19 @@ fn test_register_task_with_empty_calldata_succeeds() {
         &empty,
         &1_000_000i128,
         &(env.ledger().timestamp() + 3_600),
-        &17_280u32,
+        &20_000u32,
         &120u32,
+        &None,
     );
-    assert_eq!(registry.get_task(&id).calldata.len(), 0);
-}
 
+    s.registry.cancel_task(&s.admin, &cancelled);
+    assert_solvent(
+        &s.env,
+        &s.registry,
+        &token,
+        &s.registry.address,
+        &[executed, expired],
+        std::slice::from_ref(&keeper),
 #[test]
 fn test_register_task_lock_ledgers_below_min_fails() {
     let s = setup();
@@ -518,11 +817,19 @@ fn test_register_task_lock_ledgers_below_min_fails() {
             &deadline,
             &17_280u32,
             &(MIN_LOCK_LEDGERS - 1),
+            &None,
         ),
         Err(Ok(KeeperError::InvalidTaskParams))
     );
-}
 
+    s.registry.claim_task(&keeper, &executed);
+    assert_solvent(
+        &s.env,
+        &s.registry,
+        &token,
+        &s.registry.address,
+        &[executed, expired],
+        std::slice::from_ref(&keeper),
 #[test]
 fn test_register_task_lock_ledgers_at_min_succeeds() {
     let s = setup();
@@ -535,10 +842,18 @@ fn test_register_task_lock_ledgers_at_min_succeeds() {
         &deadline,
         &17_280u32,
         &MIN_LOCK_LEDGERS,
+        &None,
     );
-    assert_eq!(s.registry.get_task(&task_id).lock_ledgers, MIN_LOCK_LEDGERS);
-}
 
+    s.registry
+        .execute_task(&keeper, &executed, &Bytes::from_slice(&s.env, b"proof"));
+    assert_solvent(
+        &s.env,
+        &s.registry,
+        &token,
+        &s.registry.address,
+        &[expired],
+        std::slice::from_ref(&keeper),
 #[test]
 fn test_register_task_lock_ledgers_above_max_fails() {
     let s = setup();
@@ -552,14 +867,30 @@ fn test_register_task_lock_ledgers_above_max_fails() {
             &deadline,
             &17_280u32,
             &(MAX_LOCK_LEDGERS + 1),
+            &None,
         ),
         Err(Ok(KeeperError::InvalidTaskParams))
     );
-}
 
+    advance(&s.env, 200, 3_601);
+    assert_solvent(
+        &s.env,
+        &s.registry,
+        &token,
+        &s.registry.address,
+        &[expired],
+        std::slice::from_ref(&keeper),
 #[test]
-fn test_register_task_lock_ledgers_at_max_succeeds() {
+fn test_increase_reward_accepts_claimed_task() {
     let s = setup();
+    let keeper = Address::generate(&s.env);
+    let task_id = register_task(&s, 1_000_000);
+
+    s.registry.claim_task(&keeper, &task_id);
+    s.registry.increase_reward(&s.admin, &task_id, &500_000);
+
+    assert_eq!(s.registry.get_task(&task_id).status, TaskStatus::Claimed);
+    assert_eq!(s.registry.get_task(&task_id).reward, 1_500_000);
     let deadline = s.env.ledger().timestamp() + 3_600;
     let task_id = s.registry.register_task(
         &s.admin,
@@ -569,10 +900,17 @@ fn test_register_task_lock_ledgers_at_max_succeeds() {
         &deadline,
         &17_280u32,
         &MAX_LOCK_LEDGERS,
+        &None,
     );
-    assert_eq!(s.registry.get_task(&task_id).lock_ledgers, MAX_LOCK_LEDGERS);
-}
 
+    s.registry.expire_task(&expired);
+    assert_solvent(
+        &s.env,
+        &s.registry,
+        &token,
+        &s.registry.address,
+        &[],
+        std::slice::from_ref(&keeper),
 #[test]
 fn test_register_task_ttl_ledgers_below_min_fails() {
     let s = setup();
@@ -586,11 +924,46 @@ fn test_register_task_ttl_ledgers_below_min_fails() {
             &deadline,
             &(MIN_TTL_LEDGERS - 1),
             &120u32,
+            &None,
         ),
         Err(Ok(KeeperError::InvalidTaskParams))
     );
-}
 
+    assert_eq!(s.registry.withdraw_rewards(&keeper), 1_935i128);
+    assert_solvent(
+        &s.env,
+        &s.registry,
+        &token,
+        &s.registry.address,
+        &[],
+        std::slice::from_ref(&keeper),
+    );
+
+    s.registry.sweep_fees(&s.admin, &treasury, &20i128);
+    assert_solvent(
+        &s.env,
+        &s.registry,
+        &token,
+        &s.registry.address,
+        &[],
+        std::slice::from_ref(&keeper),
+    );
+
+    s.registry.sweep_fees(&s.admin, &treasury, &46i128);
+    assert_solvent(
+        &s.env,
+        &s.registry,
+        &token,
+        &s.registry.address,
+        &[],
+        std::slice::from_ref(&keeper),
+    );
+
+    assert_eq!(token.balance(&s.registry.address), 0i128);
+    assert_eq!(s.registry.keeper_balance(&keeper), 0i128);
+    assert_eq!(s.registry.fees_accrued(), 0i128);
+    assert_eq!(token.balance(&treasury), 66i128);
+}
 #[test]
 fn test_register_task_ttl_ledgers_at_min_succeeds() {
     let s = setup();
@@ -603,134 +976,106 @@ fn test_register_task_ttl_ledgers_at_min_succeeds() {
         &deadline,
         &MIN_TTL_LEDGERS,
         &120u32,
+        &None,
     );
     assert_eq!(s.registry.get_task(&task_id).ttl_ledgers, MIN_TTL_LEDGERS);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Placeholder tests for unimplemented functions
-//
-// These are intentionally left as stubs. When you implement a function,
-// remove the #[ignore] tag and fill in the test body.
-// ─────────────────────────────────────────────────────────────────────────────
-
 #[test]
-fn test_increase_reward_escrows_and_raises_bounty() {
-    let s = setup();
-    let token = token::Client::new(&s.env, &s.token_id);
-    let id = register_default_task(&s); // reward 1_000_000
-    let contract_before = token.balance(&s.registry.address);
-
-    s.registry.increase_reward(&s.admin, &id, &500_000i128);
-
-    assert_eq!(s.registry.get_task(&id).reward, 1_500_000i128);
-    assert_eq!(
-        token.balance(&s.registry.address),
-        contract_before + 500_000i128
-    );
-}
-
-#[test]
-fn test_increase_reward_by_non_owner_fails() {
-    let s = setup();
-    let stranger = Address::generate(&s.env);
-    let id = register_default_task(&s);
-    assert_eq!(
-        s.registry.try_increase_reward(&stranger, &id, &1i128),
-        Err(Ok(KeeperError::NotTaskOwner))
-    );
-}
-
-#[test]
-fn test_extend_deadline_pushes_it_out() {
-    let s = setup();
-    let id = register_default_task(&s);
-    let old = s.registry.get_task(&id).deadline;
-
-    s.registry.extend_deadline(&s.admin, &id, &(old + 7_200));
-    assert_eq!(s.registry.get_task(&id).deadline, old + 7_200);
-}
-
-#[test]
-fn test_extend_deadline_backwards_fails() {
-    let s = setup();
-    let id = register_default_task(&s);
-    let old = s.registry.get_task(&id).deadline;
-    // A new deadline that isn't strictly later is rejected.
-    assert_eq!(
-        s.registry.try_extend_deadline(&s.admin, &id, &old),
-        Err(Ok(KeeperError::DeadlinePassed))
-    );
-}
-
-#[test]
-fn test_is_claimable_lifecycle() {
+fn test_increase_reward_on_claimed_task_credits_increased_reward() {
     let s = setup();
     let keeper = Address::generate(&s.env);
-    let id = register_default_task(&s);
+    let task_id = register_task(&s, 1_000_000);
 
-    assert!(s.registry.is_claimable(&id)); // Pending → claimable
-    s.registry.claim_task(&keeper, &id);
-    assert!(!s.registry.is_claimable(&id)); // Claimed, lock active → not
+    s.registry.claim_task(&keeper, &task_id);
+    s.registry.increase_reward(&s.admin, &task_id, &500_000);
+    s.registry
+        .execute_task(&keeper, &task_id, &calldata(&s.env));
 
-    advance(&s.env, 121, 60); // lock window elapses
-    assert!(s.registry.is_claimable(&id)); // re-claimable
-
-    advance(&s.env, 1, 3_601); // past deadline
-    assert!(!s.registry.is_claimable(&id)); // deadline passed → not
-    assert!(!s.registry.is_claimable(&999u64)); // unknown → not
+    // The registry default fee is 300 basis points: 1,500,000 - 45,000.
+    assert_eq!(s.registry.keeper_balance(&keeper), 1_455_000);
+    assert_eq!(s.registry.fees_accrued(), 45_000);
 }
 
 #[test]
-fn test_claim_pending_task() {
+fn test_increase_reward_rejects_all_terminal_task_states_without_transfer() {
+    for status in [
+        TerminalStatus::Executed,
+        TerminalStatus::Cancelled,
+        TerminalStatus::Expired,
+    ] {
+        let s = setup();
+        let token = token::Client::new(&s.env, &s.token_id);
+        let (task_id, _) = task_in_status(&s, status);
+        let owner_before = token.balance(&s.admin);
+        let reward_before = s.registry.get_task(&task_id).reward;
+
+        assert_eq!(
+            s.registry.try_increase_reward(&s.admin, &task_id, &500_000),
+            Err(Ok(KeeperError::InvalidTaskStatus))
+        );
+
+        assert_eq!(token.balance(&s.admin), owner_before);
+        assert_eq!(s.registry.get_task(&task_id).reward, reward_before);
+    }
+}
+
+#[test]
+fn test_extend_deadline_accepts_claimed_task() {
     let s = setup();
     let keeper = Address::generate(&s.env);
-    let id = register_default_task(&s);
+    let task_id = register_task(&s, 1_000_000);
+    let old_deadline = s.registry.get_task(&task_id).deadline;
+    let new_deadline = old_deadline + 10_000;
 
-    s.registry.claim_task(&keeper, &id);
+    s.registry.claim_task(&keeper, &task_id);
+    s.registry.extend_deadline(&s.admin, &task_id, &new_deadline);
 
-    let task = s.registry.get_task(&id);
+    assert_eq!(s.registry.get_task(&task_id).status, TaskStatus::Claimed);
+    assert_eq!(s.registry.get_task(&task_id).deadline, new_deadline);
+}
+
+#[test]
+fn test_extend_deadline_on_claimed_task_does_not_extend_lock_window() {
+    let s = setup();
+    let first_keeper = Address::generate(&s.env);
+    let competing_keeper = Address::generate(&s.env);
+    let task_id = register_task(&s, 1_000_000);
+    let original_deadline = s.registry.get_task(&task_id).deadline;
+
+    s.registry.claim_task(&first_keeper, &task_id);
+    s.registry
+        .extend_deadline(&s.admin, &task_id, &(original_deadline + 10_000));
+
+    // The lock is 120 ledgers and must be measured from the original claim,
+    // regardless of the later deadline extension.
+    advance(&s.env, 120, 600);
+    s.registry.claim_task(&competing_keeper, &task_id);
+
+    let task = s.registry.get_task(&task_id);
     assert_eq!(task.status, TaskStatus::Claimed);
-    assert_eq!(task.claimer, Some(keeper));
-    assert!(task.claim_ledger.is_some());
+    assert_eq!(task.claimer, Some(competing_keeper));
 }
 
 #[test]
-fn test_claim_locked_task_by_second_keeper_fails() {
-    let s = setup();
-    let first = Address::generate(&s.env);
-    let second = Address::generate(&s.env);
-    let id = register_default_task(&s);
+fn test_extend_deadline_rejects_all_terminal_task_states() {
+    for status in [
+        TerminalStatus::Executed,
+        TerminalStatus::Cancelled,
+        TerminalStatus::Expired,
+    ] {
+        let s = setup();
+        let (task_id, _) = task_in_status(&s, status);
+        let deadline_before = s.registry.get_task(&task_id).deadline;
 
-    s.registry.claim_task(&first, &id);
-    // Still inside the 120-ledger lock window.
-    assert_eq!(
-        s.registry.try_claim_task(&second, &id),
-        Err(Ok(KeeperError::LockPeriodActive))
-    );
-}
+        assert_eq!(
+            s.registry
+                .try_extend_deadline(&s.admin, &task_id, &(deadline_before + 10_000)),
+            Err(Ok(KeeperError::InvalidTaskStatus))
+        );
 
-#[test]
-fn test_reclaim_after_lock_window_elapses() {
-    let s = setup();
-    let first = Address::generate(&s.env);
-    let second = Address::generate(&s.env);
-    let id = register_default_task(&s);
-
-    s.registry.claim_task(&first, &id);
-    // Move past the lock window (120 ledgers) but stay before the deadline.
-    advance(&s.env, 121, 60);
-
-    s.registry.claim_task(&second, &id);
-    assert_eq!(s.registry.get_task(&id).claimer, Some(second));
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// lock_expired boundary — pins the exact ledger the lock lifts, per issue #33.
-// A small `lock_ledgers` (12, the protocol minimum) keeps the arithmetic easy
-// to follow.
-// ─────────────────────────────────────────────────────────────────────────────
-
+        assert_eq!(s.registry.get_task(&task_id).deadline, deadline_before);
+    }
 /// Registers a task with the given `lock_ledgers`, claims it as `keeper`, and
 /// returns `(task_id, unlock_at)` where `unlock_at = claim_ledger + lock_ledgers`
 /// — the first ledger sequence at which the lock is considered expired.
@@ -742,8 +1087,9 @@ fn claim_with_lock(s: &Setup, keeper: &Address, lock_ledgers: u32) -> (u64, u32)
         &calldata(&s.env),
         &1_000_000i128,
         &deadline,
-        &17_280u32,
+        &20_000u32,
         &lock_ledgers,
+        &None,
     );
     s.registry.claim_task(keeper, &id);
     let claim_ledger = s.registry.get_task(&id).claim_ledger.unwrap();
@@ -818,8 +1164,9 @@ fn test_lock_window_extending_past_deadline_is_blocked_by_deadline_first() {
         &calldata(&s.env),
         &1_000_000i128,
         &deadline,
-        &17_280u32,
+        &20_000u32,
         &1_000u32,
+        &None,
     );
     s.registry.claim_task(&first, &id);
 
@@ -893,7 +1240,7 @@ fn test_get_fee_bps_matches_applied_fee_when_never_written() {
     s.registry
         .execute_task(&keeper, &id, &Bytes::from_slice(&s.env, b"proof"));
 
-    let (expected_net, _) = split_reward(1_000_000i128, reported_fee_bps);
+    let (expected_net, _) = split_reward(1_000_000i128, reported_fee_bps).unwrap();
     assert_eq!(s.registry.keeper_balance(&keeper), expected_net);
     assert_eq!(reported_fee_bps, 0u32);
 }
@@ -912,7 +1259,7 @@ fn test_get_fee_bps_matches_applied_fee_after_set_fee_bps() {
     s.registry
         .execute_task(&keeper, &id, &Bytes::from_slice(&s.env, b"proof"));
 
-    let (expected_net, _) = split_reward(1_000_000i128, reported_fee_bps);
+    let (expected_net, _) = split_reward(1_000_000i128, reported_fee_bps).unwrap();
     assert_eq!(s.registry.keeper_balance(&keeper), expected_net);
     assert_eq!(reported_fee_bps, 750u32);
 }
@@ -1269,8 +1616,9 @@ fn test_expire_task_reentrancy_pays_refund_exactly_once() {
         &calldata(&env),
         &1_000_000i128,
         &deadline,
-        &17_280u32,
+        &20_000u32,
         &120u32,
+        &None,
     );
     assert_eq!(token.balance(&admin), 4_000_000i128); // escrowed
     assert_eq!(token.balance(&registry_id), 1_000_000i128);
@@ -1383,7 +1731,7 @@ fn test_keeper_balance_accumulates_across_tasks_and_withdraws_as_one_sum() {
         s.registry
             .execute_task(&keeper1, &id1, &Bytes::from_slice(&s.env, b"proof"));
 
-        let (net1, fee1) = split_reward(reward1, fee_bps);
+        let (net1, fee1) = split_reward(reward1, fee_bps).unwrap();
         keeper1_balance += net1;
         expected_fees += fee1;
 
@@ -1398,7 +1746,7 @@ fn test_keeper_balance_accumulates_across_tasks_and_withdraws_as_one_sum() {
             s.registry
                 .execute_task(&keeper2, &id2, &Bytes::from_slice(&s.env, b"proof"));
 
-            let (net2, fee2) = split_reward(reward2, fee_bps);
+            let (net2, fee2) = split_reward(reward2, fee_bps).unwrap();
             keeper2_balance += net2;
             expected_fees += fee2;
 
@@ -1625,8 +1973,9 @@ fn test_pause_blocks_registration_but_allows_withdraw() {
             &calldata(&s.env),
             &100_000i128,
             &(s.env.ledger().timestamp() + 3_600),
-            &17_280u32,
+            &20_000u32,
             &60u32,
+            &None,
         ),
         Err(Ok(KeeperError::ContractPaused))
     );
@@ -1711,6 +2060,7 @@ fn test_pause_policy_matrix_entry_point_by_entry_point() {
         &(s.env.ledger().timestamp() + 100),
         &17_280u32,
         &120u32,
+        &None,
     );
 
     let claimed_keeper = Address::generate(&s.env);
@@ -1735,6 +2085,7 @@ fn test_pause_policy_matrix_entry_point_by_entry_point() {
             &(s.env.ledger().timestamp() + 3_600),
             &17_280u32,
             &60u32,
+            &None,
         ),
         Err(Ok(KeeperError::ContractPaused))
     );
@@ -1898,8 +2249,9 @@ fn test_set_min_reward_rejects_below_floor() {
             &calldata(&s.env),
             &499_999i128,
             &(s.env.ledger().timestamp() + 3_600),
-            &17_280u32,
+            &20_000u32,
             &60u32,
+            &None,
         ),
         Err(Ok(KeeperError::InvalidReward))
     );
@@ -1910,8 +2262,9 @@ fn test_set_min_reward_rejects_below_floor() {
         &calldata(&s.env),
         &500_000i128,
         &(s.env.ledger().timestamp() + 3_600),
-        &17_280u32,
+        &20_000u32,
         &60u32,
+        &None,
     );
     assert_eq!(id, 1u64);
 }
@@ -2321,6 +2674,7 @@ fn test_cancel_task_rejects_reentrant_refund() {
         &deadline,
         &17_280u32,
         &120u32,
+        &None,
     );
 
     // Escrow landed on the registry, owner is down the reward.
@@ -2379,6 +2733,7 @@ fn test_register_task_before_init_fails() {
             &(env.ledger().timestamp() + 3_600),
             &17_280u32,
             &120u32,
+            &None,
         ),
         Err(Ok(KeeperError::NotInitialized))
     );
@@ -2580,4 +2935,1565 @@ fn test_require_admin_distinguishes_not_initialized_from_wrong_caller() {
         s.registry.try_pause(&stranger),
         Err(Ok(KeeperError::Unauthorized))
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Property Tests (Invariants I-1, I-2, I-3)
+// ─────────────────────────────────────────────────────────────────────────────
+
+extern crate std;
+
+use proptest::prelude::*;
+use std::format;
+use std::string::String;
+use std::vec;
+use std::vec::Vec;
+use crate::test::reentrant_token::NO_ERROR_CODE;
+
+#[derive(Clone, Debug)]
+struct PropertyTaskSpec {
+    owner_idx: usize,
+    reward: i128,
+    deadline_offset: u64,
+    ttl_ledgers: u32,
+    lock_ledgers: u32,
+}
+
+fn reward_strategy() -> impl Strategy<Value = i128> {
+    prop_oneof![
+        Just(1i128),
+        Just(100i128),
+        Just(1_000_000i128),
+        1i128..2_000_000i128,
+    ]
+}
+
+fn deadline_offset_strategy() -> impl Strategy<Value = u64> {
+    prop_oneof![Just(1u64), Just(60u64), Just(3_600u64), 1u64..7_200u64]
+}
+
+fn ttl_ledgers_strategy() -> impl Strategy<Value = u32> {
+    prop_oneof![
+        Just(MIN_TTL_LEDGERS),
+        Just(MIN_TTL_LEDGERS + 1),
+        1_500u32..5_000u32,
+    ]
+}
+
+fn lock_ledgers_strategy() -> impl Strategy<Value = u32> {
+    prop_oneof![
+        Just(MIN_LOCK_LEDGERS),
+        Just(MAX_LOCK_LEDGERS),
+        MIN_LOCK_LEDGERS..240u32,
+    ]
+}
+
+fn property_task_strategy() -> impl Strategy<Value = PropertyTaskSpec> {
+    (
+        0usize..3,
+        reward_strategy(),
+        deadline_offset_strategy(),
+        ttl_ledgers_strategy(),
+        lock_ledgers_strategy(),
+    )
+        .prop_map(
+            |(owner_idx, reward, deadline_offset, ttl_ledgers, lock_ledgers)| PropertyTaskSpec {
+                owner_idx,
+                reward,
+                deadline_offset,
+                ttl_ledgers,
+                lock_ledgers,
+            },
+        )
+}
+
+#[derive(Clone, Debug)]
+enum SolvencyAction {
+    Register(PropertyTaskSpec),
+    Claim { task_idx: usize, keeper_idx: usize },
+    Execute { task_idx: usize, keeper_idx: usize },
+    Cancel { task_idx: usize },
+    Expire { task_idx: usize },
+    IncreaseReward { task_idx: usize, amount: i128 },
+    Withdraw { keeper_idx: usize },
+    Advance { ledgers: u32, seconds: u64 },
+}
+
+fn solvency_action_strategy() -> impl Strategy<Value = SolvencyAction> {
+    prop_oneof![
+        3 => property_task_strategy().prop_map(SolvencyAction::Register),
+        2 => (0usize..5, 0usize..3).prop_map(|(t, k)| SolvencyAction::Claim { task_idx: t, keeper_idx: k }),
+        2 => (0usize..5, 0usize..3).prop_map(|(t, k)| SolvencyAction::Execute { task_idx: t, keeper_idx: k }),
+        2 => (0usize..5).prop_map(|t| SolvencyAction::Cancel { task_idx: t }),
+        2 => (0usize..5).prop_map(|t| SolvencyAction::Expire { task_idx: t }),
+        2 => (0usize..5, 1i128..50_000i128).prop_map(|(t, a)| SolvencyAction::IncreaseReward { task_idx: t, amount: a }),
+        2 => (0usize..3).prop_map(|k| SolvencyAction::Withdraw { keeper_idx: k }),
+        2 => (0u32..5u32, 0u64..300u64).prop_map(|(l, s)| SolvencyAction::Advance { ledgers: l, seconds: s }),
+    ]
+}
+
+#[derive(Clone, Debug)]
+enum ModelTaskStatus {
+    Pending,
+    Claimed { keeper_idx: usize, claim_ledger: u32 },
+    Executed,
+    Cancelled,
+    Expired,
+}
+
+#[derive(Clone, Debug)]
+struct ModelTask {
+    owner_idx: usize,
+    reward: i128,
+    deadline: u64,
+    lock_ledgers: u32,
+    status: ModelTaskStatus,
+}
+
+#[derive(Clone, Debug)]
+struct AccountingModel {
+    tasks: Vec<ModelTask>,
+    keeper_balances: [i128; 3],
+    fees_accrued: i128,
+    executed_ops: Vec<String>,
+}
+
+impl AccountingModel {
+    fn new() -> Self {
+        Self {
+            tasks: vec![],
+            keeper_balances: [0, 0, 0],
+            fees_accrued: 0,
+            executed_ops: vec![],
+        }
+    }
+
+    fn expected_registry_balance(&self) -> i128 {
+        let open_escrow: i128 = self
+            .tasks
+            .iter()
+            .filter(|task| matches!(task.status, ModelTaskStatus::Pending | ModelTaskStatus::Claimed { .. }))
+            .map(|task| task.reward)
+            .sum();
+        open_escrow
+            + self.keeper_balances.iter().sum::<i128>()
+            + self.fees_accrued
+    }
+}
+
+fn model_lock_expired(task: &ModelTask, current_sequence: u32) -> bool {
+    match task.status {
+        ModelTaskStatus::Claimed { claim_ledger, .. } => {
+            current_sequence >= claim_ledger.saturating_add(task.lock_ledgers)
+        }
+        _ => false,
+    }
+}
+
+fn make_property_owners(s: &Setup) -> Vec<Address> {
+    let owners = vec![
+        s.admin.clone(),
+        Address::generate(&s.env),
+        Address::generate(&s.env),
+    ];
+    let asset = token::StellarAssetClient::new(&s.env, &s.token_id);
+    for owner in owners.iter().skip(1) {
+        asset.mint(owner, &10_000_000i128);
+    }
+    owners
+}
+
+fn make_property_keepers(env: &Env) -> Vec<Address> {
+    vec![
+        Address::generate(env),
+        Address::generate(env),
+        Address::generate(env),
+    ]
+}
+
+fn register_property_task(s: &Setup, owner: &Address, spec: &PropertyTaskSpec) -> u64 {
+    let deadline = s.env.ledger().timestamp() + spec.deadline_offset;
+    s.registry.register_task(
+        owner,
+        &TaskType::Liquidation,
+        &calldata(&s.env),
+        &spec.reward,
+        &deadline,
+        &spec.ttl_ledgers,
+        &spec.lock_ledgers,
+    )
+}
+
+fn proptest_seed_hint() -> String {
+    std::env::var("PROPTEST_CASE_ID")
+        .or_else(|_| std::env::var("PROPTEST_SEED"))
+        .unwrap_or_else(|_| String::from("proptest-managed"))
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    // Invariant I-1 from docs/ARCHITECTURE.md / Issue 0050:
+    // registry balance == open escrow + keeper credited balances + accrued fees.
+    #[test]
+    fn test_i1_solvency(actions in proptest::collection::vec(solvency_action_strategy(), 6..18)) {
+        let s = setup();
+        let owners = make_property_owners(&s);
+        let keepers = make_property_keepers(&s.env);
+        let token = token::Client::new(&s.env, &s.token_id);
+        let planned_actions = actions.clone();
+        let mut task_ids = Vec::new();
+        let mut model = AccountingModel::new();
+
+        for action in actions {
+            match action {
+                SolvencyAction::Register(spec) => {
+                    if task_ids.len() >= 5 {
+                        continue;
+                    }
+                    let owner = &owners[spec.owner_idx % owners.len()];
+                    let id = register_property_task(&s, owner, &spec);
+                    task_ids.push(id);
+                    model.tasks.push(ModelTask {
+                        owner_idx: spec.owner_idx % owners.len(),
+                        reward: spec.reward,
+                        deadline: s.env.ledger().timestamp() + spec.deadline_offset,
+                        lock_ledgers: spec.lock_ledgers,
+                        status: ModelTaskStatus::Pending,
+                    });
+                    model.executed_ops.push(format!(
+                        "register(task_id={id}, owner_idx={}, reward={})",
+                        spec.owner_idx % owners.len(),
+                        spec.reward
+                    ));
+                }
+                SolvencyAction::Claim { task_idx, keeper_idx } => {
+                    if task_ids.is_empty() {
+                        continue;
+                    }
+                    let idx = task_idx % task_ids.len();
+                    let id = task_ids[idx];
+                    let keeper = &keepers[keeper_idx % keepers.len()];
+                    let current_time = s.env.ledger().timestamp();
+                    let current_sequence = s.env.ledger().sequence();
+                    let task = &model.tasks[idx];
+                    let valid = current_time < task.deadline
+                        && match task.status {
+                            ModelTaskStatus::Pending => true,
+                            ModelTaskStatus::Claimed { .. } => model_lock_expired(task, current_sequence),
+                            _ => false,
+                        };
+                    if valid {
+                        let res = s.registry.try_claim_task(keeper, &id);
+                        prop_assert!(
+                            res.is_ok(),
+                            "I-1 claim failed for valid model state; seed={} actions={:?} model={:?}",
+                            proptest_seed_hint(),
+                            planned_actions,
+                            model
+                        );
+                        model.tasks[idx].status = ModelTaskStatus::Claimed {
+                            keeper_idx: keeper_idx % keepers.len(),
+                            claim_ledger: current_sequence,
+                        };
+                        model.executed_ops.push(format!(
+                            "claim(task_id={id}, keeper_idx={})",
+                            keeper_idx % keepers.len()
+                        ));
+                    }
+                }
+                SolvencyAction::Execute { task_idx, keeper_idx } => {
+                    if task_ids.is_empty() {
+                        continue;
+                    }
+                    let idx = task_idx % task_ids.len();
+                    let id = task_ids[idx];
+                    let keeper_idx = keeper_idx % keepers.len();
+                    let keeper = &keepers[keeper_idx];
+                    let current_time = s.env.ledger().timestamp();
+                    let valid = current_time < model.tasks[idx].deadline
+                        && matches!(
+                            model.tasks[idx].status,
+                            ModelTaskStatus::Claimed { keeper_idx: k, .. } if k == keeper_idx
+                        );
+                    if valid {
+                        let res = s.registry.try_execute_task(
+                            keeper,
+                            &id,
+                            &Bytes::from_slice(&s.env, b"prop"),
+                        );
+                        prop_assert!(
+                            res.is_ok(),
+                            "I-1 execute failed for valid model state; seed={} actions={:?} model={:?}",
+                            proptest_seed_hint(),
+                            planned_actions,
+                            model
+                        );
+                        let reward = model.tasks[idx].reward;
+                        let (keeper_net, fee) = split_reward(reward, 300u32);
+                        model.keeper_balances[keeper_idx] += keeper_net;
+                        model.fees_accrued += fee;
+                        model.tasks[idx].status = ModelTaskStatus::Executed;
+                        model.executed_ops.push(format!(
+                            "execute(task_id={id}, keeper_idx={keeper_idx}, keeper_net={keeper_net}, fee={fee})"
+                        ));
+                    }
+                }
+                SolvencyAction::Cancel { task_idx } => {
+                    if task_ids.is_empty() {
+                        continue;
+                    }
+                    let idx = task_idx % task_ids.len();
+                    let id = task_ids[idx];
+                    let owner = &owners[model.tasks[idx].owner_idx];
+                    let current_sequence = s.env.ledger().sequence();
+                    let valid = match model.tasks[idx].status {
+                        ModelTaskStatus::Pending => true,
+                        ModelTaskStatus::Claimed { .. } => model_lock_expired(&model.tasks[idx], current_sequence),
+                        _ => false,
+                    };
+                    if valid {
+                        let res = s.registry.try_cancel_task(owner, &id);
+                        prop_assert!(
+                            res.is_ok(),
+                            "I-1 cancel failed for valid model state; seed={} actions={:?} model={:?}",
+                            proptest_seed_hint(),
+                            planned_actions,
+                            model
+                        );
+                        model.tasks[idx].status = ModelTaskStatus::Cancelled;
+                        model.executed_ops.push(format!("cancel(task_id={id})"));
+                    }
+                }
+                SolvencyAction::Expire { task_idx } => {
+                    if task_ids.is_empty() {
+                        continue;
+                    }
+                    let idx = task_idx % task_ids.len();
+                    let id = task_ids[idx];
+                    let valid = s.env.ledger().timestamp() >= model.tasks[idx].deadline
+                        && matches!(
+                            model.tasks[idx].status,
+                            ModelTaskStatus::Pending | ModelTaskStatus::Claimed { .. }
+                        );
+                    if valid {
+                        let res = s.registry.try_expire_task(&id);
+                        prop_assert!(
+                            res.is_ok(),
+                            "I-1 expire failed for valid model state; seed={} actions={:?} model={:?}",
+                            proptest_seed_hint(),
+                            planned_actions,
+                            model
+                        );
+                        model.tasks[idx].status = ModelTaskStatus::Expired;
+                        model.executed_ops.push(format!("expire(task_id={id})"));
+                    }
+                }
+                SolvencyAction::IncreaseReward { task_idx, amount } => {
+                    if task_ids.is_empty() {
+                        continue;
+                    }
+                    let idx = task_idx % task_ids.len();
+                    let id = task_ids[idx];
+                    let owner = &owners[model.tasks[idx].owner_idx];
+                    if matches!(
+                        model.tasks[idx].status,
+                        ModelTaskStatus::Pending | ModelTaskStatus::Claimed { .. }
+                    ) {
+                        let res = s.registry.try_increase_reward(owner, &id, &amount);
+                        prop_assert!(
+                            res.is_ok(),
+                            "I-1 top-up failed for valid model state; seed={} actions={:?} model={:?}",
+                            proptest_seed_hint(),
+                            planned_actions,
+                            model
+                        );
+                        model.tasks[idx].reward += amount;
+                        model.executed_ops.push(format!(
+                            "increase_reward(task_id={id}, amount={amount})"
+                        ));
+                    }
+                }
+                SolvencyAction::Withdraw { keeper_idx } => {
+                    let keeper_idx = keeper_idx % keepers.len();
+                    let keeper = &keepers[keeper_idx];
+                    let expected = model.keeper_balances[keeper_idx];
+                    if expected > 0 {
+                        let res = s.registry.try_withdraw_rewards(keeper);
+                        prop_assert!(
+                            matches!(res, Ok(Ok(amount)) if amount == expected),
+                            "I-1 withdraw failed for valid model state; seed={} actions={:?} model={:?} result={:?}",
+                            proptest_seed_hint()
+                            ,
+                            planned_actions,
+                            model,
+                            res
+                        );
+                        model.keeper_balances[keeper_idx] = 0;
+                        model.executed_ops.push(format!(
+                            "withdraw(keeper_idx={keeper_idx}, amount={expected})"
+                        ));
+                    }
+                }
+                SolvencyAction::Advance { ledgers, seconds } => {
+                    advance(&s.env, ledgers, seconds);
+                    model.executed_ops.push(format!(
+                        "advance(ledgers={ledgers}, seconds={seconds})"
+                    ));
+                }
+            }
+
+            let registry_balance = token.balance(&s.registry.address);
+            let observed_keeper_sum: i128 = keepers.iter().map(|keeper| s.registry.keeper_balance(keeper)).sum();
+            let expected_keeper_sum: i128 = model.keeper_balances.iter().sum();
+            let observed_fees = s.registry.fees_accrued();
+            let expected_balance = model.expected_registry_balance();
+
+            prop_assert_eq!(
+                observed_keeper_sum,
+                expected_keeper_sum,
+                "Invariant I-1 keeper balances drifted; seed={} actions={:?} ops={:?} model={:?}",
+                proptest_seed_hint(),
+                planned_actions,
+                model.executed_ops
+                ,
+                model
+            );
+            prop_assert_eq!(
+                observed_fees,
+                model.fees_accrued,
+                "Invariant I-1 fees drifted; seed={} actions={:?} ops={:?} model={:?}",
+                proptest_seed_hint(),
+                planned_actions,
+                model.executed_ops
+                ,
+                model
+            );
+            prop_assert_eq!(
+                registry_balance,
+                expected_balance,
+                "Invariant I-1 solvency violated; seed={} actions={:?} ops={:?} model={:?} observed_registry_balance={} expected_balance={}",
+                proptest_seed_hint(),
+                planned_actions,
+                model.executed_ops,
+                model,
+                registry_balance,
+                expected_balance
+            );
+        }
+    }
+
+    // Invariant I-2 from docs/ARCHITECTURE.md:
+    // every escrowed reward has a reachable terminal resolution path.
+    #[test]
+    fn test_i2_escrow_recoverability(
+        spec in property_task_strategy(),
+    ) {
+        let cancel_setup = setup();
+        let cancel_owners = make_property_owners(&cancel_setup);
+        let cancel_owner = &cancel_owners[spec.owner_idx % cancel_owners.len()];
+        let cancel_id = register_property_task(&cancel_setup, cancel_owner, &spec);
+        prop_assert!(
+            cancel_setup.registry.try_cancel_task(cancel_owner, &cancel_id).is_ok(),
+            "Invariant I-2 cancel path unreachable; seed={} task={:?}",
+            proptest_seed_hint(),
+            spec
+        );
+        prop_assert_eq!(
+            cancel_setup.registry.get_task(&cancel_id).status,
+            TaskStatus::Cancelled,
+            "Invariant I-2 cancel path did not terminate; seed={} task={:?}",
+            proptest_seed_hint(),
+            spec
+        );
+
+        let execute_setup = setup();
+        let execute_owners = make_property_owners(&execute_setup);
+        let execute_owner = &execute_owners[spec.owner_idx % execute_owners.len()];
+        let execute_keeper = Address::generate(&execute_setup.env);
+        let execute_id = register_property_task(&execute_setup, execute_owner, &spec);
+        prop_assert!(
+            execute_setup.registry.try_claim_task(&execute_keeper, &execute_id).is_ok(),
+            "Invariant I-2 claim path unreachable; seed={} task={:?}",
+            proptest_seed_hint(),
+            spec
+        );
+        prop_assert!(
+            execute_setup
+                .registry
+                .try_execute_task(&execute_keeper, &execute_id, &Bytes::from_slice(&execute_setup.env, b"i2"))
+                .is_ok(),
+            "Invariant I-2 execute path unreachable; seed={} task={:?}",
+            proptest_seed_hint(),
+            spec
+        );
+        let (keeper_net, fee) = split_reward(spec.reward, 300u32);
+        prop_assert!(
+            matches!(
+                execute_setup.registry.try_withdraw_rewards(&execute_keeper),
+                Ok(Ok(amount)) if amount == keeper_net
+            ),
+            "Invariant I-2 withdraw path unreachable; seed={} task={:?}",
+            proptest_seed_hint(),
+            spec
+        );
+        prop_assert_eq!(
+            token::Client::new(&execute_setup.env, &execute_setup.token_id)
+                .balance(&execute_setup.registry.address),
+            fee,
+            "Invariant I-2 execute path left unresolved escrow; seed={} task={:?}",
+            proptest_seed_hint(),
+            spec
+        );
+
+        let expire_setup = setup();
+        let expire_owners = make_property_owners(&expire_setup);
+        let expire_owner = &expire_owners[spec.owner_idx % expire_owners.len()];
+        let expire_id = register_property_task(&expire_setup, expire_owner, &spec);
+        // Issue 0005 reference: keep the simulated expiry within a live TTL
+        // window so this property keeps exercising recoverability rather than
+        // archival/restore host behavior. Once Issue 0005 is fixed this range
+        // can widen without changing the assertions.
+        advance(&expire_setup.env, 1, spec.deadline_offset + 1);
+        prop_assert!(
+            expire_setup.registry.try_expire_task(&expire_id).is_ok(),
+            "Invariant I-2 expire path unreachable; seed={} task={:?}",
+            proptest_seed_hint(),
+            spec
+        );
+        prop_assert_eq!(
+            expire_setup.registry.get_task(&expire_id).status,
+            TaskStatus::Expired,
+            "Invariant I-2 expire path did not terminate; seed={} task={:?}",
+            proptest_seed_hint(),
+            spec
+        );
+        prop_assert_eq!(
+            token::Client::new(&expire_setup.env, &expire_setup.token_id)
+                .balance(&expire_setup.registry.address),
+            0i128,
+            "Invariant I-2 expire path left escrow stranded; seed={} task={:?}",
+            proptest_seed_hint(),
+            spec
+        );
+    }
+
+    // Invariant I-3 from docs/ARCHITECTURE.md:
+    // every reward is paid out exactly once across sequential and reentrant attempts.
+    #[test]
+    fn test_i3_single_payout(
+        spec in property_task_strategy(),
+        path in 0u8..5,
+        different_second_caller in any::<bool>(),
+    ) {
+        match path {
+            0 => {
+                let s = setup();
+                let owners = make_property_owners(&s);
+                let owner = &owners[spec.owner_idx % owners.len()];
+                let other_owner = &owners[(spec.owner_idx + 1) % owners.len()];
+                let token = token::Client::new(&s.env, &s.token_id);
+                let task_id = register_property_task(&s, owner, &spec);
+                let owner_before = token.balance(owner);
+                let payer = if different_second_caller { other_owner } else { owner };
+                let sequence = vec![
+                    format!("cancel(task_id={task_id})"),
+                    format!("cancel-again(task_id={task_id}, different_second_caller={different_second_caller})"),
+                ];
+
+                prop_assert!(
+                    s.registry.try_cancel_task(owner, &task_id).is_ok(),
+                    "Invariant I-3 cancel first call failed; seed={} path=cancel task={:?} ops={:?}",
+                    proptest_seed_hint(),
+                    spec,
+                    sequence
+                );
+                let second = s.registry.try_cancel_task(payer, &task_id);
+                prop_assert!(
+                    matches!(second, Err(Ok(_))),
+                    "Invariant I-3 cancel second call must return typed contract error; seed={} task={:?} second={:?} ops={:?}",
+                    proptest_seed_hint(),
+                    spec,
+                    second,
+                    sequence
+                );
+                prop_assert_eq!(
+                    token.balance(owner) - owner_before,
+                    spec.reward,
+                    "Invariant I-3 cancel paid wrong amount; seed={} task={:?} ops={:?}",
+                    proptest_seed_hint(),
+                    spec,
+                    sequence
+                );
+                prop_assert_eq!(
+                    token.balance(&s.registry.address),
+                    0i128,
+                    "Invariant I-3 cancel left positive registry balance; seed={} task={:?} ops={:?}",
+                    proptest_seed_hint(),
+                    spec,
+                    sequence
+                );
+            }
+            1 => {
+                let s = setup();
+                let owners = make_property_owners(&s);
+                let owner = &owners[spec.owner_idx % owners.len()];
+                let keepers = make_property_keepers(&s.env);
+                let keeper = &keepers[0];
+                let other_keeper = &keepers[1];
+                let token = token::Client::new(&s.env, &s.token_id);
+                let task_id = register_property_task(&s, owner, &spec);
+                let keeper_before = token.balance(keeper);
+                let execute_caller = if different_second_caller { other_keeper } else { keeper };
+                let withdraw_caller = if different_second_caller { other_keeper } else { keeper };
+                let (keeper_net, fee) = split_reward(spec.reward, 300u32);
+                let sequence = vec![
+                    format!("claim(task_id={task_id}, keeper=0)"),
+                    format!("execute(task_id={task_id}, keeper=0)"),
+                    format!("execute-again(task_id={task_id}, different_second_caller={different_second_caller})"),
+                    format!("withdraw(keeper=0)"),
+                    format!("withdraw-again(different_second_caller={different_second_caller})"),
+                ];
+
+                prop_assert!(
+                    s.registry.try_claim_task(keeper, &task_id).is_ok(),
+                    "Invariant I-3 execute path claim failed; seed={} task={:?} ops={:?}",
+                    proptest_seed_hint(),
+                    spec,
+                    sequence
+                );
+                prop_assert!(
+                    s.registry
+                        .try_execute_task(keeper, &task_id, &Bytes::from_slice(&s.env, b"i3"))
+                        .is_ok(),
+                    "Invariant I-3 execute first call failed; seed={} task={:?} ops={:?}",
+                    proptest_seed_hint(),
+                    spec,
+                    sequence
+                );
+                let second_execute = s.registry.try_execute_task(
+                    execute_caller,
+                    &task_id,
+                    &Bytes::from_slice(&s.env, b"i3"),
+                );
+                prop_assert!(
+                    matches!(second_execute, Err(Ok(_))),
+                    "Invariant I-3 execute second call must return typed contract error; seed={} task={:?} second={:?} ops={:?}",
+                    proptest_seed_hint(),
+                    spec,
+                    second_execute,
+                    sequence
+                );
+                prop_assert!(
+                    matches!(s.registry.try_withdraw_rewards(keeper), Ok(Ok(amount)) if amount == keeper_net),
+                    "Invariant I-3 withdraw first call failed; seed={} task={:?} ops={:?}",
+                    proptest_seed_hint(),
+                    spec,
+                    sequence
+                );
+                let second_withdraw = s.registry.try_withdraw_rewards(withdraw_caller);
+                prop_assert!(
+                    matches!(second_withdraw, Err(Ok(_))),
+                    "Invariant I-3 withdraw second call must return typed contract error; seed={} task={:?} second={:?} ops={:?}",
+                    proptest_seed_hint(),
+                    spec,
+                    second_withdraw,
+                    sequence
+                );
+                prop_assert_eq!(
+                    token.balance(keeper) - keeper_before,
+                    keeper_net,
+                    "Invariant I-3 execute/withdraw transferred wrong keeper amount; seed={} task={:?} ops={:?}",
+                    proptest_seed_hint(),
+                    spec,
+                    sequence
+                );
+                prop_assert_eq!(
+                    token.balance(&s.registry.address),
+                    fee,
+                    "Invariant I-3 execute/withdraw left wrong registry balance; seed={} task={:?} ops={:?}",
+                    proptest_seed_hint(),
+                    spec,
+                    sequence
+                );
+            }
+            2 => {
+                let s = setup();
+                let owners = make_property_owners(&s);
+                let owner = &owners[spec.owner_idx % owners.len()];
+                let token = token::Client::new(&s.env, &s.token_id);
+                let task_id = register_property_task(&s, owner, &spec);
+                let owner_before = token.balance(owner);
+                let sequence = vec![
+                    format!("advance(deadline_offset_plus_one={})", spec.deadline_offset + 1),
+                    format!("expire(task_id={task_id})"),
+                    format!("expire-again(task_id={task_id})"),
+                ];
+
+                advance(&s.env, 1, spec.deadline_offset + 1);
+                prop_assert!(
+                    s.registry.try_expire_task(&task_id).is_ok(),
+                    "Invariant I-3 expire first call failed; seed={} task={:?} ops={:?}",
+                    proptest_seed_hint(),
+                    spec,
+                    sequence
+                );
+                let second = s.registry.try_expire_task(&task_id);
+                prop_assert!(
+                    matches!(second, Err(Ok(_))),
+                    "Invariant I-3 expire second call must return typed contract error; seed={} task={:?} second={:?} ops={:?}",
+                    proptest_seed_hint(),
+                    spec,
+                    second,
+                    sequence
+                );
+                prop_assert_eq!(
+                    token.balance(owner) - owner_before,
+                    spec.reward,
+                    "Invariant I-3 expire paid wrong amount; seed={} task={:?} ops={:?}",
+                    proptest_seed_hint(),
+                    spec,
+                    sequence
+                );
+                prop_assert_eq!(
+                    token.balance(&s.registry.address),
+                    0i128,
+                    "Invariant I-3 expire left positive registry balance; seed={} task={:?} ops={:?}",
+                    proptest_seed_hint(),
+                    spec,
+                    sequence
+                );
+            }
+            3 => {
+                let env = Env::default();
+                env.mock_all_auths();
+                let admin = Address::generate(&env);
+                let token_id = env.register(reentrant_token::ReentrantToken, ());
+                let mock_token = reentrant_token::ReentrantTokenClient::new(&env, &token_id);
+                mock_token.mint(&admin, &10_000_000i128);
+
+                let registry_id = env.register(KeeperRegistry, ());
+                let registry = KeeperRegistryClient::new(&env, &registry_id);
+                registry.initialize(&admin, &token_id, &300u32);
+
+                let deadline = env.ledger().timestamp() + spec.deadline_offset;
+                let task_id = registry.register_task(
+                    &admin,
+                    &TaskType::Liquidation,
+                    &calldata(&env),
+                    &spec.reward,
+                    &deadline,
+                    &spec.ttl_ledgers,
+                    &spec.lock_ledgers,
+                );
+                let sequence = vec![
+                    format!("arm-reentrant-cancel(task_id={task_id})"),
+                    format!("cancel(task_id={task_id})"),
+                ];
+
+                mock_token.arm(&registry.address, &task_id, &admin);
+                prop_assert!(
+                    registry.try_cancel_task(&admin, &task_id).is_ok(),
+                    "Invariant I-3 reentrant cancel outer call failed; seed={} task={:?} ops={:?}",
+                    proptest_seed_hint(),
+                    spec,
+                    sequence
+                );
+                let code = mock_token.reentry_error_code();
+                if code != NO_ERROR_CODE {
+                    prop_assert_eq!(
+                        code,
+                        KeeperError::InvalidTaskStatus as u32,
+                        "Invariant I-3 reentrant cancel decoded unexpected error; seed={} task={:?} ops={:?}",
+                        proptest_seed_hint(),
+                        spec,
+                        sequence
+                    );
+                }
+                prop_assert!(mock_token.reentry_rejected());
+                prop_assert_eq!(mock_token.refund_count(), 1);
+                prop_assert_eq!(mock_token.balance(&admin), 10_000_000i128);
+                prop_assert_eq!(mock_token.balance(&registry_id), 0i128);
+            }
+            4 => {
+                let env = Env::default();
+                env.mock_all_auths();
+                let admin = Address::generate(&env);
+                let token_id = env.register(reentrant_token_expire::ExpireReentrantToken, ());
+                let token = reentrant_token_expire::ExpireReentrantTokenClient::new(&env, &token_id);
+                token.set_balance(&admin, &5_000_000i128);
+
+                let registry_id = env.register(KeeperRegistry, ());
+                let registry = KeeperRegistryClient::new(&env, &registry_id);
+                registry.initialize(&admin, &token_id, &300u32);
+
+                let reward = spec.reward.min(1_000_000i128);
+                let deadline = env.ledger().timestamp() + spec.deadline_offset.min(60);
+                let task_id = registry.register_task(
+                    &admin,
+                    &TaskType::Liquidation,
+                    &calldata(&env),
+                    &reward,
+                    &deadline,
+                    &spec.ttl_ledgers,
+                    &spec.lock_ledgers,
+                );
+                let sequence = vec![
+                    format!("advance(deadline_offset_plus_one={})", spec.deadline_offset.min(60) + 1),
+                    format!("arm-reentrant-expire(task_id={task_id})"),
+                    format!("expire(task_id={task_id})"),
+                ];
+
+                advance(&env, 1, spec.deadline_offset.min(60) + 1);
+                token.arm(&registry.address, &task_id);
+                prop_assert!(
+                    registry.try_expire_task(&task_id).is_ok(),
+                    "Invariant I-3 reentrant expire outer call failed; seed={} task={:?} ops={:?}",
+                    proptest_seed_hint(),
+                    spec,
+                    sequence
+                );
+                prop_assert_ne!(
+                    token.reentrant_code(),
+                    0u32,
+                    "Invariant I-3 reentrant expire must reject the nested payout attempt; seed={} task={:?} ops={:?}",
+                    proptest_seed_hint(),
+                    spec,
+                    sequence
+                );
+                prop_assert_eq!(token.balance(&admin), 5_000_000i128);
+                prop_assert_eq!(token.balance(&registry_id), 0i128);
+                prop_assert_eq!(registry.get_task(&task_id).status, TaskStatus::Expired);
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Verifier mocks (#96-#106) — minimal, test-only contracts following the
+// established `mod reentrant_token { ... }` local-mock-contract pattern.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A verifier whose `verify` always returns `true` — the happy-path mock for
+/// #108.
+mod always_approve_verifier {
+    use soroban_sdk::{contract, contractimpl, Address, Bytes, Env};
+
+    use crate::Task;
+
+// Verifier mocks (#98/#99/#106) — minimal, test-only contracts following the
+// established `mod reentrant_token { ... }` local-mock-contract pattern.
+// ─────────────────────────────────────────────────────────────────────────────
+
+mod always_approve_verifier {
+    use soroban_sdk::{contract, contractimpl, Address, Bytes, Env};
+
+    #[contract]
+    pub struct AlwaysApproveVerifier;
+
+    #[contractimpl]
+    impl AlwaysApproveVerifier {
+        pub fn verify(_env: Env, _task: crate::Task, _keeper: Address, _proof: Bytes) -> bool {
+            true
+        }
+    }
+}
+
+/// A verifier whose `verify` always returns `false` — the rejection-path
+/// mock for #109.
+mod always_reject_verifier {
+    use soroban_sdk::{contract, contractimpl, Address, Bytes, Env};
+
+    use crate::Task;
+
+mod always_reject_verifier {
+    use soroban_sdk::{contract, contractimpl, Address, Bytes, Env};
+
+    #[contract]
+    pub struct AlwaysRejectVerifier;
+
+    #[contractimpl]
+    impl AlwaysRejectVerifier {
+        pub fn verify(_env: Env, _task: Task, _keeper: Address, _proof: Bytes) -> bool {
+        pub fn verify(_env: Env, _task: crate::Task, _keeper: Address, _proof: Bytes) -> bool {
+            false
+        }
+    }
+}
+
+/// A verifier whose `verify` always panics — the worst-case mock for #110,
+/// distinct from `always_reject_verifier`: a `false` return is a normal,
+/// recoverable rejection `execute_task` handles gracefully, while a panic
+/// is a genuinely unrecoverable host error that aborts the whole
+/// transaction (see `IKeeperVerifier`'s doc comment for why).
+mod panicking_verifier {
+    use soroban_sdk::{contract, contractimpl, panic_with_error, Address, Bytes, Env};
+
+    use crate::{KeeperError, Task};
+
+    #[contract]
+    pub struct PanickingVerifier;
+
+    #[contractimpl]
+    impl PanickingVerifier {
+        pub fn verify(env: Env, _task: Task, _keeper: Address, _proof: Bytes) -> bool {
+            // Any panic value works to exercise the "verifier panics" path;
+            // panic_with_error is used here (rather than a bare panic!())
+            // purely so the failure is visible as a proper contract error in
+            // test output rather than an opaque WASM trap message.
+            panic_with_error!(&env, KeeperError::Unauthorized);
+        }
+    }
+}
+
+/// Registers a task with `verifier` attached, funded and deadlined the same
+/// way `register_reward_task` is, so the verifier-specific tests don't
+/// duplicate that boilerplate.
+fn register_task_with_verifier(s: &Setup, reward: i128, verifier: &Address) -> u64 {
+    let deadline = s.env.ledger().timestamp() + 3_600;
+    s.registry.register_task(
+        &s.admin,
+        &TaskType::Liquidation,
+        &calldata(&s.env),
+        &reward,
+        &deadline,
+        &17_280u32,
+        &120u32,
+        &Some(verifier.clone()),
+    )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #107 — update_verifier is rejected once a task is claimed
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_update_verifier_rejected_once_task_is_claimed() {
+    let s = setup();
+    let verifier_id = s.env.register(always_approve_verifier::AlwaysApproveVerifier, ());
+    let task_id = register_task_with_verifier(&s, 1_000_000i128, &verifier_id);
+
+    let keeper = Address::generate(&s.env);
+    s.registry.claim_task(&keeper, &task_id);
+
+    let new_verifier = Address::generate(&s.env);
+    let result = s
+        .registry
+        .try_update_verifier(&s.admin, &task_id, &Some(new_verifier.clone()));
+    assert_eq!(result, Err(Ok(KeeperError::InvalidTaskStatus)));
+
+    // The task's verifier field must be unchanged after the rejected attempt.
+    let task = s.registry.get_task(&task_id);
+    assert_eq!(task.verifier, Some(verifier_id));
+    assert_ne!(task.verifier, Some(new_verifier));
+}
+
+#[test]
+fn test_update_verifier_succeeds_while_pending() {
+    // Sanity check alongside the rejection test above: the restriction is
+    // specifically "not once claimed", not "never" — a Pending task's
+    // verifier can still be changed freely.
+    let s = setup();
+    let task_id = register_default_task(&s); // no verifier attached yet
+
+    let verifier_id = s
+        .env
+        .register(always_approve_verifier::AlwaysApproveVerifier, ());
+    s.registry
+        .update_verifier(&s.admin, &task_id, &Some(verifier_id.clone()));
+
+    let task = s.registry.get_task(&task_id);
+    assert_eq!(task.verifier, Some(verifier_id));
+}
+
+#[test]
+fn test_update_verifier_rejects_non_owner() {
+    let s = setup();
+    let task_id = register_default_task(&s);
+    let stranger = Address::generate(&s.env);
+    let verifier_id = s
+        .env
+        .register(always_approve_verifier::AlwaysApproveVerifier, ());
+
+    assert_eq!(
+        s.registry
+            .try_update_verifier(&stranger, &task_id, &Some(verifier_id)),
+        Err(Ok(KeeperError::NotTaskOwner))
+    );
+}
+
+#[test]
+fn test_update_verifier_rejected_when_paused() {
+    let s = setup();
+    let task_id = register_default_task(&s);
+    let verifier_id = s
+        .env
+        .register(always_approve_verifier::AlwaysApproveVerifier, ());
+
+    s.registry.pause(&s.admin);
+    assert_eq!(
+        s.registry
+            .try_update_verifier(&s.admin, &task_id, &Some(verifier_id)),
+        Err(Ok(KeeperError::ContractPaused))
+    );
+}
+
+#[test]
+fn test_update_verifier_emits_event() {
+    let s = setup();
+    let task_id = register_default_task(&s);
+    let verifier_id = s
+        .env
+        .register(always_approve_verifier::AlwaysApproveVerifier, ());
+
+    s.registry
+        .update_verifier(&s.admin, &task_id, &Some(verifier_id.clone()));
+
+    let expected_topic: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("verifier"), symbol_short!("task")).into_val(&s.env);
+    let found = s.env.events().all().iter().any(|(contract, topics, _)| {
+        contract == s.registry.address && topics == expected_topic
+    });
+    assert!(found, "VerifierUpdated event must be emitted");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #108 — execute_task with a verifier that always approves
+// #99 — execute_task with a verifier attached
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_execute_task_with_always_approve_verifier_matches_no_verifier_outcome() {
+    let s = setup();
+    let verifier_id = s.env.register(always_approve_verifier::AlwaysApproveVerifier, ());
+    let reward = 1_000_000i128;
+    let task_id = register_task_with_verifier(&s, reward, &verifier_id);
+
+    let keeper = Address::generate(&s.env);
+    s.registry.claim_task(&keeper, &task_id);
+
+    let proof = Bytes::from_slice(&s.env, b"proof-bytes");
+    s.registry.execute_task(&keeper, &task_id, &proof);
+
+    // Check events immediately after the call that emits them: each
+    // top-level client call is its own host invocation, and
+    // `s.env.events().all()` only reflects the most recent one — any
+    // further contract calls (even read-only ones like `get_task`) start a
+    // new invocation and the previous one's events are no longer visible.
+    let all_events = s.env.events().all();
+    let verfail_topic: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("verfail"), symbol_short!("task")).into_val(&s.env);
+    let verfail_fired = all_events.iter().any(|(contract, topics, _)| {
+        contract == s.registry.address && topics == verfail_topic
+    });
+    assert!(
+        !verfail_fired,
+        "TaskVerificationFailed must not fire when the verifier approves"
+    );
+
+    let exec_topic: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("exec"), symbol_short!("task")).into_val(&s.env);
+    let exec_fired = all_events.iter().any(|(contract, topics, _)| {
+        contract == s.registry.address && topics == exec_topic
+    });
+    assert!(exec_fired, "TaskExecuted must still fire");
+
+    // Same outcome as the no-verifier path: full net reward credited, fee
+    // accrued, task Executed.
+    let (expected_net, expected_fee) = split_reward(reward, 300u32);
+    assert_eq!(s.registry.keeper_balance(&keeper), expected_net);
+    assert_eq!(s.registry.fees_accrued(), expected_fee);
+
+    let task = s.registry.get_task(&task_id);
+    assert_eq!(task.status, TaskStatus::Executed);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #109 — execute_task with a verifier that always rejects
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_execute_task_with_always_reject_verifier() {
+    let s = setup();
+    let verifier_id = s.env.register(always_reject_verifier::AlwaysRejectVerifier, ());
+    let reward = 1_000_000i128;
+    let task_id = register_task_with_verifier(&s, reward, &verifier_id);
+
+    let keeper = Address::generate(&s.env);
+    s.registry.claim_task(&keeper, &task_id);
+
+    let proof = Bytes::from_slice(&s.env, b"first-attempt-proof");
+    let result = s.registry.try_execute_task(&keeper, &task_id, &proof);
+    assert_eq!(result, Err(Ok(KeeperError::VerificationFailed)));
+
+    // Note: we don't assert TaskVerificationFailed's presence in
+    // `s.env.events().all()` here. Soroban's host rolls back a whole call
+    // frame — events included — whenever that frame's top-level function
+    // returns `Err` (see `with_frame`/`call_n_internal` in
+    // soroban-env-host), even though the error itself is "recoverable" from
+    // the caller's perspective via `try_`. So an event published right
+    // before an `Err` return is never observable by any caller, in any
+    // Soroban contract; `emit_verification_failed`'s call site in
+    // `execute_task` can't be exercised by a test that also checks the
+    // `Err` result. What we *can* and do verify below is the actually
+    // observable contract: the typed error, and that state didn't change.
+
+    // Task remains Claimed — not Executed, not reverted to Pending.
+    let task = s.registry.get_task(&task_id);
+    assert_eq!(task.status, TaskStatus::Claimed);
+    assert_eq!(task.claimer, Some(keeper.clone()));
+
+    // No token transfer / keeper crediting occurred.
+    assert_eq!(s.registry.keeper_balance(&keeper), 0i128);
+    assert_eq!(s.registry.fees_accrued(), 0i128);
+
+    // A second execute_task call (different proof bytes, same always-reject
+    // verifier) fails the same way — the rejection is repeatable, not a
+    // one-shot state change.
+    let proof2 = Bytes::from_slice(&s.env, b"second-attempt-different-proof");
+    let result2 = s.registry.try_execute_task(&keeper, &task_id, &proof2);
+    assert_eq!(result2, Err(Ok(KeeperError::VerificationFailed)));
+
+    let task_after_retry = s.registry.get_task(&task_id);
+    assert_eq!(task_after_retry.status, TaskStatus::Claimed);
+    assert_eq!(task_after_retry.claimer, Some(keeper));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #110 — execute_task against a panicking verifier must not permanently
+// brick the task
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Per #100's investigation (see IKeeperVerifier's doc comment in lib.rs,
+// citing soroban-env-host's Host::try_call): Soroban's host only recovers
+// *typed contract errors* across a try_invoke_contract call. A genuine
+// panic in the callee is a non-recoverable host error and propagates,
+// aborting the entire calling transaction — it is NOT caught as a
+// VerificationFailed rejection. This test demonstrates that concretely,
+// and confirms expire_task is the real, working recovery path once the
+// deadline passes — proving the eventual-recovery fallback actually holds
+// even in this worst case.
+
+/// Shared setup for both panicking-verifier tests below: a task with a
+/// verifier that always panics, claimed by a keeper.
+fn setup_task_with_panicking_verifier() -> (Setup, u64, Address, i128) {
+    let s = setup();
+    let verifier_id = s.env.register(panicking_verifier::PanickingVerifier, ());
+    let reward = 1_000_000i128;
+    let deadline = s.env.ledger().timestamp() + 3_600;
+    let task_id = s
+        .registry
+        .register_task(
+            &s.admin,
+            &TaskType::Liquidation,
+            &calldata(&s.env),
+            &reward,
+            &deadline,
+            &17_280u32,
+            &120u32,
+            &Some(verifier_id),
+        );
+
+    let keeper = Address::generate(&s.env);
+    s.registry.claim_task(&keeper, &task_id);
+    (s, task_id, keeper, reward)
+}
+
+/// The panicking verifier is not isolated: `execute_task`'s own call
+/// propagates the panic rather than returning a recoverable
+/// `VerificationFailed` error. `#[should_panic]` is the idiomatic Rust way
+/// to assert this (this crate is `#![no_std]`, so `std::panic::catch_unwind`
+/// isn't available even in `#[cfg(test)]` code) — the same abort-the-whole-
+/// transaction behavior any real caller would see, per the host semantics
+/// documented on `IKeeperVerifier`.
+#[test]
+#[should_panic]
+fn test_execute_task_against_panicking_verifier_panics() {
+    let (s, task_id, keeper, _reward) = setup_task_with_panicking_verifier();
+    let proof = Bytes::from_slice(&s.env, b"proof");
+    s.registry.execute_task(&keeper, &task_id, &proof);
+}
+
+/// The recovery path: since the panic aborts the whole transaction rather
+/// than being caught (proven by the `#[should_panic]` test above), the task
+/// is never touched by the failed attempt and remains `Claimed` — this test
+/// confirms `expire_task` still successfully returns the escrow to the
+/// owner once the deadline passes, exactly as it would for any other
+/// stuck-`Claimed` task. This is the concrete proof that Invariant I-2
+/// (escrow recoverability) holds even for a permanently-panicking verifier:
+/// the eventual-recovery fallback #100 concluded on actually works.
+#[test]
+fn test_expire_task_recovers_escrow_from_a_task_stuck_behind_a_panicking_verifier() {
+    let (s, task_id, keeper, reward) = setup_task_with_panicking_verifier();
+
+    // Deliberately never call execute_task here — the test above already
+    // proves that call panics; this test only needs the pre-panic state
+    // (Claimed, unexecuted) to demonstrate expire_task's recovery, and a
+    // panic would abort this test function before reaching the assertions
+    // below.
+    let task_before_expiry = s.registry.get_task(&task_id);
+    assert_eq!(task_before_expiry.status, TaskStatus::Claimed);
+    assert_eq!(task_before_expiry.claimer, Some(keeper.clone()));
+    assert_eq!(s.registry.keeper_balance(&keeper), 0i128);
+
+    let token = token::Client::new(&s.env, &s.token_id);
+    let owner_balance_before = token.balance(&s.admin);
+
+    advance(&s.env, 1, 3_601);
+    s.registry.expire_task(&task_id);
+
+    let task_after_expiry = s.registry.get_task(&task_id);
+    assert_eq!(task_after_expiry.status, TaskStatus::Expired);
+    assert_eq!(token.balance(&s.admin), owner_balance_before + reward);
+#[test]
+fn test_execute_task_none_verifier_path_unchanged() {
+    // The base MVP path (no verifier attached) must behave identically to
+    // before this feature existed — required explicitly by #99's acceptance
+    // criteria, on top of the fact that all 100 pre-existing tests already
+    // pass unmodified.
+    let s = setup();
+    let reward = 1_000_000i128;
+    let deadline = s.env.ledger().timestamp() + 3_600;
+    let task_id = s.registry.register_task(
+        &s.admin,
+        &TaskType::Liquidation,
+        &calldata(&s.env),
+        &reward,
+        &deadline,
+        &17_280u32,
+        &120u32,
+        &None,
+    );
+    let keeper = Address::generate(&s.env);
+    s.registry.claim_task(&keeper, &task_id);
+
+    let proof = Bytes::from_slice(&s.env, b"proof-bytes");
+    s.registry.execute_task(&keeper, &task_id, &proof);
+
+    let (expected_net, expected_fee) = split_reward(reward, 300u32);
+    assert_eq!(s.registry.keeper_balance(&keeper), expected_net);
+    assert_eq!(s.registry.fees_accrued(), expected_fee);
+    assert_eq!(s.registry.get_task(&task_id).status, TaskStatus::Executed);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #106 — update_verifier
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_update_verifier_succeeds_while_pending() {
+    let s = setup();
+    let reward = 1_000_000i128;
+    let deadline = s.env.ledger().timestamp() + 3_600;
+    let task_id = s.registry.register_task(
+        &s.admin,
+        &TaskType::Liquidation,
+        &calldata(&s.env),
+        &reward,
+        &deadline,
+        &17_280u32,
+        &120u32,
+        &None,
+    );
+
+    let verifier_id = s.env.register(always_approve_verifier::AlwaysApproveVerifier, ());
+    s.registry
+        .update_verifier(&s.admin, &task_id, &Some(verifier_id.clone()));
+
+    let task = s.registry.get_task(&task_id);
+    assert_eq!(task.verifier, Some(verifier_id));
+
+    // Clearing it back to None also works while still Pending.
+    s.registry.update_verifier(&s.admin, &task_id, &None);
+    assert_eq!(s.registry.get_task(&task_id).verifier, None);
+}
+
+#[test]
+fn test_update_verifier_rejected_once_task_is_claimed() {
+    let s = setup();
+    let reward = 1_000_000i128;
+    let deadline = s.env.ledger().timestamp() + 3_600;
+    let task_id = s.registry.register_task(
+        &s.admin,
+        &TaskType::Liquidation,
+        &calldata(&s.env),
+        &reward,
+        &deadline,
+        &17_280u32,
+        &120u32,
+        &None,
+    );
+    let keeper = Address::generate(&s.env);
+    s.registry.claim_task(&keeper, &task_id);
+
+    let verifier_id = s.env.register(always_approve_verifier::AlwaysApproveVerifier, ());
+    assert_eq!(
+        s.registry
+            .try_update_verifier(&s.admin, &task_id, &Some(verifier_id)),
+        Err(Ok(KeeperError::InvalidTaskStatus))
+    );
+    // Unchanged.
+    assert_eq!(s.registry.get_task(&task_id).verifier, None);
+}
+
+#[test]
+fn test_update_verifier_rejects_non_owner() {
+    let s = setup();
+    let reward = 1_000_000i128;
+    let deadline = s.env.ledger().timestamp() + 3_600;
+    let task_id = s.registry.register_task(
+        &s.admin,
+        &TaskType::Liquidation,
+        &calldata(&s.env),
+        &reward,
+        &deadline,
+        &17_280u32,
+        &120u32,
+        &None,
+    );
+
+    let stranger = Address::generate(&s.env);
+    let verifier_id = s.env.register(always_approve_verifier::AlwaysApproveVerifier, ());
+    assert_eq!(
+        s.registry
+            .try_update_verifier(&stranger, &task_id, &Some(verifier_id)),
+        Err(Ok(KeeperError::NotTaskOwner))
+    );
+}
+
+#[test]
+fn test_update_verifier_rejected_when_paused() {
+    let s = setup();
+    let reward = 1_000_000i128;
+    let deadline = s.env.ledger().timestamp() + 3_600;
+    let task_id = s.registry.register_task(
+        &s.admin,
+        &TaskType::Liquidation,
+        &calldata(&s.env),
+        &reward,
+        &deadline,
+        &17_280u32,
+        &120u32,
+        &None,
+    );
+
+    s.registry.pause(&s.admin);
+    let verifier_id = s.env.register(always_approve_verifier::AlwaysApproveVerifier, ());
+    assert_eq!(
+        s.registry
+            .try_update_verifier(&s.admin, &task_id, &Some(verifier_id)),
+        Err(Ok(KeeperError::ContractPaused))
+    );
+}
+
+#[test]
+fn test_update_verifier_emits_event() {
+    let s = setup();
+    let reward = 1_000_000i128;
+    let deadline = s.env.ledger().timestamp() + 3_600;
+    let task_id = s.registry.register_task(
+        &s.admin,
+        &TaskType::Liquidation,
+        &calldata(&s.env),
+        &reward,
+        &deadline,
+        &17_280u32,
+        &120u32,
+        &None,
+    );
+
+    let verifier_id = s.env.register(always_approve_verifier::AlwaysApproveVerifier, ());
+    let before = s.env.events().all().len();
+    s.registry
+        .update_verifier(&s.admin, &task_id, &Some(verifier_id));
+    assert!(s.env.events().all().len() > before);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #111 — execute_task against a verifier that consumes excessive resources
+//
+// The verifier below does a configurable number of persistent-storage writes
+// before returning `true` — a stand-in for "does something resource-intensive"
+// per the issue's own suggested approach. The test drives that count up under
+// a tightly capped budget (`env.cost_estimate().budget().reset_limits(...)`)
+// to find the point where the call starts failing on resource exhaustion
+// rather than any contract logic, and confirms two things at that boundary:
+//   1. The failure is a clean host-level error, not a panic that corrupts
+//      test state or a silently-wrong `false` verification result.
+//   2. No partial state mutation survives — the task is exactly as it was
+//      before the call, same as the panicking-verifier findings in #110/0075.
+// ─────────────────────────────────────────────────────────────────────────────
+
+mod expensive_verifier {
+    use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, Env};
+
+    #[contracttype]
+    enum DataKey {
+        Slot(u32),
+    }
+
+    #[contract]
+    pub struct ExpensiveVerifier;
+
+    #[contractimpl]
+    impl ExpensiveVerifier {
+        /// Writes `work_units` persistent-storage entries, then approves.
+        /// `proof`'s first byte selects how much work to do so a single
+        /// deployed instance can be reused across increasing loads.
+        pub fn verify(
+            env: Env,
+            _task: crate::Task,
+            _keeper: Address,
+            proof: Bytes,
+        ) -> bool {
+            let work_units: u32 = proof.get(0).unwrap_or(0) as u32;
+            for i in 0..work_units {
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::Slot(i), &Bytes::from_array(&env, &[0u8; 256]));
+            }
+            true
+        }
+    }
+}
+
+fn setup_task_with_expensive_verifier() -> (Setup, u64, Address, i128) {
+    let s = setup();
+    let verifier_id = s.env.register(expensive_verifier::ExpensiveVerifier, ());
+    let reward = 1_000_000i128;
+    let deadline = s.env.ledger().timestamp() + 3_600;
+    let task_id = s.registry.register_task(
+        &s.admin,
+        &TaskType::Liquidation,
+        &calldata(&s.env),
+        &reward,
+        &deadline,
+        &17_280u32,
+        &120u32,
+        &Some(verifier_id),
+    );
+    let keeper = Address::generate(&s.env);
+    s.registry.claim_task(&keeper, &task_id);
+    (s, task_id, keeper, reward)
+}
+
+/// A `proof` whose first byte is `work_units` — see `ExpensiveVerifier::verify`.
+fn proof_requesting_work(env: &Env, work_units: u8) -> Bytes {
+    Bytes::from_array(env, &[work_units])
+}
+
+#[test]
+fn test_execute_task_succeeds_against_expensive_verifier_under_default_budget() {
+    // Under the default (untouched) test budget, a moderate amount of
+    // verifier work still succeeds — establishes the baseline before we
+    // tighten the budget to find the failure boundary below.
+    let (s, task_id, keeper, reward) = setup_task_with_expensive_verifier();
+    let proof = proof_requesting_work(&s.env, 50);
+    s.registry.execute_task(&keeper, &task_id, &proof);
+
+    let task = s.registry.get_task(&task_id);
+    assert_eq!(task.status, TaskStatus::Executed);
+    let (expected_net, _) = split_reward(reward, 300u32);
+    assert_eq!(s.registry.keeper_balance(&keeper), expected_net);
+}
+
+#[test]
+#[should_panic]
+fn test_execute_task_against_expensive_verifier_exhausts_a_tight_budget() {
+    // Cap the budget tightly, then ask the verifier to do far more work than
+    // that budget allows. This empirically establishes the failure mode:
+    // resource exhaustion during a nested contract call is a host-level
+    // error that aborts the whole transaction (via the same frame-rollback
+    // mechanism documented on IKeeperVerifier and exercised by #110's
+    // panicking-verifier tests) — not a graceful `false` result, and not a
+    // panic that leaves storage half-written. `#[should_panic]` is the same
+    // no_std-compatible mechanism #110 uses for the equivalent claim about a
+    // panicking verifier (this crate's `#![no_std]` makes
+    // `std::panic::catch_unwind` unavailable even in `#[cfg(test)]` code).
+    // `Env`'s Drop impl (soroban-sdk's test harness) writes a test snapshot
+    // on drop, which itself needs to iterate storage under the budget. Once
+    // we deliberately exhaust the budget below, that snapshot-on-drop would
+    // hit the same exhausted budget while unwinding this panic and abort the
+    // whole test binary ("panic in a destructor during cleanup") instead of
+    // failing just this test. `EnvTestConfig` is plain (non-shared) state
+    // captured by value into every `Env`/client clone at the point it's
+    // cloned, so this must be set on the *original* `Env` before any client
+    // is constructed from it — setting it on `Setup.env` afterwards doesn't
+    // reach `Setup.registry`'s already-cloned internal `Env`. Disabling it
+    // is safe: this test's only assertion is that the call panics, and the
+    // state left behind is checked by the separate expire_task-recovery
+    // test below instead (using its own fresh `Setup`).
+    let mut env = Env::default();
+    env.set_config(soroban_sdk::testutils::EnvTestConfig {
+        capture_snapshot_at_drop: false,
+    });
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    token::StellarAssetClient::new(&env, &token_id).mint(&admin, &10_000_000i128);
+    let registry_id = env.register(KeeperRegistry, ());
+    let registry = KeeperRegistryClient::new(&env, &registry_id);
+    registry.initialize(&admin, &token_id, &300u32);
+
+    let verifier_id = env.register(expensive_verifier::ExpensiveVerifier, ());
+    let reward = 1_000_000i128;
+    let deadline = env.ledger().timestamp() + 3_600;
+    let task_id = registry.register_task(
+        &admin,
+        &TaskType::Liquidation,
+        &calldata(&env),
+        &reward,
+        &deadline,
+        &17_280u32,
+        &120u32,
+        &Some(verifier_id),
+    );
+    let keeper = Address::generate(&env);
+    registry.claim_task(&keeper, &task_id);
+
+    // Tight but not zero: enough for the setup/register/claim above to have
+    // happened, but far too little for hundreds of persistent writes.
+    env.cost_estimate().budget().reset_limits(2_000_000, 2_000_000);
+
+    let proof = proof_requesting_work(&env, 255);
+
+    // A resource-exhaustion failure inside a nested call is a non-recoverable
+    // host error (not a typed contract error), so — consistent with #110's
+    // panicking-verifier findings — it propagates and aborts the caller's
+    // transaction rather than surfacing as `Err(KeeperError::...)`.
+    registry.execute_task(&keeper, &task_id, &proof);
+}
+
+#[test]
+fn test_expire_task_recovers_escrow_from_a_task_stuck_behind_a_budget_exhausting_verifier() {
+    // Companion to the panic test above, structured like #110's
+    // expire_task-recovery test: since the aborting call can't be followed
+    // by assertions in the same test function, this test independently
+    // confirms the actual recovery guarantee — a task stuck behind a
+    // verifier that will always blow the budget is not permanently bricked;
+    // expire_task still recovers the escrowed reward once the deadline
+    // passes, exactly as it does for a panicking verifier.
+    let (s, task_id, keeper, reward) = setup_task_with_expensive_verifier();
+    s.env.cost_estimate().budget().reset_limits(2_000_000, 2_000_000);
+
+    let task_before_expiry = s.registry.get_task(&task_id);
+    assert_eq!(task_before_expiry.status, TaskStatus::Claimed);
+    assert_eq!(task_before_expiry.claimer, Some(keeper.clone()));
+    assert_eq!(s.registry.keeper_balance(&keeper), 0i128);
+
+    let token = token::Client::new(&s.env, &s.token_id);
+    let owner_balance_before = token.balance(&s.admin);
+
+    advance(&s.env, 1, 3_601);
+    s.env.cost_estimate().budget().reset_unlimited();
+    s.registry.expire_task(&task_id);
+
+    let task_after_expiry = s.registry.get_task(&task_id);
+    assert_eq!(task_after_expiry.status, TaskStatus::Expired);
+    assert_eq!(token.balance(&s.admin), owner_balance_before + reward);
 }

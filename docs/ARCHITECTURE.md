@@ -127,6 +127,86 @@ Equivalently, every token entering the registry is represented by exactly one op
 **Enforced by.** `register_task` allocates from `next_task_id` and increments the counter once for each successful registration. Terminal transitions modify task status but do not return ids to an allocation pool.
 
 **Breaks if.** Registration derives ids from the number of currently open tasks, decrements the counter after deletion, or silently wraps the counter on overflow. The monotonicity property and the explicit overflow boundary are covered by [issue #0060](https://github.com/soroban-tooling/soroban-keeper-network/issues/60).
+That top-level statement is decomposed into seven named invariants,
+`I-1` through `I-7`. Each is referenced by this identifier elsewhere in the
+repo (property tests, the shared invariant-checker module, fuzz targets) so
+a single name always means the same check.
+
+- **I-1 — Solvency.** The registry's token balance always equals open task
+  escrow plus credited keeper balances plus accrued fees (the equation
+  above, taken as a whole).
+- **I-2 — Escrow recoverability.** Every escrowed reward has at least one
+  reachable path back out: to the owner via `cancel_task` or `expire_task`,
+  or to a keeper via `execute_task` then `withdraw_rewards`. No state
+  strands funds permanently.
+- **I-3 — Single payout.** Each task's reward is paid out exactly once —
+  never zero times, never twice. (Wave 1 fixed two concrete CEI-ordering
+  violations of this, issues 0002/0003.)
+- **I-4 — Fee bounding.** The protocol never takes more than `fee_bps` of a
+  reward, and the admin can never sweep more than has accrued. The fee is
+  floored by integer division, so the protocol may take marginally *less*
+  than the nominal rate — never more.
+- **I-5 — Escrow isolation.** Admin functions can never touch task escrow
+  or credited keeper balances. `sweep_fees` is bounded by the
+  `FeesAccrued` accumulator specifically to enforce this.
+- **I-6 — Withdrawal liveness.** A keeper's credited balance is always
+  withdrawable, including while the contract is paused — this is the
+  promise that makes pausing acceptable to keepers.
+- **I-7 — Monotonic task ids.** Task ids are unique and never reused, so an
+  external reference to a task id (an off-chain indexer, a keeper bot's
+  local state, a dApp's UI) is stable forever. `next_task_id` increments a
+  `u64` counter and never decrements it.
+
+Enforced by:
+
+- **Escrow on register / top-up**, released exactly once on execute (split into
+  keeper credit + accrued fee), cancel, or expire. (I-1, I-2, I-3)
+- **Checks-Effects-Interactions** in `withdraw_rewards` and `sweep_fees`: the
+  stored balance is zeroed *before* the token transfer, so a re-entrant reward
+  token cannot double-spend. (I-3, I-6)
+- **`sweep_fees` bounded by `FeesAccrued`**, so admin can never touch task
+  escrow or keeper balances. (I-4, I-5)
+- **`next_task_id`** is a monotonically incrementing `u64` counter with no
+  decrement or reset path. (I-7)
+
+The `test_multi_keeper_end_to_end_conserves_funds` and
+`test_split_reward_invariants` tests guard these invariants with fixed
+scenarios. `contracts/keeper-registry/src/invariants.rs` exposes one
+`assert_*` function per `I-N` invariant, shared between the `proptest`-based
+property tests in `test.rs` and the fuzz targets under `fuzz/fuzz_targets/`,
+so both call the same assertion logic instead of maintaining parallel
+copies that can drift apart.
+
+## TTL / deadline invariant
+
+`Task.deadline` (a unix timestamp, seconds) and `Task.ttl_ledgers` (a Persistent
+storage TTL, ledgers) are different units with no fixed conversion. If a task's
+storage entry could expire before its deadline, the entry — and the escrow
+functions that depend on `load_task` (`cancel_task`, `expire_task`,
+`execute_task`) — become permanently unreachable once the entry is evicted,
+stranding the escrowed reward with no recovery path.
+
+The contract enforces, by construction, that a task's storage always outlives
+its deadline:
+
+```
+ttl_ledgers >= (deadline - now) / SECONDS_PER_LEDGER + TTL_SAFETY_MARGIN_LEDGERS
+```
+
+- `SECONDS_PER_LEDGER = 5` — a conservative estimate of Stellar's ledger close
+  time, used only to convert the deadline into a ledger count. Over-estimating
+  the ledger rate over-provisions TTL, which is the safe direction to be wrong.
+- `TTL_SAFETY_MARGIN_LEDGERS = 17_280` (~1 day) — extra ledgers kept beyond the
+  deadline so `expire_task` remains callable for a while after the deadline
+  passes.
+
+`register_task` rejects a `ttl_ledgers` that doesn't satisfy this with
+`TtlTooShort`, and `extend_deadline` applies the same check against the task's
+existing `ttl_ledgers` before accepting a new, later deadline — so an owner
+cannot push the deadline out from under the TTL. `save_task` also re-extends
+the entry's TTL on every mutation (claim, execute, top-up, deadline change),
+so an active task's storage lifetime keeps moving forward rather than only
+being set once at registration.
 
 ## Review checklist
 
