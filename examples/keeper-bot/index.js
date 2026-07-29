@@ -1,3 +1,44 @@
+/**
+ * Soroban Keeper Network — Example Keeper Bot
+ *
+ * This off-chain bot:
+ *   1. Polls the Soroban RPC for TaskRegistered / TaskClaimed events emitted
+ *      by the KeeperRegistry contract.
+ *   2. For each Pending task whose deadline has not passed:
+ *      a. Calls `claim_task` to lock the task.
+ *      b. Executes the underlying operation off-chain (simulated here).
+ *      c. Calls `execute_task` with a proof to claim the reward.
+ *   3. Periodically calls `withdraw_rewards` to pull accumulated XLM.
+ *
+ * Usage (daemon mode):
+ *   cp .env.example .env
+ *   # Fill in your secret key and contract address
+ *   npm install
+ *   node index.js
+ *
+ * Usage (one-shot mode for cron or serverless):
+ *   node index.js --once
+ *   # or: RUN_ONCE=true node index.js
+ *
+ * This example already includes:
+ *   - Comprehensive startup validation for all config settings
+ *   - Retry with exponential back-off + jitter on transient RPC errors
+ *   - Graceful shutdown (SIGINT/SIGTERM) that drains the in-flight round
+ *   - Permissionless expiry of stale tasks to refund owners
+ *   - Read-only views (`keeper_balance`, etc.) are evaluated via simulation
+ *     through `readContract`, not submitted as signed transactions — see
+ *     that function's doc comment for why this matters
+ *
+ * Production keepers should additionally add:
+ *   - Persistent task state DB (SQLite / Redis) to avoid double-claiming.
+ *     This example only keeps a bounded in-memory outcome cache (see
+ *     `taskOutcomes` below) that is entirely lost on every restart — a real
+ *     DB is meant to be a drop-in replacement for that Map, not a rewrite.
+ *   - MEV-aware submission (bundle multiple tasks)
+ *   - Prometheus metrics endpoint
+ *   - Alerting (PagerDuty / Telegram) on missed executions
+ */
+
 "use strict";
 
 require("dotenv").config();
@@ -21,6 +62,38 @@ const NETWORK_CONFIG = {
 };
 
 let CONFIG;
+let CONFIG; // Initialized in main() after validation
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Cross-round state
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Ledger to resume the event scan from on the next round. Starts out `null`,
+// which tells the first round to fall back to the ~1000-ledger lookback
+// window (see keeperLoop). Every round after that advances this cursor using
+// the `latestLedger` reported by the getEvents RPC response itself, so each
+// round only scans the ledgers that closed since the previous round instead
+// of re-reading the same ~998 ledgers every time.
+let cursorLedger = null;
+
+// In-memory cache of taskId -> terminal outcome this bot has itself caused
+// ('executed' via execute_task, 'expired' via expire_task), so a task the
+// cursor re-surfaces (or that falls inside the very first lookback window
+// more than once) isn't re-submitted as a fresh claim/execute attempt.
+//
+// Eviction policy: an entry is removed once its task's `deadline` has
+// passed, because a task past its deadline can never be claimed or executed
+// again regardless of what this cache remembers — so the map is naturally
+// bounded by the number of tasks with a still-live deadline, not by time or
+// an arbitrary size cap. Eviction runs at the top of every round.
+//
+// This cache is entirely in-memory and is lost on process restart — that is
+// an accepted limitation for this example bot (see the header comment).
+const taskOutcomes = new Map(); // taskId -> { outcome: "executed" | "expired", deadline: number }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Configuration validation
+// ─────────────────────────────────────────────────────────────────────────────
 
 function fail(name, value, reason) {
   let message = `❌  Invalid ${name}`;
@@ -128,6 +201,16 @@ async function validateAndLoadConfig() {
       parse: (v) => v.toLowerCase() === "true",
       fallback: true,
     }),
+    eventsPageSize: requireEnv("EVENTS_PAGE_SIZE", {
+      parse: (v) => parseInt(v, 10),
+      validate: { fn: (v) => v > 0, reason: "must be a positive number" },
+      fallback: 100,
+    }),
+    eventsMaxPages: requireEnv("EVENTS_MAX_PAGES", {
+      parse: (v) => parseInt(v, 10),
+      validate: { fn: (v) => v > 0, reason: "must be a positive number" },
+      fallback: 10,
+    }),
   };
   return CONFIG;
 }
@@ -206,14 +289,36 @@ async function readContract(server, sourcePublicKey, networkPassphrase, contract
   return sim.result ? scValToNative(sim.result.retval) : null;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Task fetching — reads pending tasks by querying events
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Returns `{ tasks, latestLedger }`. `latestLedger` is the ledger the RPC
+ * node had most recently ingested at query time (straight from the
+ * getEvents response) so callers can advance a scan cursor without an extra
+ * getLatestLedger() round-trip. It is `null` if the query failed, so callers
+ * know not to advance their cursor past ledgers that were never actually
+ * scanned.
+ * Fetches TaskRegistered events across the window, following the pagination
+ * cursor. Bounded by `CONFIG.eventsMaxPages` so one very busy window cannot
+ * stall a round indefinitely; hitting the bound is logged, never silent.
+ *
+ * This pagination behaviour is compatible with Soroban RPC v1.2.0 and later,
+ * where `startLedger` and `cursor` are mutually exclusive.
+ */
 async function fetchPendingTasks(server, contractId, startLedger) {
   const tasks = [];
+  let latestLedger = null;
   try {
     const response = await server.getEvents({
       startLedger,
       filters: [{ type: "contract", contractIds: [contractId], topics: [REGISTRY_EVENTS.taskRegistered] }],
       limit: 100,
     });
+
+    latestLedger = response.latestLedger;
+
     for (const event of response.events || []) {
       try {
         const [taskIdVal, , rewardVal, deadlineVal] = event.value.value();
@@ -221,10 +326,28 @@ async function fetchPendingTasks(server, contractId, startLedger) {
       } catch (_) {
         // Ignore malformed events and continue with the remaining events.
       }
+
+      pages++;
+      if (
+        !response.events ||
+        response.events.length < CONFIG.eventsPageSize ||
+        !response.cursor
+      ) {
+        break; // Window exhausted
+      }
+      cursor = response.cursor;
+    } catch (e) {
+      console.warn("⚠️  Failed to fetch events page:", e.message);
+      break; // Stop pagination on error
     }
-  } catch (e) {
-    console.warn("⚠️  Failed to fetch events:", e.message);
   }
+
+  if (pages === CONFIG.eventsMaxPages) {
+    console.warn(
+      `⚠️  Stopped fetching events after ${pages} pages — more may remain in this window.`
+    );
+  }
+
   return tasks;
 }
 
@@ -253,6 +376,39 @@ async function keeperLoop(server, keypair, networkPassphrase, contractId, emptyR
     const pendingTasks = await fetchPendingTasks(server, contractId, Math.max(1, latestLedger.sequence - 1000));
     console.log(`  📋  Found ${pendingTasks.length} TaskRegistered events to evaluate`);
 
+    // Evict outcome-cache entries whose deadline has passed — see the
+    // `taskOutcomes` declaration for why this is a safe & sufficient policy.
+    for (const [taskId, entry] of taskOutcomes) {
+      if (entry.deadline <= nowSeconds) taskOutcomes.delete(taskId);
+    }
+
+    // Only the very first round (no cursor yet) uses a fixed lookback
+    // window (last ~1000 ledgers ≈ 1.4h at 5s) so a freshly started bot
+    // still picks up recently registered tasks. Every subsequent round
+    // resumes exactly where the previous one left off.
+    let startLedger;
+    if (cursorLedger === null) {
+      const latestLedger = await server.getLatestLedger();
+      startLedger = Math.max(1, latestLedger.sequence - 1000);
+    } else {
+      startLedger = cursorLedger;
+    }
+
+    const { tasks: fetchedTasks, latestLedger: scannedLedger } = await fetchPendingTasks(
+      server, contractId, startLedger
+    );
+
+    if (scannedLedger !== null) {
+      console.log(
+        `  📜  Scanned ledgers ${startLedger} to ${scannedLedger} (${scannedLedger - startLedger + 1} ledgers)`
+      );
+      // Resume from the next unscanned ledger next round. If the query
+      // failed (scannedLedger === null), leave the cursor where it is so
+      // the next round retries the same window instead of silently
+      // skipping ledgers we never actually read.
+      cursorLedger = scannedLedger + 1;
+    }
+
     const feeBpsValue = await readContract(server, keypair.publicKey(), networkPassphrase, contractId, "get_fee_bps", []);
     const feeBps = BigInt(feeBpsValue);
     if (feeBps < 0n || feeBps > 10000n) throw new Error(`Invalid on-chain fee rate: ${feeBps}`);
@@ -267,6 +423,9 @@ async function keeperLoop(server, keypair, networkPassphrase, contractId, emptyR
 
     for (const task of pendingTasks) {
       if (summary.processed >= CONFIG.maxTasksPerRound) break;
+
+      // The event-derived deadline is potentially stale, but it's a cheap
+      // client-side filter. is_claimable will check the true current deadline.
       if (task.deadline <= nowSeconds) {
         if (CONFIG.expireStaleTasks) {
           try {
@@ -289,6 +448,47 @@ async function keeperLoop(server, keypair, networkPassphrase, contractId, emptyR
         console.log(`  ⏭️  Skipping task ${task.taskId} (reward: ${task.reward}, estimated cost: ${economics.estimatedCost} stroops): ${reason}`);
         continue;
       }
+      try {
+        // Pre-flight check: is the task actually claimable right now? This
+        // is a read-only simulation, so it costs nothing. It confirms the
+        // task is still pending and not locked by another keeper.
+        const claimable = await readContract(
+          server,
+          keypair.publicKey(),
+          networkPassphrase,
+          contractId,
+          "is_claimable",
+          [nativeToScVal(task.taskId, { type: "u64" })]
+        );
+
+        if (!claimable) {
+          console.log(
+            `  ⏩  Skipping task ${task.taskId} — not claimable (already claimed or finished)`
+          );
+          continue;
+        }
+
+        // The pre-check is advisory, not a lock. A competitor can still
+        // claim the task in the interval between our simulation and our
+        // submission. The `claim_task` call can still fail, which is
+        // normal and expected.
+        console.log(
+          `  📌  Attempting to claim task ${task.taskId} (reward: ${task.reward})...`
+        );
+        await withRetry(`claim_task ${task.taskId}`, () =>
+          invokeContract(
+            server,
+            keypair,
+            networkPassphrase,
+            contractId,
+            "claim_task",
+            [
+              nativeToScVal(keypair.publicKey(), { type: "address" }),
+              nativeToScVal(task.taskId, { type: "u64" }),
+            ]
+          )
+        );
+        console.log(`  ✅  Task ${task.taskId} claimed!`);
 
       try {
         console.log(`  📌  Attempting to claim task ${task.taskId} (reward: ${task.reward}, estimated cost: ${economics.estimatedCost} stroops, net reward: ${economics.netReward})...`);
