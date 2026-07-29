@@ -139,6 +139,37 @@ property tests in `test.rs` and the fuzz targets under `fuzz/fuzz_targets/`,
 so both call the same assertion logic instead of maintaining parallel
 copies that can drift apart.
 
+## TTL / deadline invariant
+
+`Task.deadline` (a unix timestamp, seconds) and `Task.ttl_ledgers` (a Persistent
+storage TTL, ledgers) are different units with no fixed conversion. If a task's
+storage entry could expire before its deadline, the entry — and the escrow
+functions that depend on `load_task` (`cancel_task`, `expire_task`,
+`execute_task`) — become permanently unreachable once the entry is evicted,
+stranding the escrowed reward with no recovery path.
+
+The contract enforces, by construction, that a task's storage always outlives
+its deadline:
+
+```
+ttl_ledgers >= (deadline - now) / SECONDS_PER_LEDGER + TTL_SAFETY_MARGIN_LEDGERS
+```
+
+- `SECONDS_PER_LEDGER = 5` — a conservative estimate of Stellar's ledger close
+  time, used only to convert the deadline into a ledger count. Over-estimating
+  the ledger rate over-provisions TTL, which is the safe direction to be wrong.
+- `TTL_SAFETY_MARGIN_LEDGERS = 17_280` (~1 day) — extra ledgers kept beyond the
+  deadline so `expire_task` remains callable for a while after the deadline
+  passes.
+
+`register_task` rejects a `ttl_ledgers` that doesn't satisfy this with
+`TtlTooShort`, and `extend_deadline` applies the same check against the task's
+existing `ttl_ledgers` before accepting a new, later deadline — so an owner
+cannot push the deadline out from under the TTL. `save_task` also re-extends
+the entry's TTL on every mutation (claim, execute, top-up, deadline change),
+so an active task's storage lifetime keeps moving forward rather than only
+being set once at registration.
+
 ## Events
 
 Every state transition emits an event so off-chain keepers and indexers can

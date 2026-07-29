@@ -85,7 +85,7 @@ fn register_reward_task(s: &Setup, reward: i128) -> u64 {
         &calldata(&s.env),
         &reward,
         &deadline,
-        &17_280u32,
+        &20_000u32,
         &120u32,
         &None,
     )
@@ -172,7 +172,7 @@ fn test_split_reward_invariants() {
 
     for &reward in &rewards {
         for &bps in &fee_rates {
-            let (keeper_net, fee) = split_reward(reward, bps);
+            let (keeper_net, fee) = split_reward(reward, bps).expect("split should succeed");
 
             // 1. Conservation: nothing leaks.
             assert_eq!(keeper_net + fee, reward, "reward={reward} bps={bps}");
@@ -193,7 +193,7 @@ fn test_split_reward_invariants() {
 #[test]
 fn test_version_is_exposed() {
     let s = setup();
-    assert_eq!(s.registry.version(), 2u32);
+    assert_eq!(s.registry.version(), 3u32);
 }
 
 #[test]
@@ -280,7 +280,7 @@ fn test_register_task_success() {
         &calldata(&env),
         &1_000_000i128,
         &deadline,
-        &17_280u32,
+        &20_000u32,
         &120u32,
         &None,
     );
@@ -321,7 +321,7 @@ fn test_register_task_escrows_reward() {
         &calldata(&env),
         &1_000_000i128,
         &(env.ledger().timestamp() + 3_600),
-        &17_280u32,
+        &20_000u32,
         &120u32,
         &None,
     );
@@ -352,7 +352,7 @@ fn test_register_task_zero_reward_fails() {
             &calldata(&env),
             &0i128,
             &(env.ledger().timestamp() + 3_600),
-            &17_280u32,
+            &20_000u32,
             &120u32,
             &None,
         ),
@@ -382,7 +382,7 @@ fn test_register_task_past_deadline_fails() {
             &calldata(&env),
             &1_000_000i128,
             &past,
-            &17_280u32,
+            &20_000u32,
             &120u32,
             &None,
         ),
@@ -413,13 +413,48 @@ fn test_register_increments_task_counter() {
             &calldata(&env),
             &100_000i128,
             &deadline,
-            &17_280u32,
+            &20_000u32,
             &60u32,
             &None,
         );
         assert_eq!(id, expected_id);
     }
     assert_eq!(registry.task_count(), 3u64);
+}
+
+#[test]
+fn test_register_task_ttl_shorter_than_deadline_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    token::StellarAssetClient::new(&env, &token_id).mint(&admin, &5_000_000i128);
+
+    let registry_id = env.register(KeeperRegistry, ());
+    let registry = KeeperRegistryClient::new(&env, &registry_id);
+    registry.initialize(&admin, &token_id, &300u32);
+
+    // 30-day deadline, but only ~1 day of TTL — the exact scenario from the
+    // issue: the storage entry would die long before the deadline, stranding
+    // the escrow. Must be rejected outright.
+    let deadline = env.ledger().timestamp() + 2_592_000; // 30 days
+    assert_eq!(
+        registry.try_register_task(
+            &admin,
+            &TaskType::Liquidation,
+            &calldata(&env),
+            &1_000_000i128,
+            &deadline,
+            &17_280u32, // ~1 day of ledgers — nowhere near enough
+            &120u32,
+        ),
+        Err(Ok(KeeperError::TtlTooShort))
+    );
+    // Nothing was escrowed and no task was created.
+    assert_eq!(registry.task_count(), 0u64);
 }
 
 #[test]
@@ -445,7 +480,7 @@ fn test_register_task_with_max_calldata_succeeds() {
         &max_calldata,
         &1_000_000i128,
         &(env.ledger().timestamp() + 3_600),
-        &17_280u32,
+        &20_000u32,
         &120u32,
         &None,
     );
@@ -484,6 +519,65 @@ fn test_register_task_over_max_calldata_fails() {
 }
 
 #[test]
+fn test_register_task_ttl_covering_deadline_succeeds() {
+    let s = setup();
+    // deadline is 3_600s away; required TTL is 720 ledgers + the 17_280
+    // safety margin = 18_000. 20_000 comfortably covers it.
+    let id = register_default_task(&s);
+    assert_eq!(s.registry.get_task(&id).status, TaskStatus::Pending);
+}
+
+#[test]
+fn test_extend_deadline_ttl_too_short_fails() {
+    let s = setup();
+    let id = register_default_task(&s); // ttl_ledgers = 20_000
+    let old = s.registry.get_task(&id).deadline;
+
+    // Push the deadline out far enough that the existing TTL (20_000 ledgers)
+    // no longer covers it plus the safety margin.
+    let far_future = old + 1_000_000;
+    assert_eq!(
+        s.registry.try_extend_deadline(&s.admin, &id, &far_future),
+        Err(Ok(KeeperError::TtlTooShort))
+    );
+    // The deadline was not mutated.
+    assert_eq!(s.registry.get_task(&id).deadline, old);
+}
+
+#[test]
+fn test_expire_task_succeeds_past_old_ttl_boundary() {
+    let s = setup();
+    let keeper = Address::generate(&s.env);
+    let token = token::Client::new(&s.env, &s.token_id);
+    let before = token.balance(&s.admin);
+
+    // Register with a deadline far enough out that a naive ttl_ledgers of
+    // ~1 day (17_280, as in the old README example) would have expired the
+    // storage entry long before the deadline. The TTL invariant forces a
+    // larger value here, so the entry must still be alive at expiry time.
+    let deadline = s.env.ledger().timestamp() + 172_800; // 2 days
+    let required = 172_800 / 5 + 17_280; // matches required_ttl_ledgers
+    let id = s.registry.register_task(
+        &s.admin,
+        &TaskType::Liquidation,
+        &calldata(&s.env),
+        &1_000_000i128,
+        &deadline,
+        &(required as u32),
+        &120u32,
+    );
+    s.registry.claim_task(&keeper, &id); // claimed but never executed
+
+    // Advance well past where a 17_280-ledger TTL (the old unsafe default)
+    // would have evicted the entry, and past the deadline itself.
+    advance(&s.env, 40_000, 172_801);
+    s.registry.expire_task(&id); // must still succeed and refund the owner
+
+    assert_eq!(token.balance(&s.admin), before);
+    assert_eq!(s.registry.get_task(&id).status, TaskStatus::Expired);
+}
+
+#[test]
 fn test_register_task_with_empty_calldata_succeeds() {
     let env = Env::default();
     env.mock_all_auths();
@@ -507,7 +601,7 @@ fn test_register_task_with_empty_calldata_succeeds() {
         &empty,
         &1_000_000i128,
         &(env.ledger().timestamp() + 3_600),
-        &17_280u32,
+        &20_000u32,
         &120u32,
         &None,
     );
@@ -757,7 +851,7 @@ fn claim_with_lock(s: &Setup, keeper: &Address, lock_ledgers: u32) -> (u64, u32)
         &calldata(&s.env),
         &1_000_000i128,
         &deadline,
-        &17_280u32,
+        &20_000u32,
         &lock_ledgers,
         &None,
     );
@@ -834,7 +928,7 @@ fn test_lock_window_extending_past_deadline_is_blocked_by_deadline_first() {
         &calldata(&s.env),
         &1_000_000i128,
         &deadline,
-        &17_280u32,
+        &20_000u32,
         &1_000u32,
         &None,
     );
@@ -910,7 +1004,7 @@ fn test_get_fee_bps_matches_applied_fee_when_never_written() {
     s.registry
         .execute_task(&keeper, &id, &Bytes::from_slice(&s.env, b"proof"));
 
-    let (expected_net, _) = split_reward(1_000_000i128, reported_fee_bps);
+    let (expected_net, _) = split_reward(1_000_000i128, reported_fee_bps).unwrap();
     assert_eq!(s.registry.keeper_balance(&keeper), expected_net);
     assert_eq!(reported_fee_bps, 0u32);
 }
@@ -929,7 +1023,7 @@ fn test_get_fee_bps_matches_applied_fee_after_set_fee_bps() {
     s.registry
         .execute_task(&keeper, &id, &Bytes::from_slice(&s.env, b"proof"));
 
-    let (expected_net, _) = split_reward(1_000_000i128, reported_fee_bps);
+    let (expected_net, _) = split_reward(1_000_000i128, reported_fee_bps).unwrap();
     assert_eq!(s.registry.keeper_balance(&keeper), expected_net);
     assert_eq!(reported_fee_bps, 750u32);
 }
@@ -1286,7 +1380,7 @@ fn test_expire_task_reentrancy_pays_refund_exactly_once() {
         &calldata(&env),
         &1_000_000i128,
         &deadline,
-        &17_280u32,
+        &20_000u32,
         &120u32,
         &None,
     );
@@ -1401,7 +1495,7 @@ fn test_keeper_balance_accumulates_across_tasks_and_withdraws_as_one_sum() {
         s.registry
             .execute_task(&keeper1, &id1, &Bytes::from_slice(&s.env, b"proof"));
 
-        let (net1, fee1) = split_reward(reward1, fee_bps);
+        let (net1, fee1) = split_reward(reward1, fee_bps).unwrap();
         keeper1_balance += net1;
         expected_fees += fee1;
 
@@ -1416,7 +1510,7 @@ fn test_keeper_balance_accumulates_across_tasks_and_withdraws_as_one_sum() {
             s.registry
                 .execute_task(&keeper2, &id2, &Bytes::from_slice(&s.env, b"proof"));
 
-            let (net2, fee2) = split_reward(reward2, fee_bps);
+            let (net2, fee2) = split_reward(reward2, fee_bps).unwrap();
             keeper2_balance += net2;
             expected_fees += fee2;
 
@@ -1643,7 +1737,7 @@ fn test_pause_blocks_registration_but_allows_withdraw() {
             &calldata(&s.env),
             &100_000i128,
             &(s.env.ledger().timestamp() + 3_600),
-            &17_280u32,
+            &20_000u32,
             &60u32,
             &None,
         ),
@@ -1919,7 +2013,7 @@ fn test_set_min_reward_rejects_below_floor() {
             &calldata(&s.env),
             &499_999i128,
             &(s.env.ledger().timestamp() + 3_600),
-            &17_280u32,
+            &20_000u32,
             &60u32,
             &None,
         ),
@@ -1932,7 +2026,7 @@ fn test_set_min_reward_rejects_below_floor() {
         &calldata(&s.env),
         &500_000i128,
         &(s.env.ledger().timestamp() + 3_600),
-        &17_280u32,
+        &20_000u32,
         &60u32,
         &None,
     );
@@ -2608,6 +2702,268 @@ fn test_require_admin_distinguishes_not_initialized_from_wrong_caller() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Issue #15: ArithmeticOverflow tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_split_reward_extreme_value_returns_overflow_error() {
+    // Any reward above i128::MAX / 10_000 will overflow the multiplication
+    // when fee_bps is at the max (10_000). This test pins that the function returns a
+    // typed error rather than panicking.
+    let extreme_reward = i128::MAX / 9_999; // Will overflow when multiplied by 10_000
+    let fee_bps = 10_000u32; // Max fee rate
+    
+    let result = split_reward(extreme_reward, fee_bps);
+    assert_eq!(result, Err(KeeperError::ArithmeticOverflow));
+}
+
+#[test]
+fn test_split_reward_max_safe_value_succeeds() {
+    // The largest reward that can be safely multiplied by 10_000
+    let safe_reward = i128::MAX / 10_000;
+    let fee_bps = 300u32;
+    
+    let result = split_reward(safe_reward, fee_bps);
+    assert!(result.is_ok());
+    let (keeper_net, fee) = result.unwrap();
+    assert_eq!(keeper_net + fee, safe_reward);
+}
+
+#[test]
+fn test_split_reward_with_zero_fee_never_overflows() {
+    // With fee_bps = 0, the multiplication by 0 can never overflow
+    let huge_reward = i128::MAX;
+    let result = split_reward(huge_reward, 0);
+    assert!(result.is_ok());
+    let (keeper_net, fee) = result.unwrap();
+    assert_eq!(keeper_net, huge_reward);
+    assert_eq!(fee, 0);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #16: set_min_reward event emission tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_set_min_reward_emits_event() {
+    let s = setup();
+    let old_min = s.registry.min_reward(); // initially 0
+    let new_min = 500_000i128;
+    
+    s.registry.set_min_reward(&s.admin, &new_min);
+    
+    // Find the minrwd event - it should be emitted
+    let events = s.env.events().all();
+    let mut found = false;
+    for event in events.iter() {
+        let data_result: Result<(i128, i128), _> = event.2.try_into_val(&s.env);
+        if let Ok((event_old, event_new)) = data_result {
+            if event_old == old_min && event_new == new_min {
+                found = true;
+                break;
+            }
+        }
+    }
+    assert!(found, "MinRewardUpdated event was not emitted");
+}
+
+#[test]
+fn test_set_min_reward_no_event_when_validation_fails() {
+    let s = setup();
+    let events_before = s.env.events().all();
+    
+    // Negative reward fails validation
+    let _ = s.registry.try_set_min_reward(&s.admin, &-1i128);
+    
+    let events_after = s.env.events().all();
+    // No new min reward event should be added
+    let mut found_new_min_reward_event = false;
+    for i in events_before.len()..events_after.len() {
+        let event = events_after.get(i).unwrap();
+        // Try to parse as min reward event
+        let data_result: Result<(i128, i128), _> = event.2.try_into_val(&s.env);
+        if data_result.is_ok() {
+            found_new_min_reward_event = true;
+        }
+    }
+    assert!(!found_new_min_reward_event, "no event should be emitted on validation failure");
+}
+
+#[test]
+fn test_set_min_reward_event_captures_old_and_new() {
+    let s = setup();
+    
+    // Set initial value
+    s.registry.set_min_reward(&s.admin, &100_000i128);
+    
+    // Change it again
+    s.registry.set_min_reward(&s.admin, &200_000i128);
+    
+    let events = s.env.events().all();
+    let event = events.last().unwrap();
+    let data: (i128, i128) = event.2.try_into_val(&s.env).unwrap();
+    let (event_old, event_new) = data;
+    
+    assert_eq!(event_old, 100_000i128);
+    assert_eq!(event_new, 200_000i128);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #17: sweep_fees event emission tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_sweep_fees_emits_event() {
+    let s = setup();
+    let _ = executed_task_keeper(&s); // accrues 30_000 fee
+    let treasury = Address::generate(&s.env);
+    
+    s.registry.sweep_fees(&s.admin, &treasury, &30_000i128);
+    
+    // Verify event data - last event should be the sweep
+    let events = s.env.events().all();
+    let event = events.last().unwrap();
+    
+    let data: (Address, i128, i128) = event.2.try_into_val(&s.env).unwrap();
+    let (event_treasury, event_amount, event_remaining) = data;
+    assert_eq!(event_treasury, treasury);
+    assert_eq!(event_amount, 30_000i128);
+    assert_eq!(event_remaining, 0i128);
+}
+
+#[test]
+fn test_sweep_fees_partial_amount_shows_remaining() {
+    let s = setup();
+    let _ = executed_task_keeper(&s); // accrues 30_000 fee
+    let treasury = Address::generate(&s.env);
+    
+    s.registry.sweep_fees(&s.admin, &treasury, &12_000i128);
+    
+    let events = s.env.events().all();
+    let event = events.last().unwrap();
+    let data: (Address, i128, i128) = event.2.try_into_val(&s.env).unwrap();
+    let (_event_treasury, event_amount, event_remaining) = data;
+    
+    assert_eq!(event_amount, 12_000i128);
+    assert_eq!(event_remaining, 18_000i128);
+    
+    // Verify remaining matches actual state
+    assert_eq!(s.registry.fees_accrued(), 18_000i128);
+}
+
+#[test]
+fn test_sweep_fees_no_event_when_validation_fails() {
+    let s = setup();
+    let _ = executed_task_keeper(&s); // accrues 30_000
+    let treasury = Address::generate(&s.env);
+    let events_before = s.env.events().all();
+    
+    // Try to sweep more than accrued
+    let _ = s.registry.try_sweep_fees(&s.admin, &treasury, &30_001i128);
+    
+    let events_after = s.env.events().all();
+    // Check that no sweep event was added (events may include diagnostic events)
+    // The sweep event has 3 fields: (Address, i128, i128)
+    let mut found_sweep_event = false;
+    for i in events_before.len()..events_after.len() {
+        let event = events_after.get(i).unwrap();
+        let data_result: Result<(Address, i128, i128), _> = event.2.try_into_val(&s.env);
+        if data_result.is_ok() {
+            found_sweep_event = true;
+        }
+    }
+    assert!(!found_sweep_event, "no sweep event should be emitted on validation failure");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #19: initialize event emission tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_initialize_emits_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    
+    let admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let registry_id = env.register(KeeperRegistry, ());
+    let registry = KeeperRegistryClient::new(&env, &registry_id);
+    
+    registry.initialize(&admin, &token_id, &300u32);
+    
+    // Verify event data - last event should be the init event
+    let events = env.events().all();
+    let event = events.last().unwrap();
+    
+    // Data contains (admin, reward_token, fee_bps)
+    let data: (Address, Address, u32) = event.2.try_into_val(&env).unwrap();
+    let (event_admin, event_token, event_fee_bps) = data;
+    assert_eq!(event_admin, admin);
+    assert_eq!(event_token, token_id);
+    assert_eq!(event_fee_bps, 300u32);
+}
+
+#[test]
+fn test_initialize_no_event_on_second_call() {
+    let env = Env::default();
+    env.mock_all_auths();
+    
+    let admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let registry_id = env.register(KeeperRegistry, ());
+    let registry = KeeperRegistryClient::new(&env, &registry_id);
+    
+    registry.initialize(&admin, &token_id, &300u32);
+    let events_before = env.events().all();
+    
+    // Second initialize call fails
+    let _ = registry.try_initialize(&admin, &token_id, &300u32);
+    
+    let events_after = env.events().all();
+    // Check that no init event was added
+    let mut found_init_event = false;
+    for i in events_before.len()..events_after.len() {
+        let event = events_after.get(i).unwrap();
+        let data_result: Result<(Address, Address, u32), _> = event.2.try_into_val(&env);
+        if data_result.is_ok() {
+            found_init_event = true;
+        }
+    }
+    assert!(!found_init_event, "no event should be emitted on rejected second initialize");
+}
+
+#[test]
+fn test_initialize_no_event_when_validation_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    
+    let admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let registry_id = env.register(KeeperRegistry, ());
+    let registry = KeeperRegistryClient::new(&env, &registry_id);
+    
+    let events_before = env.events().all();
+    
+    // Invalid fee_bps > 10_000
+    let _ = registry.try_initialize(&admin, &token_id, &10_001u32);
+    
+    let events_after = env.events().all();
+    // Check that no init event was added
+    let mut found_init_event = false;
+    for i in events_before.len()..events_after.len() {
+        let event = events_after.get(i).unwrap();
+        let data_result: Result<(Address, Address, u32), _> = event.2.try_into_val(&env);
+        if data_result.is_ok() {
+            found_init_event = true;
+        }
+    }
+    assert!(!found_init_event, "no event should be emitted on validation failure");
 // Property tests (issue #93 / backlog 0068): compact proptest coverage per
 // I-N invariant, using the shared `invariants` module so these and any
 // future fuzz target assert the exact same thing. This is intentionally a
@@ -2826,12 +3182,19 @@ mod always_approve_verifier {
 
     use crate::Task;
 
+// Verifier mocks (#98/#99/#106) — minimal, test-only contracts following the
+// established `mod reentrant_token { ... }` local-mock-contract pattern.
+// ─────────────────────────────────────────────────────────────────────────────
+
+mod always_approve_verifier {
+    use soroban_sdk::{contract, contractimpl, Address, Bytes, Env};
+
     #[contract]
     pub struct AlwaysApproveVerifier;
 
     #[contractimpl]
     impl AlwaysApproveVerifier {
-        pub fn verify(_env: Env, _task: Task, _keeper: Address, _proof: Bytes) -> bool {
+        pub fn verify(_env: Env, _task: crate::Task, _keeper: Address, _proof: Bytes) -> bool {
             true
         }
     }
@@ -2844,12 +3207,16 @@ mod always_reject_verifier {
 
     use crate::Task;
 
+mod always_reject_verifier {
+    use soroban_sdk::{contract, contractimpl, Address, Bytes, Env};
+
     #[contract]
     pub struct AlwaysRejectVerifier;
 
     #[contractimpl]
     impl AlwaysRejectVerifier {
         pub fn verify(_env: Env, _task: Task, _keeper: Address, _proof: Bytes) -> bool {
+        pub fn verify(_env: Env, _task: crate::Task, _keeper: Address, _proof: Bytes) -> bool {
             false
         }
     }
@@ -2993,6 +3360,7 @@ fn test_update_verifier_emits_event() {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // #108 — execute_task with a verifier that always approves
+// #99 — execute_task with a verifier attached
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -3178,4 +3546,166 @@ fn test_expire_task_recovers_escrow_from_a_task_stuck_behind_a_panicking_verifie
     let task_after_expiry = s.registry.get_task(&task_id);
     assert_eq!(task_after_expiry.status, TaskStatus::Expired);
     assert_eq!(token.balance(&s.admin), owner_balance_before + reward);
+#[test]
+fn test_execute_task_none_verifier_path_unchanged() {
+    // The base MVP path (no verifier attached) must behave identically to
+    // before this feature existed — required explicitly by #99's acceptance
+    // criteria, on top of the fact that all 100 pre-existing tests already
+    // pass unmodified.
+    let s = setup();
+    let reward = 1_000_000i128;
+    let deadline = s.env.ledger().timestamp() + 3_600;
+    let task_id = s.registry.register_task(
+        &s.admin,
+        &TaskType::Liquidation,
+        &calldata(&s.env),
+        &reward,
+        &deadline,
+        &17_280u32,
+        &120u32,
+        &None,
+    );
+    let keeper = Address::generate(&s.env);
+    s.registry.claim_task(&keeper, &task_id);
+
+    let proof = Bytes::from_slice(&s.env, b"proof-bytes");
+    s.registry.execute_task(&keeper, &task_id, &proof);
+
+    let (expected_net, expected_fee) = split_reward(reward, 300u32);
+    assert_eq!(s.registry.keeper_balance(&keeper), expected_net);
+    assert_eq!(s.registry.fees_accrued(), expected_fee);
+    assert_eq!(s.registry.get_task(&task_id).status, TaskStatus::Executed);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #106 — update_verifier
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_update_verifier_succeeds_while_pending() {
+    let s = setup();
+    let reward = 1_000_000i128;
+    let deadline = s.env.ledger().timestamp() + 3_600;
+    let task_id = s.registry.register_task(
+        &s.admin,
+        &TaskType::Liquidation,
+        &calldata(&s.env),
+        &reward,
+        &deadline,
+        &17_280u32,
+        &120u32,
+        &None,
+    );
+
+    let verifier_id = s.env.register(always_approve_verifier::AlwaysApproveVerifier, ());
+    s.registry
+        .update_verifier(&s.admin, &task_id, &Some(verifier_id.clone()));
+
+    let task = s.registry.get_task(&task_id);
+    assert_eq!(task.verifier, Some(verifier_id));
+
+    // Clearing it back to None also works while still Pending.
+    s.registry.update_verifier(&s.admin, &task_id, &None);
+    assert_eq!(s.registry.get_task(&task_id).verifier, None);
+}
+
+#[test]
+fn test_update_verifier_rejected_once_task_is_claimed() {
+    let s = setup();
+    let reward = 1_000_000i128;
+    let deadline = s.env.ledger().timestamp() + 3_600;
+    let task_id = s.registry.register_task(
+        &s.admin,
+        &TaskType::Liquidation,
+        &calldata(&s.env),
+        &reward,
+        &deadline,
+        &17_280u32,
+        &120u32,
+        &None,
+    );
+    let keeper = Address::generate(&s.env);
+    s.registry.claim_task(&keeper, &task_id);
+
+    let verifier_id = s.env.register(always_approve_verifier::AlwaysApproveVerifier, ());
+    assert_eq!(
+        s.registry
+            .try_update_verifier(&s.admin, &task_id, &Some(verifier_id)),
+        Err(Ok(KeeperError::InvalidTaskStatus))
+    );
+    // Unchanged.
+    assert_eq!(s.registry.get_task(&task_id).verifier, None);
+}
+
+#[test]
+fn test_update_verifier_rejects_non_owner() {
+    let s = setup();
+    let reward = 1_000_000i128;
+    let deadline = s.env.ledger().timestamp() + 3_600;
+    let task_id = s.registry.register_task(
+        &s.admin,
+        &TaskType::Liquidation,
+        &calldata(&s.env),
+        &reward,
+        &deadline,
+        &17_280u32,
+        &120u32,
+        &None,
+    );
+
+    let stranger = Address::generate(&s.env);
+    let verifier_id = s.env.register(always_approve_verifier::AlwaysApproveVerifier, ());
+    assert_eq!(
+        s.registry
+            .try_update_verifier(&stranger, &task_id, &Some(verifier_id)),
+        Err(Ok(KeeperError::NotTaskOwner))
+    );
+}
+
+#[test]
+fn test_update_verifier_rejected_when_paused() {
+    let s = setup();
+    let reward = 1_000_000i128;
+    let deadline = s.env.ledger().timestamp() + 3_600;
+    let task_id = s.registry.register_task(
+        &s.admin,
+        &TaskType::Liquidation,
+        &calldata(&s.env),
+        &reward,
+        &deadline,
+        &17_280u32,
+        &120u32,
+        &None,
+    );
+
+    s.registry.pause(&s.admin);
+    let verifier_id = s.env.register(always_approve_verifier::AlwaysApproveVerifier, ());
+    assert_eq!(
+        s.registry
+            .try_update_verifier(&s.admin, &task_id, &Some(verifier_id)),
+        Err(Ok(KeeperError::ContractPaused))
+    );
+}
+
+#[test]
+fn test_update_verifier_emits_event() {
+    let s = setup();
+    let reward = 1_000_000i128;
+    let deadline = s.env.ledger().timestamp() + 3_600;
+    let task_id = s.registry.register_task(
+        &s.admin,
+        &TaskType::Liquidation,
+        &calldata(&s.env),
+        &reward,
+        &deadline,
+        &17_280u32,
+        &120u32,
+        &None,
+    );
+
+    let verifier_id = s.env.register(always_approve_verifier::AlwaysApproveVerifier, ());
+    let before = s.env.events().all().len();
+    s.registry
+        .update_verifier(&s.admin, &task_id, &Some(verifier_id));
+    assert!(s.env.events().all().len() > before);
 }
