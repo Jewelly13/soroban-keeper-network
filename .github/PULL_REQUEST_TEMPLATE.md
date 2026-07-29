@@ -22,6 +22,10 @@ Closes #<!-- issue number -->
 - [ ] Updated docs / CHANGELOG where relevant
 - [ ] The PR is scoped to a single concern
 - [ ] No sensitive data is included in the code, repository files, or commits
+- [ ] If this PR fixes a fuzzer-found bug, the minimized crash is committed
+      under `fuzz/corpus/<target>/regressions/` **and** a human-readable
+      regression test is added to `test.rs` (see CONTRIBUTING.md's
+      "Fuzzing & crash-to-regression convention") — otherwise N/A
 
 ## Notes for reviewers
 
