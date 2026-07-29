@@ -870,6 +870,12 @@ impl KeeperRegistry {
 
     // ── update_verifier ──────────────────────────────────────────────────────
     //
+    // Lets the owner attach, replace, or remove (`None`) a task's verifier
+    // before anyone claims it. Restricted to `Pending` only — once a keeper
+    // has claimed the task and started acting on the terms it saw at claim
+    // time, swapping in a verifier it cannot satisfy would let the owner
+    // grief that keeper's uncompensated off-chain work. See `IKeeperVerifier`
+    // for the full griefing-protection rationale.
     // Lets the owner change or clear a task's attached verifier before it's
     // claimed. Unlike `increase_reward`/`extend_deadline`, this is Pending-only
     // (not also Claimed): once a keeper has claimed a task, it has committed
