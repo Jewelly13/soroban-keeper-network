@@ -44,6 +44,7 @@
 require("dotenv").config();
 
 const {
+  Address,
   Keypair,
   SorobanRpc,
   TransactionBuilder,
@@ -140,6 +141,24 @@ async function validateAndLoadConfig() {
     validate: { fn: StrKey.isValidEd25519SecretSeed, reason: "must be a valid secret key (starts with S...)" },
   });
 
+  // Optional: a signing key for tasks whose attached verifier is (or is
+  // compatible with) the reference signature-verifier contract — see
+  // docs/VERIFIERS.md. Deliberately separate from KEEPER_SECRET_KEY: the
+  // party a verifier trusts to attest completion is not necessarily the
+  // same party running this keeper bot. Left unset, the bot still runs
+  // fine for tasks with no verifier or a verifier of a kind it doesn't
+  // know how to produce a proof for — see generateProof's fallback.
+  const signatureProofSecretKey = requireEnv("SIGNATURE_PROOF_SECRET_KEY", {
+    secret: true,
+    validate: {
+      fn: StrKey.isValidEd25519SecretSeed,
+      reason: "must be a valid secret key (starts with S...)",
+    },
+    fallback: null,
+  });
+
+  // After validating the required string values, we can create the server
+  // connection and use it to validate the contract's existence on the network.
   const { rpcUrl } = NETWORK_CONFIG[network];
   const server = new SorobanRpc.Server(rpcUrl, { allowHttp: false });
   try {
@@ -159,6 +178,7 @@ async function validateAndLoadConfig() {
     network,
     registryContractId,
     secretKey,
+    signatureProofSecretKey,
     once: process.argv.includes("--once") || process.env.RUN_ONCE === "true",
     pollIntervalMs: requireEnv("POLL_INTERVAL_MS", {
       parse: (v) => parseInt(v, 10),
@@ -366,6 +386,102 @@ async function executeTaskOffChain(task) {
   return Buffer.from(`keeper-proof:task:${task.taskId}:ts:${Date.now()}`).toString("hex");
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Verifier-aware proof generation
+//
+// A task's `verifier` field (see docs/VERIFIERS.md) determines what kind of
+// proof `execute_task` will actually accept. This bot only knows how to
+// produce proofs for the reference signature-verifier kind (see #102) —
+// extending this for other verifier kinds (oracle-based, inclusion-based)
+// is a follow-up; `generateProof` below is the extension point for that.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Builds the exact message the reference signature-verifier contract
+ * expects `proof` to be a valid ed25519 signature over: the task owner's
+ * Address XDR bytes, then calldata, then deadline and reward as big-endian
+ * bytes — byte-for-byte matching
+ * `signature_verifier::signed_message(&env, &task)` on the contract side
+ * (see contracts/verifiers/signature-verifier/src/lib.rs).
+ *
+ * `task` here is the full record from `get_task` (owner, calldata, deadline,
+ * reward as returned by `scValToNative`), not the trimmed
+ * `{taskId, reward, deadline}` shape `fetchPendingTasks` uses internally.
+ */
+function buildSignatureVerifierMessage(task) {
+  const ownerAddressBytes = new Address(task.owner).toScVal().toXDR();
+
+  const deadlineBytes = Buffer.alloc(8);
+  deadlineBytes.writeBigUInt64BE(BigInt(task.deadline));
+
+  const rewardBytes = Buffer.alloc(16);
+  // i128 as two big-endian 64-bit halves, matching Rust's `i128::to_be_bytes`.
+  const rewardBig = BigInt(task.reward);
+  rewardBytes.writeBigInt64BE(rewardBig >> 64n, 0);
+  rewardBytes.writeBigUInt64BE(rewardBig & 0xffffffffffffffffn, 8);
+
+  return Buffer.concat([
+    ownerAddressBytes,
+    Buffer.from(task.calldata),
+    deadlineBytes,
+    rewardBytes,
+  ]);
+}
+
+/**
+ * Signs `task`'s identity with `signatureProofKeypair` and returns the raw
+ * 64-byte ed25519 signature the reference signature-verifier contract's
+ * `verify` expects as `proof`. The caller is responsible for confirming the
+ * task's attached verifier is actually configured with this keypair's
+ * public key as its `signer` — this function doesn't check that (the bot
+ * has no on-chain way to distinguish "a signature verifier with a
+ * different signer" from "not a signature verifier at all" without calling
+ * the verifier contract's own `signer()` view, which is left as a
+ * follow-up rather than done unconditionally on every task).
+ */
+function signProofForTask(task, signatureProofKeypair) {
+  const message = buildSignatureVerifierMessage(task);
+  return signatureProofKeypair.sign(message);
+}
+
+/**
+ * Produces the `proof` bytes to submit with `execute_task` for `task`.
+ *
+ * If the task has no verifier attached, or this bot isn't configured with
+ * a signing key (`SIGNATURE_PROOF_SECRET_KEY`), falls back to the base MVP
+ * placeholder proof — unchanged behavior from before verifiers existed.
+ * If a signing key is configured and the task has a verifier attached, this
+ * bot assumes it's (or is compatible with) the reference signature-verifier
+ * kind, since that's currently the only kind it knows how to produce a
+ * proof for.
+ */
+async function generateProof(task, fullTask, signatureProofKeypair) {
+  if (fullTask.verifier && signatureProofKeypair) {
+    console.log(
+      `  ✍️  Task ${task.taskId} has a verifier attached — signing proof with the configured signature key.`
+    );
+    return signProofForTask(fullTask, signatureProofKeypair).toString("hex");
+  }
+  return executeTaskOffChain(task);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Main keeper loop
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function keeperLoop(
+  server,
+  keypair,
+  networkPassphrase,
+  contractId,
+  emptyRounds = 0,
+  signatureProofKeypair = null
+) {
+  // A round is successful if it runs to completion without any unhandled
+  // exceptions. An RPC error that cannot be resolved with retries, or any
+  // other unexpected error, is a failure.
+  // Note: a round that finds no tasks is a success. Losing a claim race to
+  // another keeper is also a success, as this is normal competitive behaviour.
 async function keeperLoop(server, keypair, networkPassphrase, contractId, emptyRounds = 0) {
   const summary = { processed: 0, errors: [] };
   let newEmptyRounds = emptyRounds;
@@ -490,6 +606,43 @@ async function keeperLoop(server, keypair, networkPassphrase, contractId, emptyR
         );
         console.log(`  ✅  Task ${task.taskId} claimed!`);
 
+        // Fetch the full task record (including `verifier`, which the
+        // trimmed TaskRegistered-event shape in `task` doesn't carry) so
+        // `generateProof` can decide how to produce a proof this task's
+        // verifier (if any) will actually accept. Read-only, so this goes
+        // through `readContract` (simulation only) like `keeper_balance`.
+        const fullTask = await readContract(
+          server,
+          keypair.publicKey(),
+          networkPassphrase,
+          contractId,
+          "get_task",
+          [nativeToScVal(task.taskId, { type: "u64" })]
+        );
+
+        const proof = await generateProof(
+          task,
+          fullTask,
+          signatureProofKeypair
+        );
+
+        await withRetry(`execute_task ${task.taskId}`, () =>
+          invokeContract(
+            server,
+            keypair,
+            networkPassphrase,
+            contractId,
+            "execute_task",
+            [
+              nativeToScVal(keypair.publicKey(), { type: "address" }),
+              nativeToScVal(task.taskId, { type: "u64" }),
+              nativeToScVal(Buffer.from(proof, "hex"), { type: "bytes" }),
+            ]
+          )
+        );
+        console.log(
+          `  💰  Task ${task.taskId} executed! Proof: ${proof.slice(0, 20)}...`
+        );
       try {
         console.log(`  📌  Attempting to claim task ${task.taskId} (reward: ${task.reward}, estimated cost: ${economics.estimatedCost} stroops, net reward: ${economics.netReward})...`);
         await withRetry(`claim_task ${task.taskId}`, () => invokeContract(server, keypair, networkPassphrase, contractId, "claim_task", [nativeToScVal(task.taskId, { type: "u64" })]));
@@ -524,6 +677,122 @@ async function main() {
   const network = NETWORK_CONFIG[CONFIG.network];
   const server = new SorobanRpc.Server(network.rpcUrl, { allowHttp: false });
   const keypair = Keypair.fromSecret(CONFIG.secretKey);
+  const signatureProofKeypair = CONFIG.signatureProofSecretKey
+    ? Keypair.fromSecret(CONFIG.signatureProofSecretKey)
+    : null;
+  const server = new SorobanRpc.Server(rpcUrl, { allowHttp: false });
+
+  console.log("╔══════════════════════════════════════════════════════════════╗");
+  console.log("║         Soroban Keeper Network — Keeper Bot v0.1.0          ║");
+  console.log("╚══════════════════════════════════════════════════════════════╝");
+  console.log(`  Network  : ${CONFIG.network}`);
+  console.log(`  RPC URL  : ${rpcUrl}`);
+  console.log(`  Keeper   : ${keypair.publicKey()}`);
+  console.log(`  Registry : ${CONFIG.registryContractId}`);
+  if (CONFIG.once) {
+    console.log("  Mode     : --once (single run)");
+  } else {
+    console.log(`  Poll     : every ${CONFIG.pollIntervalMs / 1000}s`);
+  }
+  console.log(`  Withdraw : when balance ≥ ${CONFIG.withdrawThreshold} stroops`);
+  console.log("");
+
+  // Verify connectivity
+  try {
+    const health = await server.getHealth();
+    console.log(`✅  RPC healthy — ledger ${health.ledger}`);
+  } catch (e) {
+    console.error(`❌  RPC unreachable at ${rpcUrl}: ${e.message}`);
+    process.exit(1);
+  }
+
+  if (CONFIG.once) {
+    const { summary } = await keeperLoop(
+      server,
+      keypair,
+      networkPassphrase,
+      CONFIG.registryContractId,
+      0,
+      signatureProofKeypair
+    );
+    const ok = summary.errors.length === 0;
+    console.log(ok ? "✅  Round complete." : "⚠️  Round completed with errors.");
+    process.exit(ok ? 0 : 1);
+  }
+
+  // Graceful shutdown for daemon mode
+  let shuttingDown = false;
+  let roundInFlight = false;
+  let emptyRounds = 0;
+  let timer = null;
+
+  function requestShutdown(signal) {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`\n🛑  ${signal} received — finishing current round then exiting...`);
+    if (timer) clearInterval(timer);
+    if (!roundInFlight) {
+      console.log("👋  Clean shutdown.");
+      process.exit(0);
+    }
+  }
+  process.on("SIGINT", () => requestShutdown("SIGINT"));
+  process.on("SIGTERM", () => requestShutdown("SIGTERM"));
+
+  async function runDaemonRound() {
+    if (shuttingDown || roundInFlight) return;
+    roundInFlight = true;
+    try {
+      const { summary, emptyRounds: newEmptyRounds } = await keeperLoop(
+        server,
+        keypair,
+        networkPassphrase,
+        CONFIG.registryContractId,
+        emptyRounds,
+        signatureProofKeypair
+      );
+      emptyRounds = newEmptyRounds;
+      if (summary.errors.length > 0) {
+        console.error(
+          `❌  Keeper round finished with ${summary.errors.length} error(s)`
+        );
+      }
+    } catch (err) {
+      // This is for truly unexpected errors in the loop itself
+      console.error("❌  Fatal keeper loop error:", err.message);
+    } finally {
+      roundInFlight = false;
+      if (shuttingDown) {
+        console.log("👋  Clean shutdown.");
+        process.exit(0);
+      }
+    }
+  }
+
+  // Run initial round immediately, then poll.
+  await runDaemonRound();
+  timer = setInterval(runDaemonRound, CONFIG.pollIntervalMs);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Module exports for testing
+// ─────────────────────────────────────────────────────────────────────────────
+
+module.exports = {
+  isPermanentError,
+  withRetry,
+  fetchPendingTasks,
+  validateAndLoadConfig,
+  keeperLoop,
+  sleep,
+  buildSignatureVerifierMessage,
+  signProofForTask,
+  generateProof,
+};
   let emptyRounds = 0;
   do {
     const result = await keeperLoop(server, keypair, network.networkPassphrase, CONFIG.registryContractId, emptyRounds);

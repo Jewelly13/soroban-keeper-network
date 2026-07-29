@@ -17,6 +17,7 @@
 | [Deployments](DEPLOYMENTS.md) | Canonical record of on-chain addresses |
 | [Security policy](SECURITY.md) | How to report a vulnerability |
 | [Live demo](docs/DEMO.md) | Deployed testnet contract + full on-chain transaction trace |
+| [Verifier integration guide](docs/VERIFIERS.md) | When to attach a verifier, using the reference verifiers, writing your own |
 | [Architecture](docs/ARCHITECTURE.md) | Components, task lifecycle, storage, money invariants, trust model |
 | [Fuzzing & property testing](docs/FUZZING.md) | Running/adding fuzz targets, the shared invariant module, crash-to-regression convention |
 | [Verifier design (E04)](docs/VERIFIER_DESIGN.md) | Proposed `IKeeperVerifier` interface for optional on-chain proof verification |
