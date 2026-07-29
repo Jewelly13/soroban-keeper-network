@@ -245,6 +245,7 @@ A **shared, permissionless, on-chain coordination layer** where:
 - `update_verifier` MUST only be callable by the task owner.
 - MUST only be callable when task is in `Pending` state — once claimed, a
   keeper has begun acting on the terms it saw at claim time; see
+  `IKeeperVerifier`'s doc comment for the griefing-protection rationale.
   `update_verifier`'s doc comment in
   `contracts/keeper-registry/src/lib.rs` for the bait-and-switch rationale.
 - MUST emit `VerifierUpdated`.
@@ -449,6 +450,8 @@ retry with a different proof. A task with no verifier behaves exactly as
 before this feature existed — this is a strictly opt-in, additive path.
 
 See `IKeeperVerifier`'s doc comment in `contracts/keeper-registry/src/lib.rs`
+for the trust model and the documented failure semantics of a verifier that
+panics rather than returning `false`.
 for the trust model and cross-contract panic-isolation semantics.
 
 ---
