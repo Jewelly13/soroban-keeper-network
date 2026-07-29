@@ -6,16 +6,16 @@
 [![CI](https://github.com/soroban-tooling/soroban-keeper-network/actions/workflows/ci.yml/badge.svg)](https://github.com/soroban-tooling/soroban-keeper-network/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Built on Soroban](https://img.shields.io/badge/built%20on-Soroban-blueviolet)](https://soroban.stellar.org)
-[![Live on Testnet](https://img.shields.io/badge/testnet-live-brightgreen.svg)](https://stellar.expert/explorer/testnet/contract/CDJOYHBS7C2PVJS47BTRDLGBNG2YOE43VX6Y3EWIZPPPKOPRNYQQ54U4)
-
-> **🟢 Live on Stellar testnet:** [`CDJOYHBS7C2PVJS47BTRDLGBNG2YOE43VX6Y3EWIZPPPKOPRNYQQ54U4`](https://stellar.expert/explorer/testnet/contract/CDJOYHBS7C2PVJS47BTRDLGBNG2YOE43VX6Y3EWIZPPPKOPRNYQQ54U4) — a full register → claim → execute → withdraw run is traced on-chain in [docs/DEMO.md](docs/DEMO.md).
-
----
 
 ## Documentation
 
 | Doc | What's inside |
 |-----|---------------|
+| [Live demo](docs/DEMO.md) | Deployed testnet contract and full on-chain transaction trace |
+| [Architecture](docs/ARCHITECTURE.md) | Components, task lifecycle, storage, money invariants, and trust model |
+| [Deploying & running](docs/DEPLOYING.md) | Testnet deployment walkthrough and keeper-bot operator guide |
+| [Deployments](DEPLOYMENTS.md) | Canonical record of on-chain addresses |
+| [Security policy](SECURITY.md) | How to report a vulnerability |
 | [Live demo](docs/DEMO.md) | Deployed testnet contract + full on-chain transaction trace |
 | [Architecture](docs/ARCHITECTURE.md) | Components, task lifecycle, storage, money invariants, trust model |
 | [Fuzzing & property testing](docs/FUZZING.md) | Running/adding fuzz targets, the shared invariant module, crash-to-regression convention |
@@ -306,32 +306,19 @@ A **shared, permissionless, on-chain coordination layer** where:
 - No unbounded iteration — no `Vec<task_id>` scanned in O(n); queries are by key.
 - Events are the query primitive for off-chain indexers.
 
-#### Scalability
-- Task IDs are u64 — supports 18 quintillion tasks.
-- Reward balance is aggregated per keeper — single persistent entry regardless of tasks executed.
-- Storage TTL managed per entry; expired tasks are naturally evicted by the ledger.
+## What it does
 
-#### Liveness
-- Tasks with expired lock periods are always re-claimable.
-- `expire_task` is permissionless — anyone can trigger it to unblock a stuck task.
-- Contract pause does not affect reward withdrawal (keepers can always pull earned funds).
+Task owners register jobs with a token reward and execution conditions. Keepers discover eligible jobs, claim them, perform the off-chain work, and submit the execution transaction. Successful execution credits the keeper with the reward after the protocol fee; cancellation and expiry return escrow to the owner.
 
----
+The repository contains the Soroban registry contract and an example JavaScript keeper bot.
 
-### Technical Specifications
+## Security considerations
 
-#### Storage Model
+The contract's security is defined by the money invariants in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#money-invariants). That section is the canonical specification for solvency, escrow recoverability, single payout, fee bounding, escrow isolation, withdrawal liveness, and monotonic task ids. It also identifies the contract functions that enforce each property, concrete changes that would break them, and known gaps tracked in the issue backlog.
 
-| Key | Type | Storage | TTL | Default when unset |
-|-----|------|---------|-----|---------------------|
-| `Admin` | `Address` | Instance | Instance lifetime | — |
-| `FeeBps` | `u32` | Instance | Instance lifetime | `0` (see `DEFAULT_FEE_BPS`) |
-| `Paused` | `bool` | Instance | Instance lifetime | `false` |
-| `TaskCounter` | `u64` | Instance | Instance lifetime | `0` |
-| `RewardToken` | `Address` | Instance | Instance lifetime | — |
-| `Task(u64)` | `Task` struct | Persistent | `task.ttl_ledgers` | — |
-| `KeeperReward(Address)` | `i128` | Persistent | ~1 year (6.3M ledgers) | `0` |
+Implementation mechanisms such as authorization, checked arithmetic, status guards, and checks-effects-interactions are means of preserving those properties; they are not a substitute for reviewing the properties themselves. Any change involving token transfers, task terminal states, fee accounting, pausing, storage TTL, or task-id allocation must be checked against the architecture invariants.
 
+Known open issues include the relationship between task TTL and deadline ([#0005](https://github.com/soroban-tooling/soroban-keeper-network/issues/5)) and the historical CEI ordering concerns in cancellation and expiry ([#0002](https://github.com/soroban-tooling/soroban-keeper-network/issues/2), [#0003](https://github.com/soroban-tooling/soroban-keeper-network/issues/3)).
 `Task.deadline` is a unix timestamp **in seconds**; `Task.ttl_ledgers` is a
 Persistent storage TTL **in ledgers** — the two are different units with no
 fixed conversion. `register_task` and `extend_deadline` require
@@ -353,10 +340,18 @@ with headroom for XDR/Vec overhead. Empty `calldata` is accepted, since some
 task types (e.g. a `TtlExtension` against a well-known key) need no extra
 encoded parameters.
 
-#### Events
+Report suspected vulnerabilities according to [SECURITY.md](SECURITY.md), rather than opening a public issue with exploit details.
 
-All events use two-topic format `(verb_symbol, noun_symbol)` for efficient filtering.
+## Repository layout
 
+```text
+contracts/keeper-registry/  Soroban keeper registry contract
+examples/keeper-bot/         Example keeper bot
+a fuzz/                        Fuzzing targets and shared support code
+docs/                        Architecture, deployment, and demo documentation
+```
+
+## Development
 | Event | Topics | Data |
 |-------|--------|------|
 | `TaskRegistered` | `("reg", "task")` | `(task_id, owner, reward, deadline)` |
@@ -482,18 +477,22 @@ for the trust model and cross-contract panic-isolation semantics.
 
 ### Prerequisites
 
-```bash
-# Rust + WASM target
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-rustup target add wasm32-unknown-unknown
+- Rust stable (1.78 or newer)
+- `wasm32-unknown-unknown` Rust target
+- Soroban/Stellar CLI 22.x or newer
+- Node.js 18 LTS or newer for the example bot
 
-# Soroban CLI
-cargo install --locked stellar-cli --features opt
+### Common commands
 
-# Node.js ≥ 18 (for keeper bot)
-node --version
+```sh
+make build       # Build the workspace
+make test        # Run the contract test suite
+make fmt-check   # Check formatting
+make wasm        # Build the release WASM contract
+make ci          # Run the required CI checks locally
 ```
 
+The contract can also be tested directly with `cargo test --workspace --locked`.
 ### Local Development
 
 ```bash
@@ -583,10 +582,8 @@ This project is designed to qualify for:
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the full guide including branch strategy, commit conventions, and PR process.
-
----
+Please read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. In particular, changes that move funds or alter task lifecycle behavior must be reviewed against the numbered invariants in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#money-invariants), and tests should name the invariant they protect.
 
 ## License
 
-[Apache-2.0](LICENSE) — see the LICENSE file for full terms.
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for the full text.
