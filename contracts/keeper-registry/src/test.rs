@@ -87,6 +87,7 @@ fn register_reward_task(s: &Setup, reward: i128) -> u64 {
         &deadline,
         &20_000u32,
         &120u32,
+        &None,
     )
 }
 
@@ -192,7 +193,7 @@ fn test_split_reward_invariants() {
 #[test]
 fn test_version_is_exposed() {
     let s = setup();
-    assert_eq!(s.registry.version(), 2u32);
+    assert_eq!(s.registry.version(), 3u32);
 }
 
 #[test]
@@ -281,6 +282,7 @@ fn test_register_task_success() {
         &deadline,
         &20_000u32,
         &120u32,
+        &None,
     );
 
     assert_eq!(task_id, 1u64);
@@ -321,6 +323,7 @@ fn test_register_task_escrows_reward() {
         &(env.ledger().timestamp() + 3_600),
         &20_000u32,
         &120u32,
+        &None,
     );
 
     // Owner balance decreased by the escrowed reward.
@@ -351,6 +354,7 @@ fn test_register_task_zero_reward_fails() {
             &(env.ledger().timestamp() + 3_600),
             &20_000u32,
             &120u32,
+            &None,
         ),
         Err(Ok(KeeperError::InvalidReward))
     );
@@ -380,6 +384,7 @@ fn test_register_task_past_deadline_fails() {
             &past,
             &20_000u32,
             &120u32,
+            &None,
         ),
         Err(Ok(KeeperError::DeadlinePassed))
     );
@@ -410,6 +415,7 @@ fn test_register_increments_task_counter() {
             &deadline,
             &20_000u32,
             &60u32,
+            &None,
         );
         assert_eq!(id, expected_id);
     }
@@ -476,6 +482,7 @@ fn test_register_task_with_max_calldata_succeeds() {
         &(env.ledger().timestamp() + 3_600),
         &20_000u32,
         &120u32,
+        &None,
     );
     assert_eq!(registry.get_task(&id).calldata.len(), MAX_CALLDATA_LEN);
 }
@@ -504,6 +511,7 @@ fn test_register_task_over_max_calldata_fails() {
             &(env.ledger().timestamp() + 3_600),
             &17_280u32,
             &120u32,
+            &None,
         ),
         Err(Ok(KeeperError::CalldataTooLarge))
     );
@@ -595,6 +603,7 @@ fn test_register_task_with_empty_calldata_succeeds() {
         &(env.ledger().timestamp() + 3_600),
         &20_000u32,
         &120u32,
+        &None,
     );
     assert_eq!(registry.get_task(&id).calldata.len(), 0);
 }
@@ -612,6 +621,7 @@ fn test_register_task_lock_ledgers_below_min_fails() {
             &deadline,
             &17_280u32,
             &(MIN_LOCK_LEDGERS - 1),
+            &None,
         ),
         Err(Ok(KeeperError::InvalidTaskParams))
     );
@@ -629,6 +639,7 @@ fn test_register_task_lock_ledgers_at_min_succeeds() {
         &deadline,
         &17_280u32,
         &MIN_LOCK_LEDGERS,
+        &None,
     );
     assert_eq!(s.registry.get_task(&task_id).lock_ledgers, MIN_LOCK_LEDGERS);
 }
@@ -646,6 +657,7 @@ fn test_register_task_lock_ledgers_above_max_fails() {
             &deadline,
             &17_280u32,
             &(MAX_LOCK_LEDGERS + 1),
+            &None,
         ),
         Err(Ok(KeeperError::InvalidTaskParams))
     );
@@ -663,6 +675,7 @@ fn test_register_task_lock_ledgers_at_max_succeeds() {
         &deadline,
         &17_280u32,
         &MAX_LOCK_LEDGERS,
+        &None,
     );
     assert_eq!(s.registry.get_task(&task_id).lock_ledgers, MAX_LOCK_LEDGERS);
 }
@@ -680,6 +693,7 @@ fn test_register_task_ttl_ledgers_below_min_fails() {
             &deadline,
             &(MIN_TTL_LEDGERS - 1),
             &120u32,
+            &None,
         ),
         Err(Ok(KeeperError::InvalidTaskParams))
     );
@@ -697,6 +711,7 @@ fn test_register_task_ttl_ledgers_at_min_succeeds() {
         &deadline,
         &MIN_TTL_LEDGERS,
         &120u32,
+        &None,
     );
     assert_eq!(s.registry.get_task(&task_id).ttl_ledgers, MIN_TTL_LEDGERS);
 }
@@ -838,6 +853,7 @@ fn claim_with_lock(s: &Setup, keeper: &Address, lock_ledgers: u32) -> (u64, u32)
         &deadline,
         &20_000u32,
         &lock_ledgers,
+        &None,
     );
     s.registry.claim_task(keeper, &id);
     let claim_ledger = s.registry.get_task(&id).claim_ledger.unwrap();
@@ -914,6 +930,7 @@ fn test_lock_window_extending_past_deadline_is_blocked_by_deadline_first() {
         &deadline,
         &20_000u32,
         &1_000u32,
+        &None,
     );
     s.registry.claim_task(&first, &id);
 
@@ -1365,6 +1382,7 @@ fn test_expire_task_reentrancy_pays_refund_exactly_once() {
         &deadline,
         &20_000u32,
         &120u32,
+        &None,
     );
     assert_eq!(token.balance(&admin), 4_000_000i128); // escrowed
     assert_eq!(token.balance(&registry_id), 1_000_000i128);
@@ -1721,6 +1739,7 @@ fn test_pause_blocks_registration_but_allows_withdraw() {
             &(s.env.ledger().timestamp() + 3_600),
             &20_000u32,
             &60u32,
+            &None,
         ),
         Err(Ok(KeeperError::ContractPaused))
     );
@@ -1805,6 +1824,7 @@ fn test_pause_policy_matrix_entry_point_by_entry_point() {
         &(s.env.ledger().timestamp() + 100),
         &17_280u32,
         &120u32,
+        &None,
     );
 
     let claimed_keeper = Address::generate(&s.env);
@@ -1829,6 +1849,7 @@ fn test_pause_policy_matrix_entry_point_by_entry_point() {
             &(s.env.ledger().timestamp() + 3_600),
             &17_280u32,
             &60u32,
+            &None,
         ),
         Err(Ok(KeeperError::ContractPaused))
     );
@@ -1994,6 +2015,7 @@ fn test_set_min_reward_rejects_below_floor() {
             &(s.env.ledger().timestamp() + 3_600),
             &20_000u32,
             &60u32,
+            &None,
         ),
         Err(Ok(KeeperError::InvalidReward))
     );
@@ -2006,6 +2028,7 @@ fn test_set_min_reward_rejects_below_floor() {
         &(s.env.ledger().timestamp() + 3_600),
         &20_000u32,
         &60u32,
+        &None,
     );
     assert_eq!(id, 1u64);
 }
@@ -2415,6 +2438,7 @@ fn test_cancel_task_rejects_reentrant_refund() {
         &deadline,
         &17_280u32,
         &120u32,
+        &None,
     );
 
     // Escrow landed on the registry, owner is down the reward.
@@ -2473,6 +2497,7 @@ fn test_register_task_before_init_fails() {
             &(env.ledger().timestamp() + 3_600),
             &17_280u32,
             &120u32,
+            &None,
         ),
         Err(Ok(KeeperError::NotInitialized))
     );
@@ -3143,4 +3168,312 @@ proptest! {
         assert_task_ids_monotonic(&ids)
             .expect("I-7: task ids must be strictly increasing and never reused");
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Verifier mocks (#98/#99/#106) — minimal, test-only contracts following the
+// established `mod reentrant_token { ... }` local-mock-contract pattern.
+// ─────────────────────────────────────────────────────────────────────────────
+
+mod always_approve_verifier {
+    use soroban_sdk::{contract, contractimpl, Address, Bytes, Env};
+
+    #[contract]
+    pub struct AlwaysApproveVerifier;
+
+    #[contractimpl]
+    impl AlwaysApproveVerifier {
+        pub fn verify(_env: Env, _task: crate::Task, _keeper: Address, _proof: Bytes) -> bool {
+            true
+        }
+    }
+}
+
+mod always_reject_verifier {
+    use soroban_sdk::{contract, contractimpl, Address, Bytes, Env};
+
+    #[contract]
+    pub struct AlwaysRejectVerifier;
+
+    #[contractimpl]
+    impl AlwaysRejectVerifier {
+        pub fn verify(_env: Env, _task: crate::Task, _keeper: Address, _proof: Bytes) -> bool {
+            false
+        }
+    }
+}
+
+fn register_task_with_verifier(s: &Setup, reward: i128, verifier: &Address) -> u64 {
+    let deadline = s.env.ledger().timestamp() + 3_600;
+    s.registry.register_task(
+        &s.admin,
+        &TaskType::Liquidation,
+        &calldata(&s.env),
+        &reward,
+        &deadline,
+        &17_280u32,
+        &120u32,
+        &Some(verifier.clone()),
+    )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #99 — execute_task with a verifier attached
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_execute_task_with_always_approve_verifier_matches_no_verifier_outcome() {
+    let s = setup();
+    let verifier_id = s.env.register(always_approve_verifier::AlwaysApproveVerifier, ());
+    let reward = 1_000_000i128;
+    let task_id = register_task_with_verifier(&s, reward, &verifier_id);
+
+    let keeper = Address::generate(&s.env);
+    s.registry.claim_task(&keeper, &task_id);
+
+    let proof = Bytes::from_slice(&s.env, b"proof-bytes");
+    s.registry.execute_task(&keeper, &task_id, &proof);
+
+    // Check events immediately after the call that emits them: each
+    // top-level client call is its own host invocation, and
+    // `s.env.events().all()` only reflects the most recent one — any
+    // further contract calls (even read-only ones like `get_task`) start a
+    // new invocation and the previous one's events are no longer visible.
+    let all_events = s.env.events().all();
+    let verfail_topic: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("verfail"), symbol_short!("task")).into_val(&s.env);
+    let verfail_fired = all_events.iter().any(|(contract, topics, _)| {
+        contract == s.registry.address && topics == verfail_topic
+    });
+    assert!(
+        !verfail_fired,
+        "TaskVerificationFailed must not fire when the verifier approves"
+    );
+
+    let exec_topic: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("exec"), symbol_short!("task")).into_val(&s.env);
+    let exec_fired = all_events.iter().any(|(contract, topics, _)| {
+        contract == s.registry.address && topics == exec_topic
+    });
+    assert!(exec_fired, "TaskExecuted must still fire");
+
+    // Same outcome as the no-verifier path: full net reward credited, fee
+    // accrued, task Executed.
+    let (expected_net, expected_fee) = split_reward(reward, 300u32);
+    assert_eq!(s.registry.keeper_balance(&keeper), expected_net);
+    assert_eq!(s.registry.fees_accrued(), expected_fee);
+
+    let task = s.registry.get_task(&task_id);
+    assert_eq!(task.status, TaskStatus::Executed);
+}
+
+#[test]
+fn test_execute_task_with_always_reject_verifier() {
+    let s = setup();
+    let verifier_id = s.env.register(always_reject_verifier::AlwaysRejectVerifier, ());
+    let reward = 1_000_000i128;
+    let task_id = register_task_with_verifier(&s, reward, &verifier_id);
+
+    let keeper = Address::generate(&s.env);
+    s.registry.claim_task(&keeper, &task_id);
+
+    let proof = Bytes::from_slice(&s.env, b"first-attempt-proof");
+    let result = s.registry.try_execute_task(&keeper, &task_id, &proof);
+    assert_eq!(result, Err(Ok(KeeperError::VerificationFailed)));
+
+    // Note: we don't assert TaskVerificationFailed's presence in
+    // `s.env.events().all()` here. Soroban's host rolls back a whole call
+    // frame — events included — whenever that frame's top-level function
+    // returns `Err` (see `with_frame`/`call_n_internal` in
+    // soroban-env-host), even though the error itself is "recoverable" from
+    // the caller's perspective via `try_`. So an event published right
+    // before an `Err` return is never observable by any caller, in any
+    // Soroban contract; `emit_verification_failed`'s call site in
+    // `execute_task` can't be exercised by a test that also checks the
+    // `Err` result. What we *can* and do verify below is the actually
+    // observable contract: the typed error, and that state didn't change.
+
+    // Task remains Claimed — not Executed, not reverted to Pending.
+    let task = s.registry.get_task(&task_id);
+    assert_eq!(task.status, TaskStatus::Claimed);
+    assert_eq!(task.claimer, Some(keeper.clone()));
+
+    // No token transfer / keeper crediting occurred.
+    assert_eq!(s.registry.keeper_balance(&keeper), 0i128);
+    assert_eq!(s.registry.fees_accrued(), 0i128);
+
+    // A second execute_task call (different proof bytes, same always-reject
+    // verifier) fails the same way — the rejection is repeatable, not a
+    // one-shot state change.
+    let proof2 = Bytes::from_slice(&s.env, b"second-attempt-different-proof");
+    let result2 = s.registry.try_execute_task(&keeper, &task_id, &proof2);
+    assert_eq!(result2, Err(Ok(KeeperError::VerificationFailed)));
+
+    let task_after_retry = s.registry.get_task(&task_id);
+    assert_eq!(task_after_retry.status, TaskStatus::Claimed);
+    assert_eq!(task_after_retry.claimer, Some(keeper));
+}
+
+#[test]
+fn test_execute_task_none_verifier_path_unchanged() {
+    // The base MVP path (no verifier attached) must behave identically to
+    // before this feature existed — required explicitly by #99's acceptance
+    // criteria, on top of the fact that all 100 pre-existing tests already
+    // pass unmodified.
+    let s = setup();
+    let reward = 1_000_000i128;
+    let deadline = s.env.ledger().timestamp() + 3_600;
+    let task_id = s.registry.register_task(
+        &s.admin,
+        &TaskType::Liquidation,
+        &calldata(&s.env),
+        &reward,
+        &deadline,
+        &17_280u32,
+        &120u32,
+        &None,
+    );
+    let keeper = Address::generate(&s.env);
+    s.registry.claim_task(&keeper, &task_id);
+
+    let proof = Bytes::from_slice(&s.env, b"proof-bytes");
+    s.registry.execute_task(&keeper, &task_id, &proof);
+
+    let (expected_net, expected_fee) = split_reward(reward, 300u32);
+    assert_eq!(s.registry.keeper_balance(&keeper), expected_net);
+    assert_eq!(s.registry.fees_accrued(), expected_fee);
+    assert_eq!(s.registry.get_task(&task_id).status, TaskStatus::Executed);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #106 — update_verifier
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_update_verifier_succeeds_while_pending() {
+    let s = setup();
+    let reward = 1_000_000i128;
+    let deadline = s.env.ledger().timestamp() + 3_600;
+    let task_id = s.registry.register_task(
+        &s.admin,
+        &TaskType::Liquidation,
+        &calldata(&s.env),
+        &reward,
+        &deadline,
+        &17_280u32,
+        &120u32,
+        &None,
+    );
+
+    let verifier_id = s.env.register(always_approve_verifier::AlwaysApproveVerifier, ());
+    s.registry
+        .update_verifier(&s.admin, &task_id, &Some(verifier_id.clone()));
+
+    let task = s.registry.get_task(&task_id);
+    assert_eq!(task.verifier, Some(verifier_id));
+
+    // Clearing it back to None also works while still Pending.
+    s.registry.update_verifier(&s.admin, &task_id, &None);
+    assert_eq!(s.registry.get_task(&task_id).verifier, None);
+}
+
+#[test]
+fn test_update_verifier_rejected_once_task_is_claimed() {
+    let s = setup();
+    let reward = 1_000_000i128;
+    let deadline = s.env.ledger().timestamp() + 3_600;
+    let task_id = s.registry.register_task(
+        &s.admin,
+        &TaskType::Liquidation,
+        &calldata(&s.env),
+        &reward,
+        &deadline,
+        &17_280u32,
+        &120u32,
+        &None,
+    );
+    let keeper = Address::generate(&s.env);
+    s.registry.claim_task(&keeper, &task_id);
+
+    let verifier_id = s.env.register(always_approve_verifier::AlwaysApproveVerifier, ());
+    assert_eq!(
+        s.registry
+            .try_update_verifier(&s.admin, &task_id, &Some(verifier_id)),
+        Err(Ok(KeeperError::InvalidTaskStatus))
+    );
+    // Unchanged.
+    assert_eq!(s.registry.get_task(&task_id).verifier, None);
+}
+
+#[test]
+fn test_update_verifier_rejects_non_owner() {
+    let s = setup();
+    let reward = 1_000_000i128;
+    let deadline = s.env.ledger().timestamp() + 3_600;
+    let task_id = s.registry.register_task(
+        &s.admin,
+        &TaskType::Liquidation,
+        &calldata(&s.env),
+        &reward,
+        &deadline,
+        &17_280u32,
+        &120u32,
+        &None,
+    );
+
+    let stranger = Address::generate(&s.env);
+    let verifier_id = s.env.register(always_approve_verifier::AlwaysApproveVerifier, ());
+    assert_eq!(
+        s.registry
+            .try_update_verifier(&stranger, &task_id, &Some(verifier_id)),
+        Err(Ok(KeeperError::NotTaskOwner))
+    );
+}
+
+#[test]
+fn test_update_verifier_rejected_when_paused() {
+    let s = setup();
+    let reward = 1_000_000i128;
+    let deadline = s.env.ledger().timestamp() + 3_600;
+    let task_id = s.registry.register_task(
+        &s.admin,
+        &TaskType::Liquidation,
+        &calldata(&s.env),
+        &reward,
+        &deadline,
+        &17_280u32,
+        &120u32,
+        &None,
+    );
+
+    s.registry.pause(&s.admin);
+    let verifier_id = s.env.register(always_approve_verifier::AlwaysApproveVerifier, ());
+    assert_eq!(
+        s.registry
+            .try_update_verifier(&s.admin, &task_id, &Some(verifier_id)),
+        Err(Ok(KeeperError::ContractPaused))
+    );
+}
+
+#[test]
+fn test_update_verifier_emits_event() {
+    let s = setup();
+    let reward = 1_000_000i128;
+    let deadline = s.env.ledger().timestamp() + 3_600;
+    let task_id = s.registry.register_task(
+        &s.admin,
+        &TaskType::Liquidation,
+        &calldata(&s.env),
+        &reward,
+        &deadline,
+        &17_280u32,
+        &120u32,
+        &None,
+    );
+
+    let verifier_id = s.env.register(always_approve_verifier::AlwaysApproveVerifier, ());
+    let before = s.env.events().all().len();
+    s.registry
+        .update_verifier(&s.admin, &task_id, &Some(verifier_id));
+    assert!(s.env.events().all().len() > before);
 }
