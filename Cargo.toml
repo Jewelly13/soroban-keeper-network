@@ -4,6 +4,7 @@ members = [
     "contracts/keeper-registry",
     "contracts/verifiers/signature-verifier",
     "contracts/verifiers/inclusion-verifier",
+    "contracts/verifiers/oracle-verifier",
 ]
 
 [workspace.dependencies]
