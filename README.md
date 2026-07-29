@@ -18,6 +18,8 @@
 |-----|---------------|
 | [Live demo](docs/DEMO.md) | Deployed testnet contract + full on-chain transaction trace |
 | [Architecture](docs/ARCHITECTURE.md) | Components, task lifecycle, storage, money invariants, trust model |
+| [Fuzzing & property testing](docs/FUZZING.md) | Running/adding fuzz targets, the shared invariant module, crash-to-regression convention |
+| [Verifier design (E04)](docs/VERIFIER_DESIGN.md) | Proposed `IKeeperVerifier` interface for optional on-chain proof verification |
 | [Deploying & running](docs/DEPLOYING.md) | Testnet deploy walkthrough and keeper-bot operator guide |
 | [Deployments](DEPLOYMENTS.md) | Canonical record of on-chain addresses |
 | [Contributing](CONTRIBUTING.md) | How to pick up an issue and open your first PR |
@@ -211,6 +213,9 @@ A **shared, permissionless, on-chain coordination layer** where:
 - `register_task` MUST escrow the full reward amount from the caller.
 - Task ID MUST be monotonically increasing and globally unique.
 - `deadline` MUST be strictly in the future at registration time.
+- `ttl_ledgers` MUST cover `deadline` plus a safety margin (rejected with
+  `TtlTooShort` otherwise) so the storage entry cannot expire before the
+  escrow it guards is resolved.
 - `calldata` MUST NOT exceed `MAX_CALLDATA_LEN` (1024 bytes), rejected with
   `CalldataTooLarge` otherwise. Empty `calldata` is accepted.
 - `reward` MUST be greater than zero.
@@ -227,10 +232,23 @@ A **shared, permissionless, on-chain coordination layer** where:
 #### FR-3: Task Execution
 - `execute_task` MUST only be callable by the current `claimer`.
 - MUST reject if task deadline has passed.
+- If the task has a `verifier` attached, MUST call `verifier.verify(task,
+  keeper, proof)` and reject with `VerificationFailed` (emitting
+  `TaskVerificationFailed`) without crediting, transferring, or mutating
+  task status if it returns `false`. A task with no verifier is unaffected.
 - MUST credit `(reward * (10000 - fee_bps) / 10000)` to the keeper's balance.
 - Protocol fee MUST remain in the contract (swept separately by admin).
 - MUST emit `TaskExecuted` with net reward and proof bytes.
 - Task status MUST transition to `Executed` (immutable after this point).
+
+#### FR-3a: Verifier Update
+- `update_verifier` MUST only be callable by the task owner.
+- MUST only be callable when task is in `Pending` state — once claimed, a
+  keeper has begun acting on the terms it saw at claim time; see
+  `IKeeperVerifier`'s doc comment for the griefing-protection rationale.
+  `update_verifier`'s doc comment in
+  `contracts/keeper-registry/src/lib.rs` for the bait-and-switch rationale.
+- MUST emit `VerifierUpdated`.
 
 #### FR-4: Task Cancellation
 - `cancel_task` MUST only be callable by the task owner.
@@ -252,7 +270,8 @@ A **shared, permissionless, on-chain coordination layer** where:
 
 #### FR-7: Admin Controls
 - `pause`/`unpause` MUST gate `register_task`, `claim_task`, `execute_task`,
-  and `increase_reward` — all four open new escrow or reward exposure.
+  `increase_reward`, and `update_verifier` — all five open new escrow,
+  reward, or task-outcome exposure.
 - `pause`/`unpause` MUST NOT gate `cancel_task`, `expire_task`, or
   `withdraw_rewards` — these only let already-escrowed value flow back to
   whoever already owns it, which must always stay available so an admin
@@ -313,6 +332,14 @@ A **shared, permissionless, on-chain coordination layer** where:
 | `Task(u64)` | `Task` struct | Persistent | `task.ttl_ledgers` | — |
 | `KeeperReward(Address)` | `i128` | Persistent | ~1 year (6.3M ledgers) | `0` |
 
+`Task.deadline` is a unix timestamp **in seconds**; `Task.ttl_ledgers` is a
+Persistent storage TTL **in ledgers** — the two are different units with no
+fixed conversion. `register_task` and `extend_deadline` require
+`ttl_ledgers >= (deadline - now) / SECONDS_PER_LEDGER + TTL_SAFETY_MARGIN_LEDGERS`
+(5 seconds/ledger, ~1 day margin), rejecting the call with `TtlTooShort`
+otherwise. This guarantees a task's storage entry can never be evicted while
+its escrowed reward is still held — see
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#ttl--deadline-invariant).
 `Task.calldata` is capped at `MAX_CALLDATA_LEN` = 1024 bytes, enforced at
 `register_task`. `save_task` re-writes the whole `Task` struct (including
 `calldata`) on every lifecycle mutation — `claim_task`, `execute_task`, the
@@ -338,6 +365,11 @@ All events use two-topic format `(verb_symbol, noun_symbol)` for efficient filte
 | `TaskExpired` | `("exp", "task")` | `(task_id,)` |
 | `TaskCancelled` | `("cancel", "task")` | `(task_id, owner)` |
 | `RewardsWithdrawn` | `("withdraw", "reward")` | `(keeper, amount)` |
+| `TaskVerificationFailed` | `("verfail", "task")` | `(task_id, keeper)` |
+| `VerifierUpdated` | `("verifier", "task")` | `(task_id, verifier)` |
+| `Initialized` | `("init", "admin")` | `(admin, reward_token, fee_bps)` — emitted at most once |
+| `MinRewardUpdated` | `("minrwd", "admin")` | `(old_min, new_min)` |
+| `FeesSweep` | `("sweep", "admin")` | `(treasury, amount, remaining)` |
 
 #### Task Lifecycle State Machine
 
@@ -386,20 +418,41 @@ let task_id = registry.register_task(
     &TaskType::Liquidation,
     &calldata,                        // encoded liquidation params
     &reward_amount,                   // XLM in stroops
-    &(env.ledger().timestamp() + 3600), // deadline: 1 hour from now
-    &17_280u32,                       // TTL: ~1 day
+    &(env.ledger().timestamp() + 3600), // deadline: 1 hour from now (seconds)
+    &18_000u32,                       // TTL: ledgers, must cover the deadline
+                                       // plus a ~1-day safety margin — see
+                                       // "Storage Model" above — or this call
+                                       // fails with TtlTooShort
     &120u32,                          // lock: ~10 minutes
+    &None,                            // verifier: None = trust the proof (see below)
 );
 ```
 
-**Step 3 — React to execution** (optional Phase 2 — verifier interface):
+**Step 3 — Optional on-chain proof verification**:
+
+A task owner may attach a verifier contract — any address implementing
+`IKeeperVerifier` — either at registration (above) or afterward via
+`update_verifier` while the task is still `Pending`:
 
 ```rust
-// Your contract implements this trait (Phase 2 only)
-pub trait IKeeperVerifiable {
-    fn verify_execution(env: Env, task_id: u64, proof: Bytes) -> bool;
+pub trait IKeeperVerifier {
+    /// Returns true if `proof` is a valid attestation that `keeper`
+    /// performed the off-chain action `task` describes.
+    fn verify(env: Env, task: Task, keeper: Address, proof: Bytes) -> bool;
 }
 ```
+
+When a task has a verifier attached, `execute_task` calls it before
+crediting the keeper's reward. A `false` result rejects the call with
+`VerificationFailed` (and fires a `TaskVerificationFailed` event) without
+transferring anything or changing the task's status, so the keeper may
+retry with a different proof. A task with no verifier behaves exactly as
+before this feature existed — this is a strictly opt-in, additive path.
+
+See `IKeeperVerifier`'s doc comment in `contracts/keeper-registry/src/lib.rs`
+for the trust model and the documented failure semantics of a verifier that
+panics rather than returning `false`.
+for the trust model and cross-contract panic-isolation semantics.
 
 ---
 
@@ -484,17 +537,19 @@ npm run start:testnet
 
 ### Known Design Decisions
 
-1. **No on-chain execution verification (MVP)** — The registry trusts the claimer to submit proof. A malicious keeper could claim-and-execute-fake. Phase 2 adds an optional verifier callback.
+1. **On-chain execution verification is optional** — By default (`verifier: None`) the registry trusts the claimer to submit proof, same as the original MVP. A task owner can attach an `IKeeperVerifier` contract via `register_task`/`update_verifier` to gate crediting on a custom on-chain check instead. See [`docs/VERIFIER_SECURITY.md`](docs/VERIFIER_SECURITY.md) for the security considerations of attaching a third-party verifier.
+1. **On-chain execution verification is optional** — By default (`verifier: None`) the registry trusts the claimer to submit proof, same as the original MVP. A task owner can attach an `IKeeperVerifier` contract via `register_task`/`update_verifier` to gate crediting on a custom on-chain check instead.
 2. **Fee sweep is manual** — Protocol fees are batched and swept by admin. In Phase 2 this flows automatically to a staking/treasury contract.
 3. **No slashing (MVP)** — Unresponsive keepers lose their lock but face no economic penalty. Phase 2 introduces staking + slashing.
 
 ### Security Properties
 
-- **No re-entrancy** — State transitions happen before token transfers (CEI pattern throughout).
+- **No re-entrancy** — State transitions happen before token transfers (CEI pattern throughout); this also holds for the verifier call in `execute_task`, which runs before any crediting and cannot re-enter the registry (see [`docs/VERIFIER_SECURITY.md`](docs/VERIFIER_SECURITY.md)).
 - **Auth on all mutations** — Every write function calls `address.require_auth()`.
 - **Overflow protection** — `overflow-checks = true` in release profile + `checked_*` arithmetic.
 - **Bounded storage** — No dynamic `Vec` in storage; all reads are O(1) by key.
 - **Upgrade is admin-gated** — WASM upgrade requires admin auth; new WASM must be pre-uploaded.
+- **Third-party verifiers cannot move funds** — a verifier can only approve/reject; see [`docs/VERIFIER_SECURITY.md`](docs/VERIFIER_SECURITY.md) for the full threat-model walkthrough (proof-size griefing, resource-budget cost, panic isolation, fund-safety).
 
 ### Audit Plan
 

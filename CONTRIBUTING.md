@@ -1,6 +1,9 @@
-# Contributing to Soroban Keeper Network
+### Coverage
 
-Thank you for your interest in contributing! This guide covers everything you need to know to submit quality contributions and avoid common pitfalls that cause PR conflicts or delays.
+CI runs `cargo-llvm-cov` as an **advisory** job (`Coverage (advisory)` in
+`.github/workflows/ci.yml`) — it reports a number in the job summary but
+never blocks a PR. There is no coverage threshold and none is planned; use
+the report to spot untested branches, not to chase a percentage.
 
 **Please read this entire document before opening a PR or issue.**
 
@@ -38,224 +41,98 @@ This project follows the [Contributor Covenant v2.1](CODE_OF_CONDUCT.md). By par
 | Rust | stable (≥ 1.78) | `rustup install stable` |
 | wasm32 target | — | `rustup target add wasm32-unknown-unknown` |
 | Soroban CLI | ≥ 22.x | `cargo install --locked stellar-cli --features opt` |
-| Node.js | ≥ 18 LTS | [nodejs.org](https://nodejs.org) |
-| npm | ≥ 9 | bundled with Node.js |
-| git | ≥ 2.40 | system package manager |
+| Node.js | ≥ 18 LTS | Install from [nodejs.org](https://nodejs.org/) |
+| npm | bundled with Node.js | — |
 
-### Optional (Recommended)
-
-| Tool | Purpose |
-|------|---------|
-| `wasm-opt` | WASM size optimization: `cargo install wasm-opt --locked` |
-| `cargo-audit` | Security advisory scan: `cargo install cargo-audit --locked` |
-| `cargo-expand` | Inspect macro expansions |
-| VS Code + `rust-analyzer` | IDE support |
-| VS Code + `stellar-sdk` extension | Soroban intellisense |
-
-### VS Code Recommended Extensions
-
-Add to `.vscode/extensions.json` (not committed to avoid forcing preferences):
-
-```json
-{
-  "recommendations": [
-    "rust-lang.rust-analyzer",
-    "tamasfe.even-better-toml",
-    "serayuzgur.crates",
-    "streetsidesoftware.code-spell-checker"
-  ]
-}
-```
-
-### First-Time Setup
+### Clone and configure the repository
 
 ```bash
-# Clone
-git clone https://github.com/soroban-tooling/soroban-keeper-network
+git clone https://github.com/soroban-tooling/soroban-keeper-network.git
 cd soroban-keeper-network
-
-# Verify Rust and WASM target
-rustup show
-rustup target list --installed | grep wasm32
-
-# Install JS dependencies for the keeper bot example
-cd examples/keeper-bot && npm install && cd ../..
-
-# Run tests (should all pass on a clean checkout)
-cargo test --workspace --locked
-
-# Build WASM
-cargo build --locked --release --target wasm32-unknown-unknown --package keeper-registry
-
-# Run all required CI checks locally
-make ci
-
-# Optionally run stricter checks (includes clippy)
-make check
+rustup target add wasm32-unknown-unknown
 ```
+
+Install the keeper-bot dependencies when working on the example bot:
+
+```bash
+cd examples/keeper-bot
+npm ci
+cd ../..
+```
+
+### Editor configuration
+
+The repository does not require a particular editor. For a convenient Rust setup, use an editor with rust-analyzer support and enable format-on-save if desired. Keep editor-specific settings local rather than committing generated workspace configuration.
 
 ---
 
 ## Project Structure
 
+```text
+contracts/keeper-registry/  Soroban keeper registry contract
+examples/keeper-bot/        Example off-chain keeper bot
+fuzz/                       Fuzzing harness and targets
+docs/                       Architecture, deployment, and demo documentation
+.github/                    CI, issue templates, and pull-request template
 ```
-soroban-keeper-network/
-├── Cargo.toml                    # Workspace root
-├── contracts/
-│   └── keeper-registry/
-│       ├── Cargo.toml
-│       └── src/
-│           ├── lib.rs            # Contract implementation
-│           └── test.rs           # Unit + integration tests
-├── tests/                        # Additional integration test files
-├── scripts/
-│   └── deploy.sh                 # Deployment script
-├── examples/
-│   └── keeper-bot/               # Off-chain keeper bot (Node.js)
-├── .github/
-│   └── workflows/
-│       └── ci.yml                # GitHub Actions CI
-├── README.md                     # Full PRD + docs
-├── CONTRIBUTING.md               # This file
-├── CODE_OF_CONDUCT.md
-├── SECURITY.md
-└── LICENSE
-```
+
+Rust contract changes normally belong in `contracts/keeper-registry/src/`. Contract tests are in `contracts/keeper-registry/src/test.rs`.
 
 ---
 
 ## Git Workflow
 
-We use **trunk-based development**. The `main` branch is the trunk, and it must always be stable and releasable.
+We use a trunk-based workflow with short-lived topic branches. Keep branches focused and delete them after merging.
 
-All work happens on short-lived branches prefixed with `feature/`, `fix/`, etc.
+1. Start from the current default branch.
+2. Create a descriptive topic branch.
+3. Make small, focused commits.
+4. Run the relevant local checks.
+5. Push the branch and open a pull request.
+6. Respond to review feedback with follow-up commits or a clean fixup before merge.
 
+Use branch names such as:
+
+```text
+feature/task-batching
+fix/reward-accounting
+docs/update-deployment-guide
+chore/update-dependencies
+refactor/storage-helper
 ```
-main ────────────────────────────────────────────────── (always stable, releasable)
-  ├── feature/add-verifier-interface
-  ├── fix/reclaim-lock-ledger-check
-  └── chore/update-soroban-sdk-22
-```
 
-### Branch Purposes
-
-| Branch | Purpose | Direct push? |
-|--------|---------|-------------|
-| `main` | The single source of truth. Always stable. | **Never** |
-| `feature/*` | New features | Your own branch — yes |
-| `fix/*` | Bug fixes | Your own branch — yes |
-| `chore/*` | Dependency updates, tooling, CI | Your own branch — yes |
-| `docs/*` | Documentation only changes | Your own branch — yes |
-| `refactor/*` | Code restructuring (no behaviour change) | Your own branch — yes |
-
-### Branch Protection
-
-The `main` branch is protected by the following rules:
-
-- **Requires a Pull Request**: All changes must be made through a PR.
-- **Requires Status Checks to Pass**: CI jobs (build, test, lint) must pass before merging.
-- **Requires Review**: At least one maintainer must approve the PR.
-- **No Force Pushing**: History cannot be rewritten.
-
-> **CRITICAL**: Never push directly to `main`. All changes go through PRs with at least one review. This rule is enforced via branch protection rules.
+Avoid committing generated build artifacts, secrets, local configuration, or unrelated formatting changes.
 
 ---
 
 ## Branching & PR Rules
 
-### Before Starting Work
+- Keep each pull request limited to one concern.
+- Explain the problem, the approach, and any trade-offs in the pull request description.
+- Include tests for behavior changes and regression fixes.
+- Update documentation or the changelog when the user-visible behavior or project workflow changes.
+- Do not rewrite shared branches or force-push over another contributor's work.
+- Resolve merge conflicts carefully and rerun the relevant checks afterward.
+- Never include private keys, tokens, passwords, `.env` files, or other sensitive data in code or commits.
 
-1. **Check Issues** — is this already being worked on? Comment on the issue to signal intent.
-2. **Open an issue** — if one doesn't exist, open it and get feedback before writing code.
-3. **Branch from `main`**:
-
-```bash
-git checkout main
-git pull origin main
-git checkout -b feature/your-feature-name
-```
-
-### PR Requirements Checklist
-
-Before opening a PR:
-
-- [ ] Branch is based on `main`
-- [ ] `make ci` passes (format check, tests, WASM build)
-- [ ] `make check` passes (ci + clippy) — or explain why clippy warnings are acceptable
-- [ ] New code has corresponding test coverage
-- [ ] No `TODO`, `FIXME`, or `unwrap()` added without a comment explaining why
-- [ ] No sensitive data (keys, credentials) in any file
-- [ ] PR description fills out the template below
-
-### PR Title Format
-
-```
-<type>(<scope>): <short description>
-
-Examples:
-feat(registry): add batch task registration
-fix(claim): allow re-claim after lock period expires
-docs(readme): add integration guide section
-chore(deps): upgrade soroban-sdk to 22.1.0
-test(expire): add missing deadline boundary test
-```
-
-Use the same types as [Conventional Commits](#commit-convention).
-
-### PR Size
-
-- Keep PRs focused. One logical change per PR.
-- PRs with > 500 lines changed should include a justification in the description.
-- Refactors and feature work should be in separate PRs.
+Pull requests should be opened against the repository's current default integration branch. If the target branch changes, follow the branch policy stated by the maintainers and in the pull request template.
 
 ---
 
 ## Commit Convention
 
-We follow **[Conventional Commits v1.0.0](https://www.conventionalcommits.org/en/v1.0.0/)**.
+Use an imperative subject line and keep it concise. Conventional Commit prefixes are encouraged:
 
-### Format
-
+```text
+feat: add task query helper
+fix: reject expired task claims
+docs: clarify deployment prerequisites
+test: cover reward accumulation
+chore: update CI action
+refactor: simplify task loading
 ```
-<type>(<optional scope>): <description>
 
-[optional body]
-
-[optional footer: BREAKING CHANGE: ..., Closes #N]
-```
-
-### Types
-
-| Type | When to use |
-|------|------------|
-| `feat` | A new feature |
-| `fix` | A bug fix |
-| `docs` | Documentation only |
-| `style` | Formatting, missing semicolons — no logic change |
-| `refactor` | Code change that neither fixes a bug nor adds a feature |
-| `test` | Adding or correcting tests |
-| `chore` | Build, CI, dependency updates |
-| `perf` | Performance improvement |
-| `security` | Security fix (ping maintainers before pushing) |
-
-### Examples
-
-```
-feat(registry): add sweep_fees admin function
-
-Allows admin to transfer accumulated protocol fees to a treasury
-address. Phase 2 will automate this via a governance contract.
-
-Closes #42
-
-fix(claim): reject re-claim when lock period still active
-
-Previously the lock check used timestamp instead of ledger sequence,
-causing incorrect lock expiry on networks with variable block times.
-
-BREAKING CHANGE: lock_ledgers is now compared against ledger sequence
-not unix timestamp. Existing tasks with in-flight claims are unaffected.
-```
+Keep unrelated changes in separate commits. A commit body is useful when the reason for a non-obvious change cannot be understood from the code. Do not commit temporary debugging output or commented-out experiments.
 
 ---
 
@@ -263,152 +140,147 @@ not unix timestamp. Existing tasks with in-flight claims are unaffected.
 
 ### Rust
 
-- **Formatter**: `rustfmt` with default settings. Run `cargo fmt --all` before committing.
-- **Linter**: `cargo clippy --all --all-targets --all-features -- -D warnings`. All warnings are errors.
-- **Naming**: follow Rust conventions — `snake_case` for functions/variables, `PascalCase` for types/enums.
-- **Error handling**: use `Result<T, KeeperError>` — no panics in contract code except truly unreachable states (document these with `// SAFETY:` comments).
-- **No `unwrap()` in contract code** — use `ok_or(KeeperError::Foo)?` or `expect("message that explains why this is unreachable")`.
-- **Comments**: explain _why_, not _what_. The code explains what; comments explain intent, invariants, and non-obvious behaviour.
-- **Doc comments**: use `///` for all public items (functions, structs, enums, variants).
+Run rustfmt before submitting Rust changes:
 
-### JavaScript / Node.js (keeper bot)
+```bash
+cargo fmt --all
+```
 
-- **Style**: ES2022+, `"use strict"`, CommonJS (`require`).
-- **No TypeScript** in the example (to keep it beginner-friendly). A TypeScript version is welcome as a separate example.
-- **Linting**: ESLint with the config in `examples/keeper-bot/.eslintrc.json`.
-- **Lockfile**: The keeper bot example does not currently commit `package-lock.json` to keep the repository lightweight. However, contributors working on the bot should consider evaluating whether committing the lockfile would improve reproducibility, especially if encountering version-related issues. Discuss this in an issue before submitting a PR that adds the lockfile.
+Prefer clear, explicit code and typed errors over panics. Do not use `unwrap()` in production contract code. An `expect()` is acceptable only for a genuinely unreachable invariant, and the surrounding code or comment must explain why it is unreachable.
+
+Use checked arithmetic for values influenced by callers or contract state. Validate inputs at the public boundary and return the appropriate contract error rather than allowing an avoidable panic.
+
+### JavaScript
+
+Keep the keeper bot dependency-free beyond its declared package dependencies. Follow the existing module style, validate external input, and handle expected transaction failures explicitly. Run the bot test suite before submitting bot changes.
+
+### Documentation
+
+Use concise headings, fenced code blocks for commands, and links to canonical files instead of copying their contents into another document. When a repository file is the source of truth, link to it rather than maintaining a second example that can drift.
 
 ---
 
 ## Testing Requirements
 
-### Coverage Expectations
-
-- Every new public contract function MUST have at least:
-  - One happy-path test
-  - Tests for each error case (`KeeperError` variant the function can return)
-- Bug fixes MUST include a regression test that fails before the fix and passes after.
-- PRs that remove tests must justify why in the PR description.
-
-### Running Tests
+For Rust changes, run the checks that apply to the change:
 
 ```bash
-# All tests (unit + integration)
-cargo test --all --features testutils
-
-# One specific test
-cargo test --features testutils test_full_lifecycle_multiple_tasks -- --nocapture
-
-# Watch mode (requires cargo-watch)
-cargo watch -x "test --all --features testutils"
+make ci
 ```
 
-### Test Structure
+This runs the required formatting, test, and WASM build checks. `make check` also runs the stricter local clippy check.
 
-- Unit tests live in `contracts/keeper-registry/src/test.rs`.
-- Integration tests that cross contract boundaries go in `tests/`.
-- Use `Env::default()` + `env.mock_all_auths()` for simplicity in unit tests.
-- Use real auth flows when testing auth-specific paths.
+For keeper-bot changes:
+
+```bash
+cd examples/keeper-bot
+npm test
+```
+
+New behavior should include a focused test. Bug fixes should include a regression test where practical. Tests should assert the observable behavior and relevant error, event, balance, or storage state rather than merely checking that a call does not panic.
+
+Before opening a pull request, check the final diff for accidental files, debug output, secrets, and unrelated changes.
 
 ---
 
 ## PR Template & Review Process
 
-When you open a PR, GitHub will populate this template automatically from `.github/PULL_REQUEST_TEMPLATE.md`.
-
-### Example Template
-```markdown
-## Summary
-
-<!-- One paragraph explaining what this PR does and why -->
-
-## Changes
-
-- [ ] <!-- Change 1 -->
-- [ ] <!-- Change 2 -->
-
-## Testing
-
-<!-- Describe how you tested this. New tests added? Manual testnet verification? -->
-
-## Checklist
-
-- [ ] `cargo fmt --all` passes
-- [ ] `cargo clippy` passes (no warnings)
-- [ ] All tests pass
-- [ ] New tests added for new code
-- [ ] No `unwrap()` without explanation
-- [ ] No sensitive data in code or commits
-- [ ] PR targets `main`
-
-## Related Issues
-
-Closes #<!-- issue number -->
-```
+Opening a pull request populates [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md) automatically. Fill in every section. The checklist identifies the required CI checks and the additional local standards expected for a high-quality contribution.
 
 ### Review Process
 
-1. Open PR against `main`.
-2. CI must be green before review is requested.
-3. Request review from at least one maintainer (tag `@Andreschuks101` for now).
-4. Address all review comments. Mark conversations resolved after addressing.
-5. Maintainer squash-merges the PR with a conventional commit message.
-6. Delete the feature branch after merge.
+1. A maintainer checks that the pull request is scoped, described clearly, and associated with the relevant issue.
+2. CI runs automatically and reports required checks and advisory checks.
+3. Reviewers examine correctness, security, test coverage, compatibility, and documentation.
+4. The author responds to feedback and keeps the branch up to date when requested.
+5. A maintainer merges the pull request once required checks pass and review concerns are resolved.
 
-**Note on Dependabot PRs**: Automated dependency update PRs from Dependabot follow the same review process as all other pull requests. Maintainers will review the changelog, check for breaking changes, and verify CI passes before merging.
+CI's required checks are formatting, tests, and the WASM build. Clippy is advisory in CI, but contributors should still run the stricter local check and explain relevant warnings rather than ignoring them.
 
 ### Review Turnaround
 
-Maintainers aim to respond within **48 hours** on weekdays. Complex PRs may take longer — please be patient.
+Maintainers aim to acknowledge new pull requests within a few working days. Review time can be longer for contract, security, deployment, or architectural changes. A respectful comment on the pull request is appropriate if an expected review window has passed.
+
+Keeping changes small, explaining design decisions, and providing tests makes review faster.
 
 ---
 
 ## Coordination — Issues & Discussions
 
-### GitHub Issues
+Search existing issues before opening a new one. For substantial changes, open or comment on an issue before implementation so the intended behavior and design can be discussed first.
 
-- Use Issues to track bugs, feature requests, and tasks.
-- Label your issue: `bug`, `enhancement`, `question`, `documentation`, `security`, `good first issue`.
-- For bugs: include steps to reproduce, expected vs actual behaviour, Rust version, OS.
-- For features: link to the relevant PRD section or user story if applicable.
+A useful issue includes:
 
-### GitHub Discussions
+- The current behavior and the expected behavior.
+- Reproduction steps or a minimal example.
+- The impact and why the change matters.
+- Relevant files, logs, or transaction details.
+- Any compatibility, migration, or security considerations.
 
-- Use Discussions for open-ended questions, design proposals, and community announcements.
-- Major design changes (new storage layout, breaking API changes) MUST go through a Discussion before implementation begins to get early feedback.
-
-### Discord
-
-> Discord server coming soon — link will be added here once the community grows to > 20 contributors.
+Use issues for actionable bugs and proposals. Use pull-request discussions for implementation details once a change is underway.
 
 ---
 
 ## Release Process
 
-1. **Agree on a release version** — maintainers decide on the next `vX.Y.Z` number.
-2. **Create a release branch** — `git checkout -b release/vX.Y.Z main`.
-3. **Final testing** — run the full test suite and deploy to testnet from the release branch.
-4. **Update `CHANGELOG.md`** — use the commit history to add notable changes.
-5. **Bump versions** — update the `version` in all relevant `Cargo.toml` files.
-6. **Open a PR** — merge the release branch into `main`. This PR requires at least two maintainer approvals.
-7. **Tag the release** — after merging, pull the latest `main`, then run `git tag -s vX.Y.Z -m "Release vX.Y.Z"` and `git push origin vX.Y.Z`.
-8. **Create a GitHub Release** — go to the tags page, create a new release from the tag, and paste the changelog notes. Attach the optimized WASM file.
+Releases are prepared by maintainers. Before a release, verify the required CI checks, update user-facing documentation and `CHANGELOG.md` where appropriate, confirm deployment records, and review the generated WASM artifact.
 
-### Versioning
-
-We follow **Semantic Versioning 2.0.0**:
-- `MAJOR` — breaking changes to the on-chain interface or storage layout
-- `MINOR` — new backwards-compatible functionality
-- `PATCH` — backwards-compatible bug fixes
+Do not publish deployments or change canonical contract addresses without maintainer approval. Record released addresses and network details in `DEPLOYMENTS.md`.
 
 ---
 
 ## Security Reporting
 
-**Do not open a public issue for security vulnerabilities.**
+Do not disclose suspected vulnerabilities in a public issue or pull request. Follow the instructions in [SECURITY.md](SECURITY.md) for private reporting.
 
-Please follow the responsible disclosure process described in [SECURITY.md](SECURITY.md). We aim to acknowledge reports within 24 hours and issue patches within 7 days for critical issues.
+Include enough detail to reproduce the issue safely, including affected versions, relevant transaction or input data, impact, and any suggested mitigation. Do not include private keys or other sensitive credentials in a report.
+To run it locally:
 
----
+```bash
+# One-time install
+cargo install cargo-llvm-cov --locked
+rustup component add llvm-tools-preview
 
-*Thank you for helping build the automation layer for Stellar DeFi.*
+# Browsable HTML report (writes to target/llvm-cov/html/index.html)
+cargo llvm-cov --workspace --html
+
+# Quick text summary
+cargo llvm-cov --workspace --summary-only
+
+# Or, equivalent to the HTML command above:
+make coverage
+```
+
+`src/test.rs` is excluded from the report (`--ignore-filename-regex
+'test\.rs$'`) — it's the test module itself, so counting it inflates the
+number without saying anything about how well the contract code in `lib.rs`
+is actually exercised.
+
+### Fuzzing & crash-to-regression convention
+
+A crash found by the fuzz harness (`fuzz/fuzz_targets/`) and merely "fixed"
+is a bug that can silently come back — a future refactor can reintroduce
+the same shape of mistake, and the fuzzer might not rediscover it for a
+long time since it searches randomly rather than systematically. **Every
+crash the fuzzer finds must become a permanent, checked-in regression**,
+not just a patched line of contract code:
+
+1. Minimize the crashing input (`cargo fuzz tmin <target> <path-to-crash>`)
+   and commit it under `fuzz/corpus/<target>/regressions/`, so the fuzzer's
+   own corpus keeps re-testing it on every future run.
+2. Add a corresponding `#[test]` in `contracts/keeper-registry/src/test.rs`
+   that reproduces the exact scenario **in human-readable form** — the
+   actual sequence of contract calls that triggered the crash, not "replay
+   these fuzzer bytes." A raw fuzzer input replay is not reviewable by a
+   human and doesn't explain *why* the input was dangerous.
+3. If the crash revealed a gap in one of the money invariants (`I-1`
+   through `I-7` in `docs/ARCHITECTURE.md`), consider whether it should
+   also become a case in the corresponding property test rather than only
+   a one-off regression.
+
+Any PR that fixes a bug found by fuzzing must include both the minimized
+corpus entry and the human-readable regression test in the same commit as
+the fix — see the PR template's checkbox for this.
+
+See [`docs/FUZZING.md`](docs/FUZZING.md) for how to run an existing fuzz
+target, add a new one, and use the shared `invariants` module.
