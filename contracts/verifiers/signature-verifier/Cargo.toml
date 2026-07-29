@@ -1,20 +1,15 @@
 [package]
-name = "keeper-registry"
+name = "signature-verifier"
 version = "0.1.0"
 edition = "2021"
 authors = ["Soroban Keeper Network Contributors"]
-description = "Decentralized Keeper Network registry contract for Soroban/Stellar"
+description = "Reference IKeeperVerifier implementation: ed25519 signature over a task's identity"
 license = "Apache-2.0"
 repository = "https://github.com/soroban-tooling/soroban-keeper-network"
-keywords = ["soroban", "stellar", "keeper", "automation", "defi"]
+keywords = ["soroban", "stellar", "keeper", "verifier"]
 categories = ["cryptography::cryptocurrencies"]
 
 [lib]
-# cdylib for the on-chain WASM build; rlib so the fuzz crate and other
-# workspace crates (e.g. the reference `signature-verifier` under
-# `contracts/verifiers/`) can `use keeper_registry::*` — including its
-# `Task`/`IKeeperVerifier` types — as a normal library dependency instead
-# of only linking the compiled WASM.
 crate-type = ["cdylib", "rlib"]
 
 [features]
@@ -23,10 +18,12 @@ testutils = ["soroban-sdk/testutils"]
 
 [dependencies]
 soroban-sdk = { version = "22.0.1" }
+keeper-registry = { path = "../../keeper-registry" }
 
 [dev-dependencies]
 soroban-sdk = { version = "22.0.1", features = ["testutils"] }
-proptest = "1.4"
+ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
+rand = "0.8"
 
 # Note: release profile is defined once at the workspace root Cargo.toml.
 # Profiles in non-root packages are ignored by Cargo, so it is not repeated here.
