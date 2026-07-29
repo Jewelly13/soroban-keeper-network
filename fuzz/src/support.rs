@@ -5,10 +5,7 @@
 //! duplicated setup logic.
 
 use keeper_registry::*;
-use soroban_sdk::{
-    testutils::{Address as _, MockContractData, MockEnv},
-    token, Address, Bytes, Env, IntoVal,
-};
+use soroban_sdk::{testutils::Address as _, token, Address, Bytes, Env};
 
 /// Represents a fully initialized Keeper Registry contract ready for testing.
 #[derive(Clone)]
@@ -28,26 +25,30 @@ impl RegistryHarness {
     /// Keeper Registry contract with a mock token contract. All addresses are
     /// deterministic to ensure reproducible fuzzing.
     pub fn new() -> Self {
-        let env = MockEnv::default();
+        let env = Env::default();
+        env.mock_all_auths();
 
         // Create deterministic addresses
         let admin = Address::generate(&env);
         let user = Address::generate(&env);
         let keeper = Address::generate(&env);
-        
-        // Create a mock token contract
-        let reward_token = env.register_stellar_asset_contract(admin.clone());
-        
-        // Deploy the Keeper Registry contract
-        let contract_id = env.register_contract(None, KeeperRegistry);
-        
-        // Initialize the contract with default fee (0% for testing)
+
+        // Deploy a SAC-wrapped reward token, matching the pattern in
+        // contracts/keeper-registry/src/test.rs's `setup()`.
+        let reward_token = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+
+        // Deploy the Keeper Registry contract.
+        let contract_id = env.register(KeeperRegistry, ());
+
+        // Initialize the contract with a 0% fee (fuzz targets vary this
+        // explicitly where the fee rate itself is under test).
         let client = KeeperRegistryClient::new(&env, &contract_id);
-        client.initialize(&admin, &reward_token, &0);
-        
-        // Mint some tokens to the user for testing
-        let token_client = token::Client::new(&env, &reward_token);
-        token_client.mint(&user, &1_000_000_000_000_i128);
+        client.initialize(&admin, &reward_token, &0u32);
+
+        // Mint tokens to the user for testing.
+        token::StellarAssetClient::new(&env, &reward_token).mint(&user, &1_000_000_000_000_i128);
 
         Self {
             env,
@@ -60,12 +61,12 @@ impl RegistryHarness {
     }
 
     /// Get a client for the deployed contract.
-    pub fn client(&self) -> KeeperRegistryClient {
+    pub fn client(&self) -> KeeperRegistryClient<'_> {
         KeeperRegistryClient::new(&self.env, &self.contract_id)
     }
 
     /// Get the token client.
-    pub fn token_client(&self) -> token::Client {
+    pub fn token_client(&self) -> token::Client<'_> {
         token::Client::new(&self.env, &self.reward_token)
     }
 
@@ -88,6 +89,7 @@ impl RegistryHarness {
             &(self.env.ledger().timestamp() + 1000), // Far future deadline
             &1000, // ttl_ledgers
             &100,  // lock_ledgers
+            &None, // verifier
         )
     }
 
@@ -111,9 +113,9 @@ impl RegistryHarness {
     pub fn assert_task_exists(&self, task_id: u64) {
         let client = self.client();
         let task = client.try_get_task(&task_id);
-        
+
         assert!(
-            task.is_ok(),
+            matches!(task, Ok(Ok(_))),
             "Task {} should exist after operation",
             task_id
         );
@@ -124,8 +126,8 @@ impl RegistryHarness {
     /// This property ensures that task fields remain consistent after operations.
     pub fn assert_task_fields_consistent(&self, task_id: u64) {
         let client = self.client();
-        let task = client.try_get_task(&task_id).unwrap();
-        
+        let task = client.get_task(&task_id);
+
         // Basic field consistency checks
         assert!(task.reward > 0, "Task reward should be positive");
         assert!(task.deadline > 0, "Task deadline should be set");
@@ -183,9 +185,9 @@ impl RegistryHarness {
         fees_before: i128,
     ) {
         let client = self.client();
-        
+
         // Get the executed task
-        let task = client.try_get_task(&task_id).unwrap();
+        let task = client.get_task(&task_id);
         assert_eq!(task.status, TaskStatus::Executed, "Task should be executed");
         
         // Get keeper balance after execution
@@ -232,7 +234,7 @@ pub fn arbitrary_bytes(env: &Env, data: &[u8]) -> Bytes {
 }
 
 /// Helper to generate a task type for fuzzing.
-pub fn arbitrary_task_type(env: &Env, discriminator: u8) -> TaskType {
+pub fn arbitrary_task_type(_env: &Env, discriminator: u8) -> TaskType {
     match discriminator % 6 {
         0 => TaskType::Liquidation,
         1 => TaskType::OraclePricePush,
@@ -245,10 +247,10 @@ pub fn arbitrary_task_type(env: &Env, discriminator: u8) -> TaskType {
 
 /// Check if bytes length exceeds contract limits.
 pub fn is_calldata_valid(calldata: &Bytes) -> bool {
-    calldata.len() <= keeper_registry::MAX_CALLDATA_LEN as usize
+    calldata.len() <= keeper_registry::MAX_CALLDATA_LEN
 }
 
 /// Check if proof length exceeds contract limits.
 pub fn is_proof_valid(proof: &Bytes) -> bool {
-    proof.len() <= keeper_registry::MAX_PROOF_LEN as usize
+    proof.len() <= keeper_registry::MAX_PROOF_LEN
 }
