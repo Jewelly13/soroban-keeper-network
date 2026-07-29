@@ -887,6 +887,26 @@ impl KeeperRegistry {
         emit_task_claimed(&e, task_id, &keeper);
         log!(&e, "Task {} claimed by {}", task_id, keeper);
         Ok(())
+
+    // ── claim_first_available ────────────────────────────────────────────────
+    // Attempts to claim the first available task from a list of candidate task IDs.
+    // Returns the ID of the successfully claimed task, or an error if none are
+    // claimable.
+    pub fn claim_first_available(e: Env, keeper: Address, candidates: Vec<u64>) -> Result<u64, KeeperError> {
+        // Ensure the contract is not paused before attempting any claim.
+        require_not_paused(&e)?;
+        keeper.require_auth();
+
+        for task_id in candidates.into_iter() {
+            // Attempt to claim the task using the same logic as `claim_task`.
+            // Any error is ignored; we continue to the next candidate.
+            if claim_task(e.clone(), keeper.clone(), task_id).is_ok() {
+                return Ok(task_id);
+            }
+        }
+        // No candidate could be claimed.
+        Err(KeeperError::InvalidTaskStatus)
+    }
     }
 
     // ── execute_task ─────────────────────────────────────────────────────────
