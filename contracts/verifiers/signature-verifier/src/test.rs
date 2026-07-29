@@ -204,7 +204,7 @@ fn test_end_to_end_execute_task_with_signature_verifier_credits_reward() {
         &calldata,
         &reward,
         &deadline,
-        &17_280u32,
+        &20_000u32,
         &120u32,
         &Some(verifier_id.clone()),
     );
@@ -242,7 +242,7 @@ fn test_end_to_end_execute_task_with_signature_verifier_credits_reward() {
         &calldata,
         &reward,
         &deadline,
-        &17_280u32,
+        &20_000u32,
         &120u32,
         &Some(verifier_id),
     );
