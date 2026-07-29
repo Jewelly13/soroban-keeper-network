@@ -34,6 +34,10 @@
 // function — so a function- or impl-level #[allow] doesn't reach it. A
 // crate-level allow is the only attribute clippy actually honors for this
 // specific macro-generated warning.
+// `register_task` grows to 8 parameters once `verifier: Option<Address>` is
+// added (see #98). A function-level `#[allow(...)]` on `register_task`
+// doesn't reach the warning clippy raises against `#[contractimpl]`'s
+// generated dispatch code for that function, so this has to be crate-level.
 #![allow(clippy::too_many_arguments)]
 
 use soroban_sdk::{
@@ -176,6 +180,28 @@ pub struct Task {
 /// `false` over panicking wherever the failure is a normal "proof didn't
 /// check out" outcome, reserving an actual panic for conditions that are
 /// genuinely exceptional.
+/// A task owner may attach a contract implementing this interface to gate
+/// `execute_task` on an on-chain check of the keeper's `proof`, instead of
+/// trusting it unconditionally (the pre-verifier MVP default, `verifier:
+/// None`).
+///
+/// ## Trust model
+/// The verifier is chosen by the task owner, not the registry. It receives
+/// the full `Task` (read-only), the claiming `keeper`, and the submitted
+/// `proof`, and returns `true` to approve crediting or `false` to reject.
+/// It cannot move funds, credit itself, or redirect the payout — only gate
+/// whether `execute_task`'s own crediting logic runs (see `execute_task`).
+///
+/// ## Cross-contract call semantics — panics are NOT isolated
+/// Per Soroban's host (`soroban-env-host`'s `Host::try_call`), only *typed
+/// contract errors* are recovered as a graceful outcome across a
+/// cross-contract call boundary. A genuine panic in a verifier (a WASM trap,
+/// `unwrap()` on `None`, etc.) is a non-recoverable host error and re-panics
+/// the caller — the whole `execute_task` transaction aborts, the task stays
+/// `Claimed`, and the only recovery path is `expire_task` once the deadline
+/// passes. A well-behaved verifier should therefore return `false` for a
+/// "proof didn't check out" outcome rather than panicking, reserving an
+/// actual panic for conditions that are genuinely exceptional.
 #[soroban_sdk::contractclient(name = "IKeeperVerifierClient")]
 pub trait IKeeperVerifier {
     /// Returns `true` if `proof` is a valid attestation that `keeper`
@@ -613,7 +639,7 @@ fn lock_expired(e: &Env, task: &Task) -> bool {
 
 /// Semantic version of the contract logic. Bumped on behavior changes so
 /// off-chain clients and indexers can detect which ABI they are talking to.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
 /// Maximum `calldata` length, in bytes. Sized to hold an encoded contract
 /// call — a target address, a function symbol, and a handful of scalar or
@@ -695,12 +721,13 @@ impl KeeperRegistry {
     //                  `IKeeperVerifier`); `None` preserves the pre-verifier
     //                  MVP behavior exactly (execute_task trusts the proof
     //                  unconditionally)
+    //                  `IKeeperVerifier`); `None` = trust the proof
+    //                  unconditionally, same as before this parameter existed
     //
     // Returns the new task_id.
 
     // The task parameters are all distinct scalars a caller must supply; a
     // params struct would just move them without improving the ABI.
-    #[allow(clippy::too_many_arguments)]
     pub fn register_task(
         e: Env,
         owner: Address,
@@ -849,6 +876,14 @@ impl KeeperRegistry {
     // time, swapping in a verifier it cannot satisfy would let the owner
     // grief that keeper's uncompensated off-chain work. See `IKeeperVerifier`
     // for the full griefing-protection rationale.
+    // Lets the owner change or clear a task's attached verifier before it's
+    // claimed. Unlike `increase_reward`/`extend_deadline`, this is Pending-only
+    // (not also Claimed): once a keeper has claimed a task, it has committed
+    // to a specific proof requirement, and changing that requirement out from
+    // under an already-claimed keeper would be a bait-and-switch — a keeper
+    // could do all the off-chain work for a `None`/easy verifier only to have
+    // the owner swap in a verifier its proof can't satisfy, with no way to
+    // recover the work already done beyond waiting for the lock to lapse.
 
     pub fn update_verifier(
         e: Env,
@@ -937,6 +972,10 @@ impl KeeperRegistry {
     // changing the task's status, so the same keeper may retry with a
     // different proof. A task with no verifier (`None`) behaves exactly as
     // before verifiers existed: this is a strictly additive code path.
+    // If the task has an attached verifier (see `IKeeperVerifier`), its
+    // `verify` is called after the checks above and before any crediting —
+    // rejection (`false`) leaves the task `Claimed` with nothing transferred
+    // or mutated, so the keeper may retry with a different proof.
 
     pub fn execute_task(
         e: Env,

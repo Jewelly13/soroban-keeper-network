@@ -246,6 +246,8 @@ A **shared, permissionless, on-chain coordination layer** where:
 - MUST only be callable when task is in `Pending` state — once claimed, a
   keeper has begun acting on the terms it saw at claim time; see
   `IKeeperVerifier`'s doc comment for the griefing-protection rationale.
+  `update_verifier`'s doc comment in
+  `contracts/keeper-registry/src/lib.rs` for the bait-and-switch rationale.
 - MUST emit `VerifierUpdated`.
 
 #### FR-4: Task Cancellation
@@ -450,6 +452,7 @@ before this feature existed — this is a strictly opt-in, additive path.
 See `IKeeperVerifier`'s doc comment in `contracts/keeper-registry/src/lib.rs`
 for the trust model and the documented failure semantics of a verifier that
 panics rather than returning `false`.
+for the trust model and cross-contract panic-isolation semantics.
 
 ---
 
@@ -535,6 +538,7 @@ npm run start:testnet
 ### Known Design Decisions
 
 1. **On-chain execution verification is optional** — By default (`verifier: None`) the registry trusts the claimer to submit proof, same as the original MVP. A task owner can attach an `IKeeperVerifier` contract via `register_task`/`update_verifier` to gate crediting on a custom on-chain check instead. See [`docs/VERIFIER_SECURITY.md`](docs/VERIFIER_SECURITY.md) for the security considerations of attaching a third-party verifier.
+1. **On-chain execution verification is optional** — By default (`verifier: None`) the registry trusts the claimer to submit proof, same as the original MVP. A task owner can attach an `IKeeperVerifier` contract via `register_task`/`update_verifier` to gate crediting on a custom on-chain check instead.
 2. **Fee sweep is manual** — Protocol fees are batched and swept by admin. In Phase 2 this flows automatically to a staking/treasury contract.
 3. **No slashing (MVP)** — Unresponsive keepers lose their lock but face no economic penalty. Phase 2 introduces staking + slashing.
 
