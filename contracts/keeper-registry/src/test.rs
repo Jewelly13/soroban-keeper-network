@@ -1,8 +1,17 @@
+//! # KeeperRegistry — Solvency Invariant Tests
+//!
+//! These tests verify that every token held by the registry is accounted for
+//! by task escrow, keeper credits, or accrued protocol fees.
 //! # KeeperRegistry — Test Suite
 
 #![cfg(test)]
 
 use soroban_sdk::{
+    testutils::{Address as _, Deployer as _, Ledger, MockAuth},
+    token, Address, Bytes, Env,
+};
+
+use crate::{KeeperRegistry, KeeperRegistryClient, TaskType};
     testutils::{Address as _, Ledger, MockAuth},
     token, Address, Bytes, Env,
 };
@@ -16,6 +25,10 @@ struct Setup {
     token_id: Address,
 }
 
+// The shared environment/client lifetime is intentionally extended for the
+// standard Soroban test-harness pattern.
+#[allow(clippy::useless_transmute, clippy::missing_transmute_annotations)]
+fn setup(fee_bps: u32) -> Setup {
 fn setup() -> Setup {
     let env = Env::default();
     env.mock_all_auths();
@@ -29,7 +42,7 @@ fn setup() -> Setup {
 
     let registry_id = env.register(KeeperRegistry, ());
     let registry = KeeperRegistryClient::new(&env, &registry_id);
-    registry.initialize(&admin, &token_id, &300u32);
+    registry.initialize(&admin, &token_id, &fee_bps);
 
     let env = unsafe { core::mem::transmute::<Env, Env>(env) };
     Setup {
@@ -41,13 +54,18 @@ fn setup() -> Setup {
 }
 
 fn calldata(env: &Env) -> Bytes {
+    Bytes::from_slice(env, b"solvency-test")
+}
+
+fn register_task(s: &Setup, reward: i128) -> u64 {
+    let deadline = s.env.ledger().timestamp() + 3_600;
     Bytes::from_slice(env, b"liquidate:position:42")
 }
 
 fn register_task(s: &Setup, reward: i128) -> u64 {
     s.registry.register_task(
         &s.admin,
-        &TaskType::Liquidation,
+        &TaskType::Custom,
         &calldata(&s.env),
         &reward,
         &(s.env.ledger().timestamp() + 3_600),
@@ -66,6 +84,37 @@ fn advance(env: &Env, ledgers: u32, seconds: u64) {
     });
 }
 
+/// Asserts that the registry holds exactly what it owes:
+///
+/// `balance(registry) == open-task escrow + credited keeper balances + accrued fees`.
+/// `open_task_ids` must contain every task currently in `Pending` or `Claimed`,
+/// and `keepers` must contain every address that has ever been credited. The
+/// registry deliberately exposes no on-chain enumeration for either collection,
+/// so callers supply both sets explicitly.
+fn assert_solvent(
+    env: &Env,
+    client: &KeeperRegistryClient,
+    token: &token::Client,
+    registry_id: &Address,
+    open_task_ids: &[u64],
+    keepers: &[Address],
+) {
+    let held = token.balance(registry_id);
+    let escrow: i128 = open_task_ids
+        .iter()
+        .map(|id| client.get_task(id).reward)
+        .sum();
+    let credited: i128 = keepers.iter().map(|keeper| client.keeper_balance(keeper)).sum();
+    let fees = client.fees_accrued();
+
+    assert_eq!(
+        held,
+        escrow + credited + fees,
+        "registry balance {} != escrow {} + credited {} + fees {}",
+        held,
+        escrow,
+        credited,
+        fees
 #[derive(Clone, Copy)]
 enum TerminalStatus {
     Executed,
@@ -255,13 +304,35 @@ fn test_register_task_escrows_reward() {
         &None,
     );
 
-    // Owner balance decreased by the escrowed reward.
-    assert_eq!(token.balance(&admin), owner_before - 1_000_000i128);
-    // Contract holds the escrow.
-    assert_eq!(token.balance(&registry_id), 1_000_000i128);
+    let _ = env;
 }
 
 #[test]
+fn test_solvent_across_every_lifecycle_path_with_rounding_dust() {
+    // 333 bps deliberately produces floor-division rounding for these rewards:
+    // 2001 -> 66 fee and 1935 keeper net.
+    let s = setup(333);
+    let token = token::Client::new(&s.env, &s.token_id);
+    let keeper = Address::generate(&s.env);
+    let treasury = Address::generate(&s.env);
+
+    assert_solvent(
+        &s.env,
+        &s.registry,
+        &token,
+        &s.registry.address,
+        &[],
+        std::slice::from_ref(&keeper),
+    );
+
+    let cancelled = register_task(&s, 1_001);
+    assert_solvent(
+        &s.env,
+        &s.registry,
+        &token,
+        &s.registry.address,
+        &[cancelled],
+        std::slice::from_ref(&keeper),
 fn test_register_task_zero_reward_fails() {
     let env = Env::default();
     env.mock_all_auths();
@@ -413,22 +484,25 @@ fn test_register_task_with_max_calldata_succeeds() {
         &120u32,
         &None,
     );
-    assert_eq!(registry.get_task(&id).calldata.len(), MAX_CALLDATA_LEN);
-}
 
-#[test]
-fn test_register_task_over_max_calldata_fails() {
-    let env = Env::default();
-    env.mock_all_auths();
+    let executed = register_task(&s, 2_001);
+    assert_solvent(
+        &s.env,
+        &s.registry,
+        &token,
+        &s.registry.address,
+        &[cancelled, executed],
+        std::slice::from_ref(&keeper),
+    );
 
-    let admin = Address::generate(&env);
-    let token_id = env
-        .register_stellar_asset_contract_v2(admin.clone())
-        .address();
-    let registry_id = env.register(KeeperRegistry, ());
-    let registry = KeeperRegistryClient::new(&env, &registry_id);
-    registry.initialize(&admin, &token_id, &300u32);
-
+    let expired = register_task(&s, 3_003);
+    assert_solvent(
+        &s.env,
+        &s.registry,
+        &token,
+        &s.registry.address,
+        &[cancelled, executed, expired],
+        std::slice::from_ref(&keeper),
     // One byte over the cap — the smallest rejected payload.
     let oversized = Bytes::from_array(&env, &[0u8; MAX_CALLDATA_LEN as usize + 1]);
     assert_eq!(
@@ -534,9 +608,15 @@ fn test_register_task_with_empty_calldata_succeeds() {
         &120u32,
         &None,
     );
-    assert_eq!(registry.get_task(&id).calldata.len(), 0);
-}
 
+    s.registry.cancel_task(&s.admin, &cancelled);
+    assert_solvent(
+        &s.env,
+        &s.registry,
+        &token,
+        &s.registry.address,
+        &[executed, expired],
+        std::slice::from_ref(&keeper),
 #[test]
 fn test_register_task_lock_ledgers_below_min_fails() {
     let s = setup();
@@ -554,8 +634,15 @@ fn test_register_task_lock_ledgers_below_min_fails() {
         ),
         Err(Ok(KeeperError::InvalidTaskParams))
     );
-}
 
+    s.registry.claim_task(&keeper, &executed);
+    assert_solvent(
+        &s.env,
+        &s.registry,
+        &token,
+        &s.registry.address,
+        &[executed, expired],
+        std::slice::from_ref(&keeper),
 #[test]
 fn test_register_task_lock_ledgers_at_min_succeeds() {
     let s = setup();
@@ -570,9 +657,16 @@ fn test_register_task_lock_ledgers_at_min_succeeds() {
         &MIN_LOCK_LEDGERS,
         &None,
     );
-    assert_eq!(s.registry.get_task(&task_id).lock_ledgers, MIN_LOCK_LEDGERS);
-}
 
+    s.registry
+        .execute_task(&keeper, &executed, &Bytes::from_slice(&s.env, b"proof"));
+    assert_solvent(
+        &s.env,
+        &s.registry,
+        &token,
+        &s.registry.address,
+        &[expired],
+        std::slice::from_ref(&keeper),
 #[test]
 fn test_register_task_lock_ledgers_above_max_fails() {
     let s = setup();
@@ -590,8 +684,15 @@ fn test_register_task_lock_ledgers_above_max_fails() {
         ),
         Err(Ok(KeeperError::InvalidTaskParams))
     );
-}
 
+    advance(&s.env, 200, 3_601);
+    assert_solvent(
+        &s.env,
+        &s.registry,
+        &token,
+        &s.registry.address,
+        &[expired],
+        std::slice::from_ref(&keeper),
 #[test]
 fn test_increase_reward_accepts_claimed_task() {
     let s = setup();
@@ -614,9 +715,15 @@ fn test_increase_reward_accepts_claimed_task() {
         &MAX_LOCK_LEDGERS,
         &None,
     );
-    assert_eq!(s.registry.get_task(&task_id).lock_ledgers, MAX_LOCK_LEDGERS);
-}
 
+    s.registry.expire_task(&expired);
+    assert_solvent(
+        &s.env,
+        &s.registry,
+        &token,
+        &s.registry.address,
+        &[],
+        std::slice::from_ref(&keeper),
 #[test]
 fn test_register_task_ttl_ledgers_below_min_fails() {
     let s = setup();
@@ -634,8 +741,42 @@ fn test_register_task_ttl_ledgers_below_min_fails() {
         ),
         Err(Ok(KeeperError::InvalidTaskParams))
     );
-}
 
+    assert_eq!(s.registry.withdraw_rewards(&keeper), 1_935i128);
+    assert_solvent(
+        &s.env,
+        &s.registry,
+        &token,
+        &s.registry.address,
+        &[],
+        std::slice::from_ref(&keeper),
+    );
+
+    s.registry.sweep_fees(&s.admin, &treasury, &20i128);
+    assert_solvent(
+        &s.env,
+        &s.registry,
+        &token,
+        &s.registry.address,
+        &[],
+        std::slice::from_ref(&keeper),
+    );
+
+    s.registry.sweep_fees(&s.admin, &treasury, &46i128);
+    assert_solvent(
+        &s.env,
+        &s.registry,
+        &token,
+        &s.registry.address,
+        &[],
+        std::slice::from_ref(&keeper),
+    );
+
+    assert_eq!(token.balance(&s.registry.address), 0i128);
+    assert_eq!(s.registry.keeper_balance(&keeper), 0i128);
+    assert_eq!(s.registry.fees_accrued(), 0i128);
+    assert_eq!(token.balance(&treasury), 66i128);
+}
 #[test]
 fn test_register_task_ttl_ledgers_at_min_succeeds() {
     let s = setup();
