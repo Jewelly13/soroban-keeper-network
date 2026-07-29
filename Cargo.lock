@@ -1365,6 +1365,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "signature-verifier"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "keeper-registry",
+ "rand",
+ "soroban-sdk",
+]
+
+[[package]]
 name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
