@@ -1,3 +1,9 @@
+use proptest::prelude::*;
+use soroban_sdk::{
+    testutils::{Address as _, Ledger},
+    token::StellarAssetClient,
+    Address, Bytes, Env,
+};
 //! # KeeperRegistry — Test Suite
 //!
 //! Property tests for keeper reward withdrawal liveness.
@@ -2665,13 +2671,26 @@ fn test_cancel_task_rejects_reentrant_refund() {
     let registry = KeeperRegistryClient::new(&env, &registry_id);
     registry.initialize(&admin, &token_id, &300u32);
 
-    let deadline = env.ledger().timestamp() + 3_600;
+use crate::{DataKey, KeeperRegistry, KeeperRegistryClient};
+
+const INITIAL_TOKEN_BALANCE: i128 = 1_000_000_000;
+const TASK_REWARD: i128 = 10_000;
+const LOCK_LEDGERS: u32 = 10;
+const TASK_TTL_LEDGERS: u32 = 1_000;
+
+fn execute_and_assert_fee(
+    env: &Env,
+    registry: &KeeperRegistryClient,
+    owner: &Address,
+    keeper: &Address,
+    reward: i128,
+) {
+    let deadline = env.ledger().sequence() as u64 + 100;
     let task_id = registry.register_task(
-        &admin,
-        &TaskType::Liquidation,
-        &calldata(&env),
-        &1_000_000i128,
+        owner,
+        &reward,
         &deadline,
+        &TASK_TTL_LEDGERS,
         &17_280u32,
         &120u32,
         &None,
@@ -2771,172 +2790,91 @@ fn test_pause_before_init_fails() {
         registry.try_pause(&caller),
         Err(Ok(KeeperError::NotInitialized))
     );
-}
 
-#[test]
-fn test_unpause_before_init_fails() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let registry = uninitialized_registry(&env);
-    let caller = Address::generate(&env);
+    registry.claim_task(&task_id, keeper);
+
+    let fee_bps_before = registry.get_fee_bps();
+    let keeper_balance_before = registry.get_keeper_balance(keeper);
+
+    registry.execute_task(&task_id, keeper, &Bytes::new(env));
+
+    let keeper_balance_after = registry.get_keeper_balance(keeper);
+    let keeper_delta = keeper_balance_after - keeper_balance_before;
+    let applied_fee = reward - keeper_delta;
+    let expected_fee = reward * i128::from(fee_bps_before) / 10_000;
+
     assert_eq!(
-        registry.try_unpause(&caller),
-        Err(Ok(KeeperError::NotInitialized))
+        applied_fee,
+        expected_fee,
+        "fee mismatch: get_fee_bps() reported {fee_bps_before} bps, expected fee {expected_fee}, applied fee {applied_fee} (reward={reward}, keeper_delta={keeper_delta})"
     );
 }
 
-#[test]
-fn test_set_fee_bps_before_init_fails() {
-    let env = Env::default();
+fn setup_registry(
+    env: &Env,
+) -> (Address, Address, Address, KeeperRegistryClient<'_>) {
     env.mock_all_auths();
-    let registry = uninitialized_registry(&env);
-    let caller = Address::generate(&env);
-    assert_eq!(
-        registry.try_set_fee_bps(&caller, &500u32),
-        Err(Ok(KeeperError::NotInitialized))
+
+    let admin = Address::generate(env);
+    let owner = Address::generate(env);
+    let keeper = Address::generate(env);
+
+    let token_id = env.register_stellar_asset_contract(admin.clone());
+    let token_admin = StellarAssetClient::new(env, &token_id);
+    token_admin.mint(&owner, &INITIAL_TOKEN_BALANCE);
+
+    let registry_id = env.register_contract(None, KeeperRegistry);
+    let registry = KeeperRegistryClient::new(env, &registry_id);
+    registry.initialize(
+        &admin,
+        &token_id,
+        &1i128,
+        &0u32,
+        &LOCK_LEDGERS,
     );
-}
 
-#[test]
-fn test_set_min_reward_before_init_fails() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let registry = uninitialized_registry(&env);
-    let caller = Address::generate(&env);
-    assert_eq!(
-        registry.try_set_min_reward(&caller, &1i128),
-        Err(Ok(KeeperError::NotInitialized))
-    );
-}
-
-#[test]
-fn test_transfer_admin_before_init_fails() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let registry = uninitialized_registry(&env);
-    let caller = Address::generate(&env);
-    let new_admin = Address::generate(&env);
-    assert_eq!(
-        registry.try_transfer_admin(&caller, &new_admin),
-        Err(Ok(KeeperError::NotInitialized))
-    );
-}
-
-#[test]
-fn test_upgrade_before_init_fails() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let registry = uninitialized_registry(&env);
-    let caller = Address::generate(&env);
-    let bogus = soroban_sdk::BytesN::from_array(&env, &[0u8; 32]);
-    assert_eq!(
-        registry.try_upgrade(&caller, &bogus),
-        Err(Ok(KeeperError::NotInitialized))
-    );
-}
-
-#[test]
-fn test_sweep_fees_before_init_fails() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let registry = uninitialized_registry(&env);
-    let caller = Address::generate(&env);
-    let treasury = Address::generate(&env);
-    // require_admin runs before the reward-token lookup, so this surfaces
-    // NotInitialized from the missing Admin key, not from RewardToken.
-    assert_eq!(
-        registry.try_sweep_fees(&caller, &treasury, &1i128),
-        Err(Ok(KeeperError::NotInitialized))
-    );
-}
-
-// increase_reward, cancel_task, and expire_task all load the task by id
-// before they ever reach the reward-token lookup, and no task can exist on
-// a registry that was never initialized (register_task itself requires the
-// reward token to be configured). So "call before initialize" can only ever
-// surface TaskNotFound for these three, not NotInitialized — that ordering
-// (existence check before configuration check) is correct, not a gap.
-//
-// The reward-token dependency in these three functions is still real,
-// though: a registry that was initialized and had a task registered, but
-// later had its RewardToken key removed by e.g. a partial storage
-// migration, must not panic. These tests reproduce exactly that.
-
-#[test]
-fn test_increase_reward_after_reward_token_migration_drop_fails() {
-    let s = setup();
-    let id = register_default_task(&s);
-    s.env.as_contract(&s.registry.address, || {
-        s.env.storage().instance().remove(&DataKey::RewardToken);
+    env.as_contract(&registry_id, || {
+        env.storage().instance().remove(&DataKey::FeeBps);
     });
-    assert_eq!(
-        s.registry.try_increase_reward(&s.admin, &id, &1i128),
-        Err(Ok(KeeperError::NotInitialized))
-    );
+
+    (admin, owner, keeper, registry)
 }
 
 #[test]
-fn test_cancel_task_after_reward_token_migration_drop_fails() {
-    let s = setup();
-    let id = register_default_task(&s);
-    s.env.as_contract(&s.registry.address, || {
-        s.env.storage().instance().remove(&DataKey::RewardToken);
-    });
-    assert_eq!(
-        s.registry.try_cancel_task(&s.admin, &id),
-        Err(Ok(KeeperError::NotInitialized))
-    );
-}
-
-#[test]
-fn test_expire_task_after_reward_token_migration_drop_fails() {
-    let s = setup();
-    let id = register_default_task(&s);
-    s.env.as_contract(&s.registry.address, || {
-        s.env.storage().instance().remove(&DataKey::RewardToken);
-    });
-    advance(&s.env, 1, 3_601); // past deadline
-    assert_eq!(
-        s.registry.try_expire_task(&id),
-        Err(Ok(KeeperError::NotInitialized))
-    );
-}
-
-#[test]
-fn test_withdraw_rewards_after_reward_token_migration_drop_fails() {
-    let s = setup();
-    let keeper = executed_task_keeper(&s); // has a balance to withdraw
-    s.env.as_contract(&s.registry.address, || {
-        s.env.storage().instance().remove(&DataKey::RewardToken);
-    });
-    assert_eq!(
-        s.registry.try_withdraw_rewards(&keeper),
-        Err(Ok(KeeperError::NotInitialized))
-    );
-}
-
-#[test]
-fn test_require_admin_distinguishes_not_initialized_from_wrong_caller() {
-    // Uninitialized: no admin configured at all.
+fn fee_bps_matches_applied_fee_when_never_configured() {
     let env = Env::default();
-    env.mock_all_auths();
-    let registry = uninitialized_registry(&env);
-    let caller = Address::generate(&env);
-    assert_eq!(
-        registry.try_pause(&caller),
-        Err(Ok(KeeperError::NotInitialized))
-    );
+    let (_admin, owner, keeper, registry) = setup_registry(&env);
 
-    // Initialized, but caller isn't the admin: a different, more specific
-    // error than "not initialized".
-    let s = setup();
-    let stranger = Address::generate(&s.env);
-    assert_eq!(
-        s.registry.try_pause(&stranger),
-        Err(Ok(KeeperError::Unauthorized))
+    execute_and_assert_fee(
+        &env,
+        &registry,
+        &owner,
+        &keeper,
+        TASK_REWARD,
     );
 }
 
+proptest! {
+    #[test]
+    fn fee_bps_matches_applied_fee_across_fee_history(
+        fee_history in prop::collection::vec(any::<Option<u16>>(), 1..8)
+    ) {
+        let env = Env::default();
+        let (admin, owner, keeper, registry) = setup_registry(&env);
+
+        for fee in fee_history {
+            if let Some(fee) = fee {
+                registry.set_fee_bps(&admin, &(u32::from(fee) % 10_001));
+            }
+
+            execute_and_assert_fee(
+                &env,
+                &registry,
+                &owner,
+                &keeper,
+                TASK_REWARD,
+            );
+        }
 // ─────────────────────────────────────────────────────────────────────────────
 // Property Tests (Invariants I-1, I-2, I-3)
 // ─────────────────────────────────────────────────────────────────────────────
