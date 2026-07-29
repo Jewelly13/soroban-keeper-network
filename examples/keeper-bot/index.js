@@ -30,7 +30,10 @@
  *     that function's doc comment for why this matters
  *
  * Production keepers should additionally add:
- *   - Persistent task state DB (SQLite / Redis) to avoid double-claiming
+ *   - Persistent task state DB (SQLite / Redis) to avoid double-claiming.
+ *     This example only keeps a bounded in-memory outcome cache (see
+ *     `taskOutcomes` below) that is entirely lost on every restart — a real
+ *     DB is meant to be a drop-in replacement for that Map, not a rewrite.
  *   - MEV-aware submission (bundle multiple tasks)
  *   - Prometheus metrics endpoint
  *   - Alerting (PagerDuty / Telegram) on missed executions
@@ -72,6 +75,33 @@ const NETWORK_CONFIG = {
 };
 
 let CONFIG; // Initialized in main() after validation
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Cross-round state
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Ledger to resume the event scan from on the next round. Starts out `null`,
+// which tells the first round to fall back to the ~1000-ledger lookback
+// window (see keeperLoop). Every round after that advances this cursor using
+// the `latestLedger` reported by the getEvents RPC response itself, so each
+// round only scans the ledgers that closed since the previous round instead
+// of re-reading the same ~998 ledgers every time.
+let cursorLedger = null;
+
+// In-memory cache of taskId -> terminal outcome this bot has itself caused
+// ('executed' via execute_task, 'expired' via expire_task), so a task the
+// cursor re-surfaces (or that falls inside the very first lookback window
+// more than once) isn't re-submitted as a fresh claim/execute attempt.
+//
+// Eviction policy: an entry is removed once its task's `deadline` has
+// passed, because a task past its deadline can never be claimed or executed
+// again regardless of what this cache remembers — so the map is naturally
+// bounded by the number of tasks with a still-live deadline, not by time or
+// an arbitrary size cap. Eviction runs at the top of every round.
+//
+// This cache is entirely in-memory and is lost on process restart — that is
+// an accepted limitation for this example bot (see the header comment).
+const taskOutcomes = new Map(); // taskId -> { outcome: "executed" | "expired", deadline: number }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Configuration validation
@@ -353,6 +383,12 @@ async function readContract(server, sourcePublicKey, networkPassphrase, contract
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
+ * Returns `{ tasks, latestLedger }`. `latestLedger` is the ledger the RPC
+ * node had most recently ingested at query time (straight from the
+ * getEvents response) so callers can advance a scan cursor without an extra
+ * getLatestLedger() round-trip. It is `null` if the query failed, so callers
+ * know not to advance their cursor past ledgers that were never actually
+ * scanned.
  * Fetches TaskRegistered events across the window, following the pagination
  * cursor. Bounded by `CONFIG.eventsMaxPages` so one very busy window cannot
  * stall a round indefinitely; hitting the bound is logged, never silent.
@@ -362,6 +398,7 @@ async function readContract(server, sourcePublicKey, networkPassphrase, contract
  */
 async function fetchPendingTasks(server, contractId, startLedger) {
   const tasks = [];
+  let latestLedger = null;
   try {
     // Query TaskRegistered events
     const response = await server.getEvents({
@@ -375,6 +412,8 @@ async function fetchPendingTasks(server, contractId, startLedger) {
       ],
       limit: 100,
     });
+
+    latestLedger = response.latestLedger;
 
     for (const event of response.events || []) {
       try {
@@ -458,8 +497,38 @@ async function keeperLoop(
     const nowSeconds = Math.floor(Date.now() / 1000);
     console.log(`\n🔄  Keeper round at ${new Date().toISOString()}`);
 
-    const latestLedger = await server.getLatestLedger();
-    const startLedger = Math.max(1, latestLedger.sequence - 1000);
+    // Evict outcome-cache entries whose deadline has passed — see the
+    // `taskOutcomes` declaration for why this is a safe & sufficient policy.
+    for (const [taskId, entry] of taskOutcomes) {
+      if (entry.deadline <= nowSeconds) taskOutcomes.delete(taskId);
+    }
+
+    // Only the very first round (no cursor yet) uses a fixed lookback
+    // window (last ~1000 ledgers ≈ 1.4h at 5s) so a freshly started bot
+    // still picks up recently registered tasks. Every subsequent round
+    // resumes exactly where the previous one left off.
+    let startLedger;
+    if (cursorLedger === null) {
+      const latestLedger = await server.getLatestLedger();
+      startLedger = Math.max(1, latestLedger.sequence - 1000);
+    } else {
+      startLedger = cursorLedger;
+    }
+
+    const { tasks: fetchedTasks, latestLedger: scannedLedger } = await fetchPendingTasks(
+      server, contractId, startLedger
+    );
+
+    if (scannedLedger !== null) {
+      console.log(
+        `  📜  Scanned ledgers ${startLedger} to ${scannedLedger} (${scannedLedger - startLedger + 1} ledgers)`
+      );
+      // Resume from the next unscanned ledger next round. If the query
+      // failed (scannedLedger === null), leave the cursor where it is so
+      // the next round retries the same window instead of silently
+      // skipping ledgers we never actually read.
+      cursorLedger = scannedLedger + 1;
+    }
 
     const pendingTasks = await fetchPendingTasks(
       server,
