@@ -109,9 +109,15 @@ pub struct Task {
     pub calldata: Bytes,
     /// Reward escrowed in this contract (token units / XLM stroops).
     pub reward: i128,
-    /// Unix timestamp (seconds) after which the task may be expired.
+    /// Unix timestamp IN SECONDS after which the task may be expired. Not
+    /// directly comparable to `ttl_ledgers` — see that field.
     pub deadline: u64,
-    /// Ledger TTL for this storage entry.
+    /// Ledger TTL for this storage entry, IN LEDGERS (not seconds). Ledgers
+    /// close roughly every `SECONDS_PER_LEDGER` seconds, so this and
+    /// `deadline` are different units; `register_task`/`extend_deadline`
+    /// enforce that this always covers `deadline` plus a safety margin so the
+    /// entry cannot be evicted while its escrow is still live (see
+    /// `required_ttl_ledgers`).
     pub ttl_ledgers: u32,
     pub status: TaskStatus,
     /// Set when a keeper claims the task.
@@ -181,6 +187,13 @@ pub enum KeeperError {
     /// A function requiring configured state (`initialize` must have been
     /// called) was invoked on a registry that isn't configured yet.
     NotInitialized = 15,
+    /// `ttl_ledgers` does not cover the task's `deadline` plus the safety
+    /// margin — the storage entry could expire while the escrow is still
+    /// live. See [`required_ttl_ledgers`].
+    TtlTooShort = 16,
+    // 17 is reserved for `CalldataTooLarge`, added by a sibling in-flight PR
+    // (see #13 / register_task calldata bounding). Left as a gap rather than
+    // reused so the two branches don't collide on the same discriminant.
     // 16 is reserved for `TtlTooShort`, added by a sibling in-flight PR (see
     // #11 / register_task deadline-vs-TTL invariant). Left as a gap rather
     // than reused so the two branches don't collide on the same discriminant.
@@ -196,6 +209,8 @@ pub enum KeeperError {
     /// keeper may retry `execute_task` with a different proof against the
     /// same claim.
     VerificationFailed = 19,
+    /// Arithmetic operation would overflow or underflow.
+    ArithmeticOverflow = 19,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -313,6 +328,24 @@ pub fn emit_verifier_updated(e: &Env, task_id: u64, verifier: &Option<Address>) 
     e.events().publish(
         (symbol_short!("verifier"), symbol_short!("task")),
         (task_id, verifier.clone()),
+pub fn emit_min_reward_updated(e: &Env, old_min: i128, new_min: i128) {
+    e.events().publish(
+        (symbol_short!("minrwd"), symbol_short!("admin")),
+        (old_min, new_min),
+    );
+}
+
+pub fn emit_fees_swept(e: &Env, treasury: &Address, amount: i128, remaining: i128) {
+    e.events().publish(
+        (symbol_short!("sweep"), symbol_short!("admin")),
+        (treasury.clone(), amount, remaining),
+    );
+}
+
+pub fn emit_initialized(e: &Env, admin: &Address, reward_token: &Address, fee_bps: u32) {
+    e.events().publish(
+        (symbol_short!("init"), symbol_short!("admin")),
+        (admin.clone(), reward_token.clone(), fee_bps),
     );
 }
 
@@ -395,9 +428,33 @@ fn next_task_id(e: &Env) -> u64 {
         .instance()
         .get(&DataKey::TaskCounter)
         .unwrap_or(0u64);
-    let next = id.checked_add(1).expect("task id overflow");
+    // Unreachable: exhausting u64 task ids requires ~1.8e19 registrations, far
+    // beyond any plausible lifetime of this contract.
+    let next = id.checked_add(1).expect("task id counter exhausted");
     e.storage().instance().set(&DataKey::TaskCounter, &next);
     next
+}
+
+/// Ledgers close roughly every 5 seconds on Stellar. Used only to sanity-check
+/// that a task's storage outlives its deadline; a conservative estimate is
+/// correct here because over-estimating the ledger rate over-provisions TTL.
+const SECONDS_PER_LEDGER: u64 = 5;
+
+/// Extra ledgers kept beyond the deadline so `expire_task` (and `cancel_task`/
+/// `execute_task`) are still callable for a while after the deadline passes,
+/// giving a margin against clock drift between the two units below.
+const TTL_SAFETY_MARGIN_LEDGERS: u32 = 17_280; // ~1 day
+
+/// Minimum `ttl_ledgers` a task with the given `deadline` must be stored with
+/// so its Persistent storage entry cannot be evicted while the escrow it
+/// guards is still live. `deadline` is a unix timestamp (seconds);
+/// `ttl_ledgers` is a ledger count — the two are different units with no
+/// fixed conversion, so this is deliberately conservative
+/// (see [`SECONDS_PER_LEDGER`], [`TTL_SAFETY_MARGIN_LEDGERS`]).
+fn required_ttl_ledgers(e: &Env, deadline: u64) -> u64 {
+    let seconds_until_deadline = deadline.saturating_sub(e.ledger().timestamp());
+    let ledgers_until_deadline = seconds_until_deadline / SECONDS_PER_LEDGER;
+    ledgers_until_deadline + TTL_SAFETY_MARGIN_LEDGERS as u64
 }
 
 fn load_task(e: &Env, task_id: u64) -> Result<Task, KeeperError> {
@@ -452,10 +509,12 @@ fn fee_bps(e: &Env) -> u32 {
 pub fn split_reward(reward: i128, fee_bps: u32) -> (i128, i128) {
     let fee = reward
         .checked_mul(fee_bps as i128)
-        .expect("overflow")
-        .checked_div(10_000)
-        .expect("div zero");
-    (reward.checked_sub(fee).expect("underflow"), fee)
+        .ok_or(KeeperError::ArithmeticOverflow)?
+        / 10_000; // Divisor is a non-zero literal, cannot fail
+    let net = reward
+        .checked_sub(fee)
+        .ok_or(KeeperError::ArithmeticOverflow)?;
+    Ok((net, fee))
 }
 
 /// Adds `amount` to a keeper's withdrawable balance in Persistent storage.
@@ -467,24 +526,25 @@ pub fn split_reward(reward: i128, fee_bps: u32) -> (i128, i128) {
 /// zero-out/write), but deliberately *not* on `keeper_balance` reads — see
 /// the doc comment there for why a keeper that never returns can still see
 /// its balance entry archive.
-fn credit_keeper(e: &Env, keeper: &Address, amount: i128) {
+fn credit_keeper(e: &Env, keeper: &Address, amount: i128) -> Result<(), KeeperError> {
     let key = DataKey::KeeperReward(keeper.clone());
     let current: i128 = e.storage().persistent().get(&key).unwrap_or(0);
     let updated = current
         .checked_add(amount)
-        .expect("keeper balance overflow");
+        .ok_or(KeeperError::ArithmeticOverflow)?;
     e.storage().persistent().set(&key, &updated);
     e.storage().persistent().extend_ttl(
         &key,
         KEEPER_BALANCE_BUMP_THRESHOLD,
         KEEPER_BALANCE_BUMP_LEDGERS,
     );
+    Ok(())
 }
 
 /// Adds `amount` to the swept-able protocol fee accumulator (instance storage).
-fn accrue_fee(e: &Env, amount: i128) {
+fn accrue_fee(e: &Env, amount: i128) -> Result<(), KeeperError> {
     if amount == 0 {
-        return;
+        return Ok(());
     }
     let current: i128 = e
         .storage()
@@ -493,8 +553,9 @@ fn accrue_fee(e: &Env, amount: i128) {
         .unwrap_or(0);
     let updated = current
         .checked_add(amount)
-        .expect("fee accumulator overflow");
+        .ok_or(KeeperError::ArithmeticOverflow)?;
     e.storage().instance().set(&DataKey::FeesAccrued, &updated);
+    Ok(())
 }
 
 /// True once a claimed task's exclusive lock window has elapsed, meaning any
@@ -582,6 +643,7 @@ impl KeeperRegistry {
         e.storage().instance().set(&DataKey::TaskCounter, &0u64);
         bump_instance(&e);
 
+        emit_initialized(&e, &admin, &reward_token, fee_bps);
         log!(&e, "KeeperRegistry initialized by {}", admin);
         Ok(())
     }
@@ -648,7 +710,11 @@ impl KeeperRegistry {
         bump_instance(&e);
 
         // Escrow the reward from the owner into this contract.
-        reward_token(&e)?.transfer(&owner, &e.current_contract_address(), &reward);
+        let token = reward_token(&e)?;
+        if (ttl_ledgers as u64) < required_ttl_ledgers(&e, deadline) {
+            return Err(KeeperError::TtlTooShort);
+        }
+        token.transfer(&owner, &e.current_contract_address(), &reward);
 
         let task_id = next_task_id(&e);
         let task = Task {
@@ -733,6 +799,9 @@ impl KeeperRegistry {
         }
         if new_deadline <= task.deadline {
             return Err(KeeperError::DeadlinePassed);
+        }
+        if (task.ttl_ledgers as u64) < required_ttl_ledgers(&e, new_deadline) {
+            return Err(KeeperError::TtlTooShort);
         }
 
         bump_instance(&e);
@@ -876,9 +945,9 @@ impl KeeperRegistry {
         }
 
         bump_instance(&e);
-        let (keeper_net, fee) = split_reward(task.reward, fee_bps(&e));
-        credit_keeper(&e, &keeper, keeper_net);
-        accrue_fee(&e, fee);
+        let (keeper_net, fee) = split_reward(task.reward, fee_bps(&e))?;
+        credit_keeper(&e, &keeper, keeper_net)?;
+        accrue_fee(&e, fee)?;
 
         task.status = TaskStatus::Executed;
         save_task(&e, task_id, &task);
@@ -1083,7 +1152,9 @@ impl KeeperRegistry {
             return Err(KeeperError::InvalidReward);
         }
         bump_instance(&e);
+        let old_min: i128 = e.storage().instance().get(&DataKey::MinReward).unwrap_or(0);
         e.storage().instance().set(&DataKey::MinReward, &min_reward);
+        emit_min_reward_updated(&e, old_min, min_reward);
         log!(&e, "Min reward set to {}", min_reward);
         Ok(())
     }
@@ -1150,6 +1221,8 @@ impl KeeperRegistry {
             .set(&DataKey::FeesAccrued, &(accrued - amount));
         reward_token(&e)?.transfer(&e.current_contract_address(), &treasury, &amount);
 
+        let remaining = accrued - amount;
+        emit_fees_swept(&e, &treasury, amount, remaining);
         log!(&e, "Swept {} fees to {}", amount, treasury);
         Ok(())
     }
