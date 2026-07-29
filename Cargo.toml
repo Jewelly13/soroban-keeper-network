@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "contracts/keeper-registry",
     "contracts/verifiers/signature-verifier",
+    "contracts/verifiers/inclusion-verifier",
 ]
 
 [workspace.dependencies]

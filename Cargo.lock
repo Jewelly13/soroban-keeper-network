@@ -778,6 +778,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
 
 [[package]]
+name = "inclusion-verifier"
+version = "0.1.0"
+dependencies = [
+ "keeper-registry",
+ "soroban-sdk",
+]
+
+[[package]]
 name = "indexmap"
 version = "1.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1370,7 +1378,7 @@ version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
  "keeper-registry",
- "rand",
+ "rand 0.8.7",
  "soroban-sdk",
 ]
 
