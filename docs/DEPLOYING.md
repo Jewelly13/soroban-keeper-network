@@ -73,8 +73,6 @@ The bot can be run as a long-running daemon or as a one-shot process via cron.
 
 ### Daemon mode
 
-This is the default. The bot will poll for tasks every `POLL_INTERVAL_MS`.
-
 ```bash
 cd examples/keeper-bot
 cp .env.example .env
@@ -83,11 +81,33 @@ npm install
 npm start
 ```
 
-The bot polls for `TaskRegistered` events, claims claimable tasks, executes them
-off-chain, submits proof via `execute_task`, and periodically withdraws accrued
-rewards. It also expires past-deadline tasks (`EXPIRE_STALE_TASKS=true`) to
-refund owners. See the header of `examples/keeper-bot/index.js` for tuning knobs
-(`POLL_INTERVAL_MS`, `MAX_RETRIES`, `WITHDRAW_THRESHOLD`, …).
+The bot polls for `TaskRegistered` events, reads the current on-chain
+`get_fee_bps` value once per round, and estimates the net reward before it
+submits `claim_task`. Tasks that do not meet both profitability guardrails are
+skipped without submitting a transaction. It then executes profitable tasks
+and periodically withdraws accrued rewards. It also expires past-deadline tasks
+(`EXPIRE_STALE_TASKS=true`) to refund owners.
+
+### Calibrating profitability settings
+
+`MIN_NET_REWARD_STROOPS` is the minimum amount the keeper expects to retain after
+the registry fee. The default is `1000000` stroops (0.1 XLM).
+
+`ESTIMATED_TX_COST_STROOPS` is a deliberately static estimate for one submitted
+transaction. Set it from the keeper's observed claim and execute costs. The bot
+uses three times this value: claim, execute, and an amortised withdrawal. The
+claim simulation's reported resource fee is logged alongside the static estimate
+so operators can tune it over time. It is an estimate, not a fee guarantee.
+
+`MIN_PROFIT_MULTIPLE` requires the net reward to exceed the estimated total cost
+by that multiple; the default is `2.0`. Increase it when fee volatility or failed
+transactions require a larger safety margin. Decrease it only after observing
+stable costs. Both checks apply, so a task must clear the minimum net reward and
+the profit multiple.
+
+All reward and cost comparisons are performed as integer stroop amounts. The
+fee rate is read from the initialized contract rather than relying on any view
+fallback value.
 
 ### Cron mode
 
@@ -102,8 +122,8 @@ status code indicating success (0) or failure (non-zero).
 * * * * * your-user /path/to/soroban-keeper-network/examples/keeper-bot/run.sh >> /var/log/keeper-bot.log 2>&1
 ```
 
-You'll need a wrapper script like `run.sh` to `cd` into the right directory
-and invoke `node`.
+You'll need a wrapper script like `run.sh` to `cd` into the right directory and
+invoke `node`.
 
 **`run.sh`**
 ```bash
