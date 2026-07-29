@@ -85,7 +85,7 @@ fn register_reward_task(s: &Setup, reward: i128) -> u64 {
         &calldata(&s.env),
         &reward,
         &deadline,
-        &17_280u32,
+        &20_000u32,
         &120u32,
     )
 }
@@ -171,7 +171,7 @@ fn test_split_reward_invariants() {
 
     for &reward in &rewards {
         for &bps in &fee_rates {
-            let (keeper_net, fee) = split_reward(reward, bps);
+            let (keeper_net, fee) = split_reward(reward, bps).expect("split should succeed");
 
             // 1. Conservation: nothing leaks.
             assert_eq!(keeper_net + fee, reward, "reward={reward} bps={bps}");
@@ -279,7 +279,7 @@ fn test_register_task_success() {
         &calldata(&env),
         &1_000_000i128,
         &deadline,
-        &17_280u32,
+        &20_000u32,
         &120u32,
     );
 
@@ -319,7 +319,7 @@ fn test_register_task_escrows_reward() {
         &calldata(&env),
         &1_000_000i128,
         &(env.ledger().timestamp() + 3_600),
-        &17_280u32,
+        &20_000u32,
         &120u32,
     );
 
@@ -349,7 +349,7 @@ fn test_register_task_zero_reward_fails() {
             &calldata(&env),
             &0i128,
             &(env.ledger().timestamp() + 3_600),
-            &17_280u32,
+            &20_000u32,
             &120u32,
         ),
         Err(Ok(KeeperError::InvalidReward))
@@ -378,7 +378,7 @@ fn test_register_task_past_deadline_fails() {
             &calldata(&env),
             &1_000_000i128,
             &past,
-            &17_280u32,
+            &20_000u32,
             &120u32,
         ),
         Err(Ok(KeeperError::DeadlinePassed))
@@ -408,12 +408,47 @@ fn test_register_increments_task_counter() {
             &calldata(&env),
             &100_000i128,
             &deadline,
-            &17_280u32,
+            &20_000u32,
             &60u32,
         );
         assert_eq!(id, expected_id);
     }
     assert_eq!(registry.task_count(), 3u64);
+}
+
+#[test]
+fn test_register_task_ttl_shorter_than_deadline_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    token::StellarAssetClient::new(&env, &token_id).mint(&admin, &5_000_000i128);
+
+    let registry_id = env.register(KeeperRegistry, ());
+    let registry = KeeperRegistryClient::new(&env, &registry_id);
+    registry.initialize(&admin, &token_id, &300u32);
+
+    // 30-day deadline, but only ~1 day of TTL — the exact scenario from the
+    // issue: the storage entry would die long before the deadline, stranding
+    // the escrow. Must be rejected outright.
+    let deadline = env.ledger().timestamp() + 2_592_000; // 30 days
+    assert_eq!(
+        registry.try_register_task(
+            &admin,
+            &TaskType::Liquidation,
+            &calldata(&env),
+            &1_000_000i128,
+            &deadline,
+            &17_280u32, // ~1 day of ledgers — nowhere near enough
+            &120u32,
+        ),
+        Err(Ok(KeeperError::TtlTooShort))
+    );
+    // Nothing was escrowed and no task was created.
+    assert_eq!(registry.task_count(), 0u64);
 }
 
 #[test]
@@ -439,7 +474,7 @@ fn test_register_task_with_max_calldata_succeeds() {
         &max_calldata,
         &1_000_000i128,
         &(env.ledger().timestamp() + 3_600),
-        &17_280u32,
+        &20_000u32,
         &120u32,
     );
     assert_eq!(registry.get_task(&id).calldata.len(), MAX_CALLDATA_LEN);
@@ -476,6 +511,65 @@ fn test_register_task_over_max_calldata_fails() {
 }
 
 #[test]
+fn test_register_task_ttl_covering_deadline_succeeds() {
+    let s = setup();
+    // deadline is 3_600s away; required TTL is 720 ledgers + the 17_280
+    // safety margin = 18_000. 20_000 comfortably covers it.
+    let id = register_default_task(&s);
+    assert_eq!(s.registry.get_task(&id).status, TaskStatus::Pending);
+}
+
+#[test]
+fn test_extend_deadline_ttl_too_short_fails() {
+    let s = setup();
+    let id = register_default_task(&s); // ttl_ledgers = 20_000
+    let old = s.registry.get_task(&id).deadline;
+
+    // Push the deadline out far enough that the existing TTL (20_000 ledgers)
+    // no longer covers it plus the safety margin.
+    let far_future = old + 1_000_000;
+    assert_eq!(
+        s.registry.try_extend_deadline(&s.admin, &id, &far_future),
+        Err(Ok(KeeperError::TtlTooShort))
+    );
+    // The deadline was not mutated.
+    assert_eq!(s.registry.get_task(&id).deadline, old);
+}
+
+#[test]
+fn test_expire_task_succeeds_past_old_ttl_boundary() {
+    let s = setup();
+    let keeper = Address::generate(&s.env);
+    let token = token::Client::new(&s.env, &s.token_id);
+    let before = token.balance(&s.admin);
+
+    // Register with a deadline far enough out that a naive ttl_ledgers of
+    // ~1 day (17_280, as in the old README example) would have expired the
+    // storage entry long before the deadline. The TTL invariant forces a
+    // larger value here, so the entry must still be alive at expiry time.
+    let deadline = s.env.ledger().timestamp() + 172_800; // 2 days
+    let required = 172_800 / 5 + 17_280; // matches required_ttl_ledgers
+    let id = s.registry.register_task(
+        &s.admin,
+        &TaskType::Liquidation,
+        &calldata(&s.env),
+        &1_000_000i128,
+        &deadline,
+        &(required as u32),
+        &120u32,
+    );
+    s.registry.claim_task(&keeper, &id); // claimed but never executed
+
+    // Advance well past where a 17_280-ledger TTL (the old unsafe default)
+    // would have evicted the entry, and past the deadline itself.
+    advance(&s.env, 40_000, 172_801);
+    s.registry.expire_task(&id); // must still succeed and refund the owner
+
+    assert_eq!(token.balance(&s.admin), before);
+    assert_eq!(s.registry.get_task(&id).status, TaskStatus::Expired);
+}
+
+#[test]
 fn test_register_task_with_empty_calldata_succeeds() {
     let env = Env::default();
     env.mock_all_auths();
@@ -499,7 +593,7 @@ fn test_register_task_with_empty_calldata_succeeds() {
         &empty,
         &1_000_000i128,
         &(env.ledger().timestamp() + 3_600),
-        &17_280u32,
+        &20_000u32,
         &120u32,
     );
     assert_eq!(registry.get_task(&id).calldata.len(), 0);
@@ -742,7 +836,7 @@ fn claim_with_lock(s: &Setup, keeper: &Address, lock_ledgers: u32) -> (u64, u32)
         &calldata(&s.env),
         &1_000_000i128,
         &deadline,
-        &17_280u32,
+        &20_000u32,
         &lock_ledgers,
     );
     s.registry.claim_task(keeper, &id);
@@ -818,7 +912,7 @@ fn test_lock_window_extending_past_deadline_is_blocked_by_deadline_first() {
         &calldata(&s.env),
         &1_000_000i128,
         &deadline,
-        &17_280u32,
+        &20_000u32,
         &1_000u32,
     );
     s.registry.claim_task(&first, &id);
@@ -893,7 +987,7 @@ fn test_get_fee_bps_matches_applied_fee_when_never_written() {
     s.registry
         .execute_task(&keeper, &id, &Bytes::from_slice(&s.env, b"proof"));
 
-    let (expected_net, _) = split_reward(1_000_000i128, reported_fee_bps);
+    let (expected_net, _) = split_reward(1_000_000i128, reported_fee_bps).unwrap();
     assert_eq!(s.registry.keeper_balance(&keeper), expected_net);
     assert_eq!(reported_fee_bps, 0u32);
 }
@@ -912,7 +1006,7 @@ fn test_get_fee_bps_matches_applied_fee_after_set_fee_bps() {
     s.registry
         .execute_task(&keeper, &id, &Bytes::from_slice(&s.env, b"proof"));
 
-    let (expected_net, _) = split_reward(1_000_000i128, reported_fee_bps);
+    let (expected_net, _) = split_reward(1_000_000i128, reported_fee_bps).unwrap();
     assert_eq!(s.registry.keeper_balance(&keeper), expected_net);
     assert_eq!(reported_fee_bps, 750u32);
 }
@@ -1269,7 +1363,7 @@ fn test_expire_task_reentrancy_pays_refund_exactly_once() {
         &calldata(&env),
         &1_000_000i128,
         &deadline,
-        &17_280u32,
+        &20_000u32,
         &120u32,
     );
     assert_eq!(token.balance(&admin), 4_000_000i128); // escrowed
@@ -1383,7 +1477,7 @@ fn test_keeper_balance_accumulates_across_tasks_and_withdraws_as_one_sum() {
         s.registry
             .execute_task(&keeper1, &id1, &Bytes::from_slice(&s.env, b"proof"));
 
-        let (net1, fee1) = split_reward(reward1, fee_bps);
+        let (net1, fee1) = split_reward(reward1, fee_bps).unwrap();
         keeper1_balance += net1;
         expected_fees += fee1;
 
@@ -1398,7 +1492,7 @@ fn test_keeper_balance_accumulates_across_tasks_and_withdraws_as_one_sum() {
             s.registry
                 .execute_task(&keeper2, &id2, &Bytes::from_slice(&s.env, b"proof"));
 
-            let (net2, fee2) = split_reward(reward2, fee_bps);
+            let (net2, fee2) = split_reward(reward2, fee_bps).unwrap();
             keeper2_balance += net2;
             expected_fees += fee2;
 
@@ -1625,7 +1719,7 @@ fn test_pause_blocks_registration_but_allows_withdraw() {
             &calldata(&s.env),
             &100_000i128,
             &(s.env.ledger().timestamp() + 3_600),
-            &17_280u32,
+            &20_000u32,
             &60u32,
         ),
         Err(Ok(KeeperError::ContractPaused))
@@ -1898,7 +1992,7 @@ fn test_set_min_reward_rejects_below_floor() {
             &calldata(&s.env),
             &499_999i128,
             &(s.env.ledger().timestamp() + 3_600),
-            &17_280u32,
+            &20_000u32,
             &60u32,
         ),
         Err(Ok(KeeperError::InvalidReward))
@@ -1910,7 +2004,7 @@ fn test_set_min_reward_rejects_below_floor() {
         &calldata(&s.env),
         &500_000i128,
         &(s.env.ledger().timestamp() + 3_600),
-        &17_280u32,
+        &20_000u32,
         &60u32,
     );
     assert_eq!(id, 1u64);

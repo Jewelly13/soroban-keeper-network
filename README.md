@@ -18,6 +18,8 @@
 |-----|---------------|
 | [Live demo](docs/DEMO.md) | Deployed testnet contract + full on-chain transaction trace |
 | [Architecture](docs/ARCHITECTURE.md) | Components, task lifecycle, storage, money invariants, trust model |
+| [Fuzzing & property testing](docs/FUZZING.md) | Running/adding fuzz targets, the shared invariant module, crash-to-regression convention |
+| [Verifier design (E04)](docs/VERIFIER_DESIGN.md) | Proposed `IKeeperVerifier` interface for optional on-chain proof verification |
 | [Deploying & running](docs/DEPLOYING.md) | Testnet deploy walkthrough and keeper-bot operator guide |
 | [Deployments](DEPLOYMENTS.md) | Canonical record of on-chain addresses |
 | [Contributing](CONTRIBUTING.md) | How to pick up an issue and open your first PR |
@@ -211,6 +213,9 @@ A **shared, permissionless, on-chain coordination layer** where:
 - `register_task` MUST escrow the full reward amount from the caller.
 - Task ID MUST be monotonically increasing and globally unique.
 - `deadline` MUST be strictly in the future at registration time.
+- `ttl_ledgers` MUST cover `deadline` plus a safety margin (rejected with
+  `TtlTooShort` otherwise) so the storage entry cannot expire before the
+  escrow it guards is resolved.
 - `calldata` MUST NOT exceed `MAX_CALLDATA_LEN` (1024 bytes), rejected with
   `CalldataTooLarge` otherwise. Empty `calldata` is accepted.
 - `reward` MUST be greater than zero.
@@ -313,6 +318,14 @@ A **shared, permissionless, on-chain coordination layer** where:
 | `Task(u64)` | `Task` struct | Persistent | `task.ttl_ledgers` | — |
 | `KeeperReward(Address)` | `i128` | Persistent | ~1 year (6.3M ledgers) | `0` |
 
+`Task.deadline` is a unix timestamp **in seconds**; `Task.ttl_ledgers` is a
+Persistent storage TTL **in ledgers** — the two are different units with no
+fixed conversion. `register_task` and `extend_deadline` require
+`ttl_ledgers >= (deadline - now) / SECONDS_PER_LEDGER + TTL_SAFETY_MARGIN_LEDGERS`
+(5 seconds/ledger, ~1 day margin), rejecting the call with `TtlTooShort`
+otherwise. This guarantees a task's storage entry can never be evicted while
+its escrowed reward is still held — see
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#ttl--deadline-invariant).
 `Task.calldata` is capped at `MAX_CALLDATA_LEN` = 1024 bytes, enforced at
 `register_task`. `save_task` re-writes the whole `Task` struct (including
 `calldata`) on every lifecycle mutation — `claim_task`, `execute_task`, the
@@ -338,6 +351,9 @@ All events use two-topic format `(verb_symbol, noun_symbol)` for efficient filte
 | `TaskExpired` | `("exp", "task")` | `(task_id,)` |
 | `TaskCancelled` | `("cancel", "task")` | `(task_id, owner)` |
 | `RewardsWithdrawn` | `("withdraw", "reward")` | `(keeper, amount)` |
+| `Initialized` | `("init", "admin")` | `(admin, reward_token, fee_bps)` — emitted at most once |
+| `MinRewardUpdated` | `("minrwd", "admin")` | `(old_min, new_min)` |
+| `FeesSweep` | `("sweep", "admin")` | `(treasury, amount, remaining)` |
 
 #### Task Lifecycle State Machine
 
@@ -386,8 +402,11 @@ let task_id = registry.register_task(
     &TaskType::Liquidation,
     &calldata,                        // encoded liquidation params
     &reward_amount,                   // XLM in stroops
-    &(env.ledger().timestamp() + 3600), // deadline: 1 hour from now
-    &17_280u32,                       // TTL: ~1 day
+    &(env.ledger().timestamp() + 3600), // deadline: 1 hour from now (seconds)
+    &18_000u32,                       // TTL: ledgers, must cover the deadline
+                                       // plus a ~1-day safety margin — see
+                                       // "Storage Model" above — or this call
+                                       // fails with TtlTooShort
     &120u32,                          // lock: ~10 minutes
 );
 ```
