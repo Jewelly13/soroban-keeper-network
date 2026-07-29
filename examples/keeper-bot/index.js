@@ -30,7 +30,10 @@
  *     that function's doc comment for why this matters
  *
  * Production keepers should additionally add:
- *   - Persistent task state DB (SQLite / Redis) to avoid double-claiming
+ *   - Persistent task state DB (SQLite / Redis) to avoid double-claiming.
+ *     This example only keeps a bounded in-memory outcome cache (see
+ *     `taskOutcomes` below) that is entirely lost on every restart — a real
+ *     DB is meant to be a drop-in replacement for that Map, not a rewrite.
  *   - MEV-aware submission (bundle multiple tasks)
  *   - Prometheus metrics endpoint
  *   - Alerting (PagerDuty / Telegram) on missed executions
@@ -53,26 +56,41 @@ const {
   StrKey,
 } = require("@stellar/stellar-sdk");
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Configuration — set via environment variables or .env file
-// ─────────────────────────────────────────────────────────────────────────────
-
 const NETWORK_CONFIG = {
-  testnet: {
-    rpcUrl: "https://soroban-testnet.stellar.org",
-    networkPassphrase: Networks.TESTNET,
-  },
-  futurenet: {
-    rpcUrl: "https://rpc-futurenet.stellar.org",
-    networkPassphrase: Networks.FUTURENET,
-  },
-  mainnet: {
-    rpcUrl: "https://mainnet.sorobanrpc.com",
-    networkPassphrase: Networks.PUBLIC,
-  },
+  testnet: { rpcUrl: "https://soroban-testnet.stellar.org", networkPassphrase: Networks.TESTNET },
+  futurenet: { rpcUrl: "https://rpc-futurenet.stellar.org", networkPassphrase: Networks.FUTURENET },
+  mainnet: { rpcUrl: "https://mainnet.sorobanrpc.com", networkPassphrase: Networks.PUBLIC },
 };
 
+let CONFIG;
 let CONFIG; // Initialized in main() after validation
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Cross-round state
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Ledger to resume the event scan from on the next round. Starts out `null`,
+// which tells the first round to fall back to the ~1000-ledger lookback
+// window (see keeperLoop). Every round after that advances this cursor using
+// the `latestLedger` reported by the getEvents RPC response itself, so each
+// round only scans the ledgers that closed since the previous round instead
+// of re-reading the same ~998 ledgers every time.
+let cursorLedger = null;
+
+// In-memory cache of taskId -> terminal outcome this bot has itself caused
+// ('executed' via execute_task, 'expired' via expire_task), so a task the
+// cursor re-surfaces (or that falls inside the very first lookback window
+// more than once) isn't re-submitted as a fresh claim/execute attempt.
+//
+// Eviction policy: an entry is removed once its task's `deadline` has
+// passed, because a task past its deadline can never be claimed or executed
+// again regardless of what this cache remembers — so the map is naturally
+// bounded by the number of tasks with a still-live deadline, not by time or
+// an arbitrary size cap. Eviction runs at the top of every round.
+//
+// This cache is entirely in-memory and is lost on process restart — that is
+// an accepted limitation for this example bot (see the header comment).
+const taskOutcomes = new Map(); // taskId -> { outcome: "executed" | "expired", deadline: number }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Configuration validation
@@ -80,9 +98,7 @@ let CONFIG; // Initialized in main() after validation
 
 function fail(name, value, reason) {
   let message = `❌  Invalid ${name}`;
-  if (value) {
-    message += `: ${value}`;
-  }
+  if (value) message += `: ${value}`;
   console.error(`${message} — ${reason}`);
   process.exit(1);
 }
@@ -90,44 +106,39 @@ function fail(name, value, reason) {
 function requireEnv(name, { parse, validate, secret = false, fallback }) {
   const raw = process.env[name];
   if (raw === undefined || raw === "") {
-    if (fallback !== undefined) {
-      return fallback;
-    }
+    if (fallback !== undefined) return fallback;
     fail(name, raw, "must be set");
   }
   try {
     const parsed = parse ? parse(raw) : raw;
-    if (validate && !validate.fn(parsed)) {
-      fail(name, secret ? null : raw, validate.reason);
-    }
+    if (validate && !validate.fn(parsed)) fail(name, secret ? null : raw, validate.reason);
     return parsed;
   } catch (e) {
     fail(name, secret ? null : raw, e.message);
   }
 }
 
+function parseProfitMultiple(value) {
+  const parsed = Number.parseFloat(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) throw new Error("must be a finite number greater than 0");
+  return parsed;
+}
+
+function profitMultipleScale(value) {
+  return BigInt(Math.ceil(value * 1000));
+}
+
 async function validateAndLoadConfig() {
   const network = requireEnv("NETWORK", {
-    validate: {
-      fn: (v) => Object.keys(NETWORK_CONFIG).includes(v),
-      reason: `must be one of: ${Object.keys(NETWORK_CONFIG).join(", ")}`,
-    },
+    validate: { fn: (v) => Object.keys(NETWORK_CONFIG).includes(v), reason: `must be one of: ${Object.keys(NETWORK_CONFIG).join(", ")}` },
     fallback: "testnet",
   });
-
   const registryContractId = requireEnv("REGISTRY_CONTRACT_ID", {
-    validate: {
-      fn: StrKey.isValidContract,
-      reason: "must be a valid contract ID (starts with C...)",
-    },
+    validate: { fn: StrKey.isValidContract, reason: "must be a valid contract ID (starts with C...)" },
   });
-
   const secretKey = requireEnv("KEEPER_SECRET_KEY", {
     secret: true,
-    validate: {
-      fn: StrKey.isValidEd25519SecretSeed,
-      reason: "must be a valid secret key (starts with S...)",
-    },
+    validate: { fn: StrKey.isValidEd25519SecretSeed, reason: "must be a valid secret key (starts with S...)" },
   });
 
   // Optional: a signing key for tasks whose attached verifier is (or is
@@ -150,21 +161,19 @@ async function validateAndLoadConfig() {
   // connection and use it to validate the contract's existence on the network.
   const { rpcUrl } = NETWORK_CONFIG[network];
   const server = new SorobanRpc.Server(rpcUrl, { allowHttp: false });
-
   try {
     await server.getContractData(registryContractId);
   } catch (e) {
     if (e.response && e.response.status === 404) {
-      fail(
-        "REGISTRY_CONTRACT_ID",
-        registryContractId,
-        `not found on network ${network}. Please check the contract ID and NETWORK settings.`
-      );
+      fail("REGISTRY_CONTRACT_ID", registryContractId, `not found on network ${network}. Please check the contract ID and NETWORK settings.`);
     }
-    // For other errors, we'll let the main connectivity check handle it.
   }
 
-  // Now that all critical configs are validated, build the final CONFIG object.
+  const minProfitMultiple = requireEnv("MIN_PROFIT_MULTIPLE", {
+    parse: parseProfitMultiple,
+    fallback: 2.0,
+  });
+
   CONFIG = {
     network,
     registryContractId,
@@ -173,48 +182,68 @@ async function validateAndLoadConfig() {
     once: process.argv.includes("--once") || process.env.RUN_ONCE === "true",
     pollIntervalMs: requireEnv("POLL_INTERVAL_MS", {
       parse: (v) => parseInt(v, 10),
-      validate: { fn: (v) => v >= 1000, reason: "must be >= 1000" },
+      validate: { fn: (v) => Number.isInteger(v) && v >= 1000, reason: "must be >= 1000" },
       fallback: 10000,
     }),
     withdrawThreshold: requireEnv("WITHDRAW_THRESHOLD", {
       parse: BigInt,
-      validate: { fn: (v) => v >= 0, reason: "must be a positive number" },
+      validate: { fn: (v) => v >= 0n, reason: "must be non-negative" },
       fallback: 10000000n,
+    }),
+    minNetRewardStroops: requireEnv("MIN_NET_REWARD_STROOPS", {
+      parse: BigInt,
+      validate: { fn: (v) => v >= 0n, reason: "must be non-negative" },
+      fallback: 1000000n,
+    }),
+    minProfitMultiple,
+    minProfitMultipleScale: profitMultipleScale(minProfitMultiple),
+    estimatedTransactionCostStroops: requireEnv("ESTIMATED_TX_COST_STROOPS", {
+      parse: BigInt,
+      validate: { fn: (v) => v > 0n, reason: "must be greater than 0" },
+      fallback: 10000n,
     }),
     maxTasksPerRound: requireEnv("MAX_TASKS_PER_ROUND", {
       parse: (v) => parseInt(v, 10),
-      validate: { fn: (v) => v >= 1, reason: "must be >= 1" },
+      validate: { fn: (v) => Number.isInteger(v) && v >= 1, reason: "must be >= 1" },
       fallback: 5,
     }),
     maxRetries: requireEnv("MAX_RETRIES", {
       parse: (v) => parseInt(v, 10),
-      validate: { fn: (v) => v >= 0, reason: "must be >= 0" },
+      validate: { fn: (v) => Number.isInteger(v) && v >= 0, reason: "must be >= 0" },
       fallback: 3,
     }),
     retryBaseMs: requireEnv("RETRY_BASE_MS", {
       parse: (v) => parseInt(v, 10),
-      validate: { fn: (v) => v > 0, reason: "must be > 0" },
+      validate: { fn: (v) => Number.isInteger(v) && v > 0, reason: "must be > 0" },
       fallback: 500,
     }),
     expireStaleTasks: requireEnv("EXPIRE_STALE_TASKS", {
       parse: (v) => v.toLowerCase() === "true",
       fallback: true,
     }),
+    eventsPageSize: requireEnv("EVENTS_PAGE_SIZE", {
+      parse: (v) => parseInt(v, 10),
+      validate: { fn: (v) => v > 0, reason: "must be a positive number" },
+      fallback: 100,
+    }),
+    eventsMaxPages: requireEnv("EVENTS_MAX_PAGES", {
+      parse: (v) => parseInt(v, 10),
+      validate: { fn: (v) => v > 0, reason: "must be a positive number" },
+      fallback: 10,
+    }),
   };
+  return CONFIG;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Reliability helpers
-// ─────────────────────────────────────────────────────────────────────────────
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
-/**
- * Retries an async operation with exponential back-off and jitter.
- *
- * Only transient failures (RPC timeouts, network blips, transaction not-yet-
- * confirmed) should be retried. Deterministic contract errors — e.g. a task
- * already claimed by another keeper — are surfaced immediately so we don't
- * waste fees resubmitting a call that can never succeed.
- */
+function isPermanentError(err) {
+  const msg = (err && err.message ? err.message : "").toLowerCase();
+  return msg.includes("simulation failed") || msg.includes("invalidaction") || msg.includes("unauthorized") || msg.includes("already");
+}
+
 async function withRetry(label, fn) {
   let lastErr;
   for (let attempt = 0; attempt <= CONFIG.maxRetries; attempt++) {
@@ -222,12 +251,9 @@ async function withRetry(label, fn) {
       return await fn();
     } catch (err) {
       lastErr = err;
-      if (isPermanentError(err) || attempt === CONFIG.maxRetries) {
-        throw err;
-      }
+      if (isPermanentError(err) || attempt === CONFIG.maxRetries) throw err;
       const backoff = CONFIG.retryBaseMs * 2 ** attempt;
-      const jitter = Math.floor(Math.random() * CONFIG.retryBaseMs);
-      const delay = backoff + jitter;
+      const delay = backoff + Math.floor(Math.random() * CONFIG.retryBaseMs);
       console.warn(`  ↻  ${label} failed (attempt ${attempt + 1}), retrying in ${delay}ms: ${err.message}`);
       await sleep(delay);
     }
@@ -235,65 +261,23 @@ async function withRetry(label, fn) {
   throw lastErr;
 }
 
-/**
- * Heuristic: contract-level business errors are permanent for this bot and must
- * not be retried, whereas transport/consensus errors are worth another attempt.
- */
-function isPermanentError(err) {
-  const msg = (err && err.message ? err.message : "").toLowerCase();
-  return (
-    msg.includes("simulation failed") || // contract returned an Err()
-    msg.includes("invalidaction") ||
-    msg.includes("unauthorized") ||
-    msg.includes("already")
-  );
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Soroban helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
 const MAX_SYMBOL_LENGTH = 9;
-
-/**
- * Encodes a Soroban symbol as the base64 XDR string `getEvents` expects for a
- * topic filter. Derived at runtime so the filter always matches the symbol
- * written here, and a contract-side rename surfaces as a code change rather
- * than a filter that silently stops matching.
- */
 function topicSymbol(name) {
-  if (name.length > MAX_SYMBOL_LENGTH) {
-    throw new Error(
-      `Symbol "${name}" is too long; max ${MAX_SYMBOL_LENGTH} chars`
-    );
-  }
+  if (name.length > MAX_SYMBOL_LENGTH) throw new Error(`Symbol "${name}" is too long`);
   return nativeToScVal(name, { type: "symbol" }).toXDR("base64");
 }
 
-/**
- * Event topic filters, derived from runtime symbol names.
- * Cross-references:
- *  - `taskRegistered`: `contracts/keeper-registry/src/lib.rs`, `emit_task_registered`
- */
 const REGISTRY_EVENTS = {
   taskRegistered: [topicSymbol("reg"), topicSymbol("task")],
 };
 
 async function simulateAndSend(server, keypair, networkPassphrase, tx) {
   const simResponse = await server.simulateTransaction(tx);
-  if (SorobanRpc.Api.isSimulationError(simResponse)) {
-    throw new Error(`Simulation failed: ${simResponse.error}`);
-  }
-
+  if (SorobanRpc.Api.isSimulationError(simResponse)) throw new Error(`Simulation failed: ${simResponse.error}`);
   const preparedTx = SorobanRpc.assembleTransaction(tx, simResponse).build();
   preparedTx.sign(keypair);
-
   const sendResponse = await server.sendTransaction(preparedTx);
-  if (sendResponse.status === "ERROR") {
-    throw new Error(`Send failed: ${JSON.stringify(sendResponse.errorResult)}`);
-  }
-
-  // Poll for confirmation
+  if (sendResponse.status === "ERROR") throw new Error(`Send failed: ${JSON.stringify(sendResponse.errorResult)}`);
   let getResponse = await server.getTransaction(sendResponse.hash);
   let attempts = 0;
   while (getResponse.status === SorobanRpc.Api.GetTransactionStatus.NOT_FOUND && attempts < 30) {
@@ -301,58 +285,27 @@ async function simulateAndSend(server, keypair, networkPassphrase, tx) {
     getResponse = await server.getTransaction(sendResponse.hash);
     attempts++;
   }
-
-  if (getResponse.status === SorobanRpc.Api.GetTransactionStatus.SUCCESS) {
-    return getResponse;
-  } else {
-    throw new Error(`Transaction failed with status: ${getResponse.status}`);
-  }
+  if (getResponse.status === SorobanRpc.Api.GetTransactionStatus.SUCCESS) return getResponse;
+  throw new Error(`Transaction failed with status: ${getResponse.status}`);
 }
 
 async function invokeContract(server, keypair, networkPassphrase, contractId, method, args) {
   const account = await server.getAccount(keypair.publicKey());
-  const contract = new Contract(contractId);
-
-  const tx = new TransactionBuilder(account, {
-    fee: BASE_FEE,
-    networkPassphrase,
-  })
-    .addOperation(contract.call(method, ...args))
+  const tx = new TransactionBuilder(account, { fee: BASE_FEE, networkPassphrase })
+    .addOperation(new Contract(contractId).call(method, ...args))
     .setTimeout(30)
     .build();
-
   return simulateAndSend(server, keypair, networkPassphrase, tx);
 }
 
-/**
- * Evaluates a read-only contract function via simulation.
- *
- * No transaction is signed, submitted, or confirmed, and no sequence number
- * is consumed — this is safe (and cheap) to call on every polling round.
- * Use `invokeContract` instead for anything that mutates state, since that
- * is the only path that actually submits.
- *
- * Note: simulation still builds a transaction envelope, so `server.getAccount`
- * requires the source account to already exist (be funded) on-chain — the
- * same requirement `invokeContract` has today. A brand-new, unfunded keeper
- * key will throw here.
- */
 async function readContract(server, sourcePublicKey, networkPassphrase, contractId, method, args) {
   const account = await server.getAccount(sourcePublicKey);
-  const contract = new Contract(contractId);
-
-  const tx = new TransactionBuilder(account, {
-    fee: BASE_FEE,
-    networkPassphrase,
-  })
-    .addOperation(contract.call(method, ...args))
+  const tx = new TransactionBuilder(account, { fee: BASE_FEE, networkPassphrase })
+    .addOperation(new Contract(contractId).call(method, ...args))
     .setTimeout(30)
     .build();
-
   const sim = await server.simulateTransaction(tx);
-  if (SorobanRpc.Api.isSimulationError(sim)) {
-    throw new Error(`Simulation failed: ${sim.error}`);
-  }
+  if (SorobanRpc.Api.isSimulationError(sim)) throw new Error(`Simulation failed: ${sim.error}`);
   return sim.result ? scValToNative(sim.result.retval) : null;
 }
 
@@ -360,61 +313,77 @@ async function readContract(server, sourcePublicKey, networkPassphrase, contract
 // Task fetching — reads pending tasks by querying events
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * Returns `{ tasks, latestLedger }`. `latestLedger` is the ledger the RPC
+ * node had most recently ingested at query time (straight from the
+ * getEvents response) so callers can advance a scan cursor without an extra
+ * getLatestLedger() round-trip. It is `null` if the query failed, so callers
+ * know not to advance their cursor past ledgers that were never actually
+ * scanned.
+ * Fetches TaskRegistered events across the window, following the pagination
+ * cursor. Bounded by `CONFIG.eventsMaxPages` so one very busy window cannot
+ * stall a round indefinitely; hitting the bound is logged, never silent.
+ *
+ * This pagination behaviour is compatible with Soroban RPC v1.2.0 and later,
+ * where `startLedger` and `cursor` are mutually exclusive.
+ */
 async function fetchPendingTasks(server, contractId, startLedger) {
   const tasks = [];
+  let latestLedger = null;
   try {
-    // Query TaskRegistered events
     const response = await server.getEvents({
       startLedger,
-      filters: [
-        {
-          type: "contract",
-          contractIds: [contractId],
-          topics: [REGISTRY_EVENTS.taskRegistered],
-        },
-      ],
+      filters: [{ type: "contract", contractIds: [contractId], topics: [REGISTRY_EVENTS.taskRegistered] }],
       limit: 100,
     });
+
+    latestLedger = response.latestLedger;
 
     for (const event of response.events || []) {
       try {
         const [taskIdVal, , rewardVal, deadlineVal] = event.value.value();
-        const taskId = scValToNative(taskIdVal);
-        const reward = scValToNative(rewardVal);
-        const deadline = scValToNative(deadlineVal);
-
-        tasks.push({ taskId, reward, deadline });
-      } catch (e) {
-        // Skip malformed events
+        tasks.push({ taskId: scValToNative(taskIdVal), reward: scValToNative(rewardVal), deadline: scValToNative(deadlineVal) });
+      } catch (_) {
+        // Ignore malformed events and continue with the remaining events.
       }
+
+      pages++;
+      if (
+        !response.events ||
+        response.events.length < CONFIG.eventsPageSize ||
+        !response.cursor
+      ) {
+        break; // Window exhausted
+      }
+      cursor = response.cursor;
+    } catch (e) {
+      console.warn("⚠️  Failed to fetch events page:", e.message);
+      break; // Stop pagination on error
     }
-  } catch (e) {
-    console.warn("⚠️  Failed to fetch events:", e.message);
   }
+
+  if (pages === CONFIG.eventsMaxPages) {
+    console.warn(
+      `⚠️  Stopped fetching events after ${pages} pages — more may remain in this window.`
+    );
+  }
+
   return tasks;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Keeper logic — off-chain execution simulation
-// ─────────────────────────────────────────────────────────────────────────────
+function profitability(task, feeBps) {
+  const basisPoints = BigInt(feeBps);
+  const netReward = task.reward * (10000n - basisPoints) / 10000n;
+  const estimatedCost = CONFIG.estimatedTransactionCostStroops * 3n;
+  const clearsMinimum = netReward >= CONFIG.minNetRewardStroops;
+  const clearsMultiple = netReward * 1000n > estimatedCost * CONFIG.minProfitMultipleScale;
+  return { netReward, estimatedCost, clearsMinimum, clearsMultiple };
+}
 
-/**
- * Simulates off-chain execution of the task (liquidation, oracle push, etc.)
- * In a real keeper this would:
- *   - Call the target protocol contract
- *   - Verify the action succeeded
- *   - Return the tx hash or state proof
- */
 async function executeTaskOffChain(task) {
   console.log(`  ⚙️  Executing task ${task.taskId} off-chain...`);
-  // Simulate network latency
   await sleep(500);
-
-  // Return a fake "proof" — in production this is the target tx hash
-  const fakeTxHash = Buffer.from(
-    `keeper-proof:task:${task.taskId}:ts:${Date.now()}`
-  ).toString("hex");
-  return fakeTxHash;
+  return Buffer.from(`keeper-proof:task:${task.taskId}:ts:${Date.now()}`).toString("hex");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -513,32 +482,57 @@ async function keeperLoop(
   // other unexpected error, is a failure.
   // Note: a round that finds no tasks is a success. Losing a claim race to
   // another keeper is also a success, as this is normal competitive behaviour.
+async function keeperLoop(server, keypair, networkPassphrase, contractId, emptyRounds = 0) {
   const summary = { processed: 0, errors: [] };
   let newEmptyRounds = emptyRounds;
-
   try {
-    const nowSeconds = Math.floor(Date.now() / 1000);
+    const nowSeconds = BigInt(Math.floor(Date.now() / 1000));
     console.log(`\n🔄  Keeper round at ${new Date().toISOString()}`);
-
     const latestLedger = await server.getLatestLedger();
-    const startLedger = Math.max(1, latestLedger.sequence - 1000);
+    const pendingTasks = await fetchPendingTasks(server, contractId, Math.max(1, latestLedger.sequence - 1000));
+    console.log(`  📋  Found ${pendingTasks.length} TaskRegistered events to evaluate`);
 
-    const pendingTasks = await fetchPendingTasks(
-      server,
-      contractId,
-      startLedger
+    // Evict outcome-cache entries whose deadline has passed — see the
+    // `taskOutcomes` declaration for why this is a safe & sufficient policy.
+    for (const [taskId, entry] of taskOutcomes) {
+      if (entry.deadline <= nowSeconds) taskOutcomes.delete(taskId);
+    }
+
+    // Only the very first round (no cursor yet) uses a fixed lookback
+    // window (last ~1000 ledgers ≈ 1.4h at 5s) so a freshly started bot
+    // still picks up recently registered tasks. Every subsequent round
+    // resumes exactly where the previous one left off.
+    let startLedger;
+    if (cursorLedger === null) {
+      const latestLedger = await server.getLatestLedger();
+      startLedger = Math.max(1, latestLedger.sequence - 1000);
+    } else {
+      startLedger = cursorLedger;
+    }
+
+    const { tasks: fetchedTasks, latestLedger: scannedLedger } = await fetchPendingTasks(
+      server, contractId, startLedger
     );
-    console.log(
-      `  📋  Found ${pendingTasks.length} TaskRegistered events to evaluate`
-    );
+
+    if (scannedLedger !== null) {
+      console.log(
+        `  📜  Scanned ledgers ${startLedger} to ${scannedLedger} (${scannedLedger - startLedger + 1} ledgers)`
+      );
+      // Resume from the next unscanned ledger next round. If the query
+      // failed (scannedLedger === null), leave the cursor where it is so
+      // the next round retries the same window instead of silently
+      // skipping ledgers we never actually read.
+      cursorLedger = scannedLedger + 1;
+    }
+
+    const feeBpsValue = await readContract(server, keypair.publicKey(), networkPassphrase, contractId, "get_fee_bps", []);
+    const feeBps = BigInt(feeBpsValue);
+    if (feeBps < 0n || feeBps > 10000n) throw new Error(`Invalid on-chain fee rate: ${feeBps}`);
+    console.log(`  💸  Current registry fee: ${feeBps} bps`);
 
     if (pendingTasks.length === 0) {
       newEmptyRounds++;
-      if (newEmptyRounds > 0 && newEmptyRounds % 30 === 0) {
-        console.warn(
-          `  ⚠️  No TaskRegistered events found for ${newEmptyRounds} consecutive rounds.`
-        );
-      }
+      if (newEmptyRounds % 30 === 0) console.warn(`  ⚠️  No TaskRegistered events found for ${newEmptyRounds} consecutive rounds.`);
     } else {
       newEmptyRounds = 0;
     }
@@ -551,23 +545,10 @@ async function keeperLoop(
       if (task.deadline <= nowSeconds) {
         if (CONFIG.expireStaleTasks) {
           try {
-            await withRetry(`expire_task ${task.taskId}`, () =>
-              invokeContract(
-                server,
-                keypair,
-                networkPassphrase,
-                contractId,
-                "expire_task",
-                [nativeToScVal(task.taskId, { type: "u64" })]
-              )
-            );
-            console.log(
-              `  ♻️  Task ${task.taskId} expired — escrow refunded to owner`
-            );
+            await withRetry(`expire_task ${task.taskId}`, () => invokeContract(server, keypair, networkPassphrase, contractId, "expire_task", [nativeToScVal(task.taskId, { type: "u64" })]));
+            console.log(`  ♻️  Task ${task.taskId} expired — escrow refunded to owner`);
           } catch (err) {
-            console.log(
-              `  ⏰  Task ${task.taskId} past deadline (skip: ${err.message})`
-            );
+            console.log(`  ⏰  Task ${task.taskId} past deadline (skip: ${err.message})`);
           }
         } else {
           console.log(`  ⏰  Task ${task.taskId} is past deadline, skipping`);
@@ -575,6 +556,14 @@ async function keeperLoop(
         continue;
       }
 
+      const economics = profitability(task, feeBps);
+      if (!economics.clearsMinimum || !economics.clearsMultiple) {
+        const reason = !economics.clearsMinimum
+          ? `net reward ${economics.netReward} is below minimum ${CONFIG.minNetRewardStroops}`
+          : `net reward ${economics.netReward} does not exceed ${CONFIG.minProfitMultiple}x estimated cost`;
+        console.log(`  ⏭️  Skipping task ${task.taskId} (reward: ${task.reward}, estimated cost: ${economics.estimatedCost} stroops): ${reason}`);
+        continue;
+      }
       try {
         // Pre-flight check: is the task actually claimable right now? This
         // is a read-only simulation, so it costs nothing. It confirms the
@@ -654,66 +643,39 @@ async function keeperLoop(
         console.log(
           `  💰  Task ${task.taskId} executed! Proof: ${proof.slice(0, 20)}...`
         );
+      try {
+        console.log(`  📌  Attempting to claim task ${task.taskId} (reward: ${task.reward}, estimated cost: ${economics.estimatedCost} stroops, net reward: ${economics.netReward})...`);
+        await withRetry(`claim_task ${task.taskId}`, () => invokeContract(server, keypair, networkPassphrase, contractId, "claim_task", [nativeToScVal(task.taskId, { type: "u64" })]));
+        const proof = await executeTaskOffChain(task);
+        await withRetry(`execute_task ${task.taskId}`, () => invokeContract(server, keypair, networkPassphrase, contractId, "execute_task", [nativeToScVal(task.taskId, { type: "u64" }), nativeToScVal(proof, { type: "bytes" })]));
         summary.processed++;
+        console.log(`  ✅  Task ${task.taskId} executed successfully`);
       } catch (err) {
-        console.warn(
-          `  ⚠️  Failed to process task ${task.taskId}: ${err.message}`
-        );
         summary.errors.push(err);
+        console.error(`  ❌  Task ${task.taskId} failed: ${err.message}`);
       }
     }
-  } catch (err) {
-    console.error(`❌  Keeper loop error: ${err.message}`);
-    summary.errors.push(err);
-  }
 
-  // Check accumulated rewards and withdraw if above threshold. This is a
-  // read-only view, so it goes through `readContract` (simulation only) and
-  // costs nothing — no fee, no sequence number, no submitted transaction.
-  // We still check it every round rather than tracking the balance locally:
-  // simulation makes the read free enough that the extra round-trip isn't
-  // worth trading away the guarantee of reading current on-chain state.
-  try {
-    const rawBalance = await readContract(
-      server,
-      keypair.publicKey(),
-      networkPassphrase,
-      contractId,
-      "keeper_balance",
-      [nativeToScVal(keypair.publicKey(), { type: "address" })]
-    );
-    const balance = BigInt(rawBalance || 0);
-    console.log(`  💎  Accumulated reward balance: ${balance} stroops`);
-
-    if (balance >= CONFIG.withdrawThreshold) {
-      console.log(`  💸  Withdrawing ${balance} stroops...`);
-      // withdraw_rewards mutates state, so it still goes through the
-      // submitting path.
-      await invokeContract(
-        server,
-        keypair,
-        networkPassphrase,
-        contractId,
-        "withdraw_rewards",
-        [nativeToScVal(keypair.publicKey(), { type: "address" })]
-      );
-      console.log(`  ✅  Withdrawal complete!`);
+    try {
+      const balance = BigInt(await readContract(server, keypair.publicKey(), networkPassphrase, contractId, "keeper_balance", [nativeToScVal(keypair.publicKey(), { type: "address" })]));
+      if (balance >= CONFIG.withdrawThreshold) {
+        await withRetry("withdraw_rewards", () => invokeContract(server, keypair, networkPassphrase, contractId, "withdraw_rewards", []));
+        console.log(`  💰  Withdrew keeper balance of ${balance} stroops`);
+      }
+    } catch (err) {
+      console.warn(`  ⚠️  Withdrawal check failed: ${err.message}`);
     }
   } catch (err) {
-    console.warn(`  ⚠️  Balance check failed: ${err.message}`);
     summary.errors.push(err);
+    console.error(`  ❌  Keeper round failed: ${err.message}`);
   }
-  return { summary, emptyRounds: newEmptyRounds };
+  return { ...summary, emptyRounds: newEmptyRounds };
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Entry point
-// ─────────────────────────────────────────────────────────────────────────────
 
 async function main() {
   await validateAndLoadConfig();
-
-  const { rpcUrl, networkPassphrase } = NETWORK_CONFIG[CONFIG.network];
+  const network = NETWORK_CONFIG[CONFIG.network];
+  const server = new SorobanRpc.Server(network.rpcUrl, { allowHttp: false });
   const keypair = Keypair.fromSecret(CONFIG.secretKey);
   const signatureProofKeypair = CONFIG.signatureProofSecretKey
     ? Keypair.fromSecret(CONFIG.signatureProofSecretKey)
@@ -831,11 +793,15 @@ module.exports = {
   signProofForTask,
   generateProof,
 };
-
-// Only run main() when executed directly, not when imported for testing
-if (require.main === module) {
-  main().catch((err) => {
-    console.error("Fatal error:", err);
-    process.exit(1);
-  });
+  let emptyRounds = 0;
+  do {
+    const result = await keeperLoop(server, keypair, network.networkPassphrase, CONFIG.registryContractId, emptyRounds);
+    emptyRounds = result.emptyRounds;
+    if (CONFIG.once) process.exitCode = result.errors.length ? 1 : 0;
+    else await sleep(CONFIG.pollIntervalMs);
+  } while (!CONFIG.once);
 }
+
+if (require.main === module) main().catch((err) => { console.error(err); process.exitCode = 1; });
+
+module.exports = { fetchPendingTasks, keeperLoop, profitability, readContract, validateAndLoadConfig };
