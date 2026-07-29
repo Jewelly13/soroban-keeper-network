@@ -212,6 +212,16 @@ async function validateAndLoadConfig() {
       parse: (v) => v.toLowerCase() === "true",
       fallback: true,
     }),
+    eventsPageSize: requireEnv("EVENTS_PAGE_SIZE", {
+      parse: (v) => parseInt(v, 10),
+      validate: { fn: (v) => v > 0, reason: "must be a positive number" },
+      fallback: 100,
+    }),
+    eventsMaxPages: requireEnv("EVENTS_MAX_PAGES", {
+      parse: (v) => parseInt(v, 10),
+      validate: { fn: (v) => v > 0, reason: "must be a positive number" },
+      fallback: 10,
+    }),
   };
 }
 
@@ -379,6 +389,12 @@ async function readContract(server, sourcePublicKey, networkPassphrase, contract
  * getLatestLedger() round-trip. It is `null` if the query failed, so callers
  * know not to advance their cursor past ledgers that were never actually
  * scanned.
+ * Fetches TaskRegistered events across the window, following the pagination
+ * cursor. Bounded by `CONFIG.eventsMaxPages` so one very busy window cannot
+ * stall a round indefinitely; hitting the bound is logged, never silent.
+ *
+ * This pagination behaviour is compatible with Soroban RPC v1.2.0 and later,
+ * where `startLedger` and `cursor` are mutually exclusive.
  */
 async function fetchPendingTasks(server, contractId, startLedger) {
   const tasks = [];
@@ -410,11 +426,29 @@ async function fetchPendingTasks(server, contractId, startLedger) {
       } catch (e) {
         // Skip malformed events
       }
+
+      pages++;
+      if (
+        !response.events ||
+        response.events.length < CONFIG.eventsPageSize ||
+        !response.cursor
+      ) {
+        break; // Window exhausted
+      }
+      cursor = response.cursor;
+    } catch (e) {
+      console.warn("⚠️  Failed to fetch events page:", e.message);
+      break; // Stop pagination on error
     }
-  } catch (e) {
-    console.warn("⚠️  Failed to fetch events:", e.message);
   }
-  return { tasks, latestLedger };
+
+  if (pages === CONFIG.eventsMaxPages) {
+    console.warn(
+      `⚠️  Stopped fetching events after ${pages} pages — more may remain in this window.`
+    );
+  }
+
+  return tasks;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -519,6 +553,8 @@ async function keeperLoop(
     for (const task of pendingTasks) {
       if (summary.processed >= CONFIG.maxTasksPerRound) break;
 
+      // The event-derived deadline is potentially stale, but it's a cheap
+      // client-side filter. is_claimable will check the true current deadline.
       if (task.deadline <= nowSeconds) {
         if (CONFIG.expireStaleTasks) {
           try {
@@ -547,6 +583,29 @@ async function keeperLoop(
       }
 
       try {
+        // Pre-flight check: is the task actually claimable right now? This
+        // is a read-only simulation, so it costs nothing. It confirms the
+        // task is still pending and not locked by another keeper.
+        const claimable = await readContract(
+          server,
+          keypair.publicKey(),
+          networkPassphrase,
+          contractId,
+          "is_claimable",
+          [nativeToScVal(task.taskId, { type: "u64" })]
+        );
+
+        if (!claimable) {
+          console.log(
+            `  ⏩  Skipping task ${task.taskId} — not claimable (already claimed or finished)`
+          );
+          continue;
+        }
+
+        // The pre-check is advisory, not a lock. A competitor can still
+        // claim the task in the interval between our simulation and our
+        // submission. The `claim_task` call can still fail, which is
+        // normal and expected.
         console.log(
           `  📌  Attempting to claim task ${task.taskId} (reward: ${task.reward})...`
         );
