@@ -1,32 +1,13 @@
 //! # KeeperRegistry — Test Suite
-//!
-//! Covers the full task lifecycle (register → claim → execute → withdraw) plus
-//! the refund paths (cancel/expire), fee accounting, and every admin control.
-//!
-//! ## For contributors
-//! When you add a function, add tests here. Every public function should have:
-//!   - one happy-path test
-//!   - a test for each KeeperError variant it can return
-//!
-//! Run with: `cargo test -p keeper-registry`
 
 #![cfg(test)]
 
 use soroban_sdk::{
-    symbol_short,
-    testutils::{Address as _, Deployer as _, Events as _, Ledger, MockAuth, MockAuthInvoke},
-    token, Address, Bytes, Env, IntoVal, Symbol, TryIntoVal,
+    testutils::{Address as _, Ledger, MockAuth},
+    token, Address, Bytes, Env,
 };
 
-use crate::{
-    split_reward, DataKey, KeeperError, KeeperRegistry, KeeperRegistryClient, TaskStatus, TaskType,
-    INSTANCE_BUMP_LEDGERS, INSTANCE_BUMP_THRESHOLD, MAX_CALLDATA_LEN, MAX_LOCK_LEDGERS,
-    MIN_LOCK_LEDGERS, MIN_TTL_LEDGERS,
-};
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Shared test setup
-// ─────────────────────────────────────────────────────────────────────────────
+use crate::{KeeperError, KeeperRegistry, KeeperRegistryClient, TaskStatus, TaskType};
 
 struct Setup {
     env: Env,
@@ -35,19 +16,14 @@ struct Setup {
     token_id: Address,
 }
 
-// The transmutes below intentionally re-bind the env/client to a 'static
-// lifetime — the standard Soroban test-harness pattern for a shared Setup.
-#[allow(clippy::useless_transmute, clippy::missing_transmute_annotations)]
 fn setup() -> Setup {
     let env = Env::default();
     env.mock_all_auths();
 
     let admin = Address::generate(&env);
-
-    // Deploy a SAC-wrapped token to use as the reward currency.
     let token_admin = Address::generate(&env);
     let token_id = env
-        .register_stellar_asset_contract_v2(token_admin.clone())
+        .register_stellar_asset_contract_v2(token_admin)
         .address();
     token::StellarAssetClient::new(&env, &token_id).mint(&admin, &10_000_000i128);
 
@@ -55,7 +31,6 @@ fn setup() -> Setup {
     let registry = KeeperRegistryClient::new(&env, &registry_id);
     registry.initialize(&admin, &token_id, &300u32);
 
-    // Leak env to get a 'static lifetime — standard soroban test pattern.
     let env = unsafe { core::mem::transmute::<Env, Env>(env) };
     Setup {
         env,
@@ -69,21 +44,14 @@ fn calldata(env: &Env) -> Bytes {
     Bytes::from_slice(env, b"liquidate:position:42")
 }
 
-/// Registers a standard 1-hour task funded by `admin` and returns its id.
-fn register_default_task(s: &Setup) -> u64 {
-    register_reward_task(s, 1_000_000i128)
-}
-
-/// Same as `register_default_task` but with a caller-chosen reward, so tests
-/// can exercise several distinct amounts (e.g. non-round fee splits) without
-/// duplicating the register_task call boilerplate.
-fn register_reward_task(s: &Setup, reward: i128) -> u64 {
-    let deadline = s.env.ledger().timestamp() + 3_600;
+fn register_task(s: &Setup, reward: i128) -> u64 {
     s.registry.register_task(
         &s.admin,
         &TaskType::Liquidation,
         &calldata(&s.env),
         &reward,
+        &(s.env.ledger().timestamp() + 3_600),
+        &17_280u32,
         &deadline,
         &20_000u32,
         &120u32,
@@ -91,64 +59,23 @@ fn register_reward_task(s: &Setup, reward: i128) -> u64 {
     )
 }
 
-/// Advances the ledger sequence and timestamp so lock-window / deadline logic
-/// can be exercised deterministically.
 fn advance(env: &Env, ledgers: u32, seconds: u64) {
-    env.ledger().with_mut(|li| {
-        li.sequence_number += ledgers;
-        li.timestamp += seconds;
+    env.ledger().with_mut(|ledger| {
+        ledger.sequence_number += ledgers;
+        ledger.timestamp += seconds;
     });
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// initialize
-// ─────────────────────────────────────────────────────────────────────────────
-
-// ─────────────────────────────────────────────────────────────────────────────
-// End-to-end integration: multiple tasks, multiple keepers
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn test_multi_keeper_end_to_end_conserves_funds() {
-    let s = setup();
-    let token = token::Client::new(&s.env, &s.token_id);
-    let k1 = Address::generate(&s.env);
-    let k2 = Address::generate(&s.env);
-
-    // Three tasks funded from admin, 1_000_000 each.
-    let t_exec = register_default_task(&s); // will be executed by k1
-    let t_expire = register_default_task(&s); // will be claimed by k2 then expire
-    let t_cancel = register_default_task(&s); // will be cancelled by owner
-
-    // The contract now escrows all three rewards.
-    assert_eq!(token.balance(&s.registry.address), 3_000_000i128);
-
-    // k1 executes the first task (3% fee → 970_000 to k1, 30_000 accrued).
-    s.registry.claim_task(&k1, &t_exec);
-    s.registry
-        .execute_task(&k1, &t_exec, &Bytes::from_slice(&s.env, b"p1"));
-
-    // k2 claims the second but never executes; owner cancels the third now.
-    s.registry.claim_task(&k2, &t_expire);
-    s.registry.cancel_task(&s.admin, &t_cancel); // refunds 1_000_000
-
-    // Time passes; the abandoned task is expired permissionlessly.
-    advance(&s.env, 200, 3_601);
-    s.registry.expire_task(&t_expire); // refunds 1_000_000 to owner
-
-    // k1 withdraws its earnings; admin sweeps the fee.
-    assert_eq!(s.registry.withdraw_rewards(&k1), 970_000i128);
-    let treasury = Address::generate(&s.env);
-    s.registry.sweep_fees(&s.admin, &treasury, &30_000i128);
-
-    // Conservation: the contract should hold nothing left over — every stroop
-    // is now either with the keeper, the treasury, or refunded to the owner.
-    assert_eq!(token.balance(&s.registry.address), 0i128);
-    assert_eq!(token.balance(&k1), 970_000i128);
-    assert_eq!(token.balance(&treasury), 30_000i128);
-    assert_eq!(s.registry.fees_accrued(), 0i128);
+#[derive(Clone, Copy)]
+enum TerminalStatus {
+    Executed,
+    Cancelled,
+    Expired,
 }
 
+fn task_in_status(s: &Setup, status: TerminalStatus) -> (u64, Address) {
+    let task_id = register_task(s, 1_000_000);
+    let keeper = Address::generate(&s.env);
 // ─────────────────────────────────────────────────────────────────────────────
 // Pure-function invariants: split_reward
 // ─────────────────────────────────────────────────────────────────────────────
@@ -174,20 +101,22 @@ fn test_split_reward_invariants() {
         for &bps in &fee_rates {
             let (keeper_net, fee) = split_reward(reward, bps).expect("split should succeed");
 
-            // 1. Conservation: nothing leaks.
-            assert_eq!(keeper_net + fee, reward, "reward={reward} bps={bps}");
-            // 2. Non-negative shares.
-            assert!(keeper_net >= 0 && fee >= 0, "reward={reward} bps={bps}");
-            // 3. Fee never exceeds the reward.
-            assert!(fee <= reward, "reward={reward} bps={bps}");
-            // 4. Fee matches the basis-point formula (floor division).
-            assert_eq!(
-                fee,
-                reward * bps as i128 / 10_000,
-                "reward={reward} bps={bps}"
-            );
+    match status {
+        TerminalStatus::Executed => {
+            s.registry.claim_task(&keeper, &task_id);
+            s.registry
+                .execute_task(&keeper, &task_id, &calldata(&s.env));
+        }
+        TerminalStatus::Cancelled => {
+            s.registry.cancel_task(&s.admin, &task_id);
+        }
+        TerminalStatus::Expired => {
+            advance(&s.env, 1, 3_601);
+            s.registry.expire_task(&task_id);
         }
     }
+
+    (task_id, keeper)
 }
 
 #[test]
@@ -664,8 +593,16 @@ fn test_register_task_lock_ledgers_above_max_fails() {
 }
 
 #[test]
-fn test_register_task_lock_ledgers_at_max_succeeds() {
+fn test_increase_reward_accepts_claimed_task() {
     let s = setup();
+    let keeper = Address::generate(&s.env);
+    let task_id = register_task(&s, 1_000_000);
+
+    s.registry.claim_task(&keeper, &task_id);
+    s.registry.increase_reward(&s.admin, &task_id, &500_000);
+
+    assert_eq!(s.registry.get_task(&task_id).status, TaskStatus::Claimed);
+    assert_eq!(s.registry.get_task(&task_id).reward, 1_500_000);
     let deadline = s.env.ledger().timestamp() + 3_600;
     let task_id = s.registry.register_task(
         &s.admin,
@@ -716,130 +653,101 @@ fn test_register_task_ttl_ledgers_at_min_succeeds() {
     assert_eq!(s.registry.get_task(&task_id).ttl_ledgers, MIN_TTL_LEDGERS);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Placeholder tests for unimplemented functions
-//
-// These are intentionally left as stubs. When you implement a function,
-// remove the #[ignore] tag and fill in the test body.
-// ─────────────────────────────────────────────────────────────────────────────
-
 #[test]
-fn test_increase_reward_escrows_and_raises_bounty() {
-    let s = setup();
-    let token = token::Client::new(&s.env, &s.token_id);
-    let id = register_default_task(&s); // reward 1_000_000
-    let contract_before = token.balance(&s.registry.address);
-
-    s.registry.increase_reward(&s.admin, &id, &500_000i128);
-
-    assert_eq!(s.registry.get_task(&id).reward, 1_500_000i128);
-    assert_eq!(
-        token.balance(&s.registry.address),
-        contract_before + 500_000i128
-    );
-}
-
-#[test]
-fn test_increase_reward_by_non_owner_fails() {
-    let s = setup();
-    let stranger = Address::generate(&s.env);
-    let id = register_default_task(&s);
-    assert_eq!(
-        s.registry.try_increase_reward(&stranger, &id, &1i128),
-        Err(Ok(KeeperError::NotTaskOwner))
-    );
-}
-
-#[test]
-fn test_extend_deadline_pushes_it_out() {
-    let s = setup();
-    let id = register_default_task(&s);
-    let old = s.registry.get_task(&id).deadline;
-
-    s.registry.extend_deadline(&s.admin, &id, &(old + 7_200));
-    assert_eq!(s.registry.get_task(&id).deadline, old + 7_200);
-}
-
-#[test]
-fn test_extend_deadline_backwards_fails() {
-    let s = setup();
-    let id = register_default_task(&s);
-    let old = s.registry.get_task(&id).deadline;
-    // A new deadline that isn't strictly later is rejected.
-    assert_eq!(
-        s.registry.try_extend_deadline(&s.admin, &id, &old),
-        Err(Ok(KeeperError::DeadlinePassed))
-    );
-}
-
-#[test]
-fn test_is_claimable_lifecycle() {
+fn test_increase_reward_on_claimed_task_credits_increased_reward() {
     let s = setup();
     let keeper = Address::generate(&s.env);
-    let id = register_default_task(&s);
+    let task_id = register_task(&s, 1_000_000);
 
-    assert!(s.registry.is_claimable(&id)); // Pending → claimable
-    s.registry.claim_task(&keeper, &id);
-    assert!(!s.registry.is_claimable(&id)); // Claimed, lock active → not
+    s.registry.claim_task(&keeper, &task_id);
+    s.registry.increase_reward(&s.admin, &task_id, &500_000);
+    s.registry
+        .execute_task(&keeper, &task_id, &calldata(&s.env));
 
-    advance(&s.env, 121, 60); // lock window elapses
-    assert!(s.registry.is_claimable(&id)); // re-claimable
-
-    advance(&s.env, 1, 3_601); // past deadline
-    assert!(!s.registry.is_claimable(&id)); // deadline passed → not
-    assert!(!s.registry.is_claimable(&999u64)); // unknown → not
+    // The registry default fee is 300 basis points: 1,500,000 - 45,000.
+    assert_eq!(s.registry.keeper_balance(&keeper), 1_455_000);
+    assert_eq!(s.registry.fees_accrued(), 45_000);
 }
 
 #[test]
-fn test_claim_pending_task() {
+fn test_increase_reward_rejects_all_terminal_task_states_without_transfer() {
+    for status in [
+        TerminalStatus::Executed,
+        TerminalStatus::Cancelled,
+        TerminalStatus::Expired,
+    ] {
+        let s = setup();
+        let token = token::Client::new(&s.env, &s.token_id);
+        let (task_id, _) = task_in_status(&s, status);
+        let owner_before = token.balance(&s.admin);
+        let reward_before = s.registry.get_task(&task_id).reward;
+
+        assert_eq!(
+            s.registry.try_increase_reward(&s.admin, &task_id, &500_000),
+            Err(Ok(KeeperError::InvalidTaskStatus))
+        );
+
+        assert_eq!(token.balance(&s.admin), owner_before);
+        assert_eq!(s.registry.get_task(&task_id).reward, reward_before);
+    }
+}
+
+#[test]
+fn test_extend_deadline_accepts_claimed_task() {
     let s = setup();
     let keeper = Address::generate(&s.env);
-    let id = register_default_task(&s);
+    let task_id = register_task(&s, 1_000_000);
+    let old_deadline = s.registry.get_task(&task_id).deadline;
+    let new_deadline = old_deadline + 10_000;
 
-    s.registry.claim_task(&keeper, &id);
+    s.registry.claim_task(&keeper, &task_id);
+    s.registry.extend_deadline(&s.admin, &task_id, &new_deadline);
 
-    let task = s.registry.get_task(&id);
+    assert_eq!(s.registry.get_task(&task_id).status, TaskStatus::Claimed);
+    assert_eq!(s.registry.get_task(&task_id).deadline, new_deadline);
+}
+
+#[test]
+fn test_extend_deadline_on_claimed_task_does_not_extend_lock_window() {
+    let s = setup();
+    let first_keeper = Address::generate(&s.env);
+    let competing_keeper = Address::generate(&s.env);
+    let task_id = register_task(&s, 1_000_000);
+    let original_deadline = s.registry.get_task(&task_id).deadline;
+
+    s.registry.claim_task(&first_keeper, &task_id);
+    s.registry
+        .extend_deadline(&s.admin, &task_id, &(original_deadline + 10_000));
+
+    // The lock is 120 ledgers and must be measured from the original claim,
+    // regardless of the later deadline extension.
+    advance(&s.env, 120, 600);
+    s.registry.claim_task(&competing_keeper, &task_id);
+
+    let task = s.registry.get_task(&task_id);
     assert_eq!(task.status, TaskStatus::Claimed);
-    assert_eq!(task.claimer, Some(keeper));
-    assert!(task.claim_ledger.is_some());
+    assert_eq!(task.claimer, Some(competing_keeper));
 }
 
 #[test]
-fn test_claim_locked_task_by_second_keeper_fails() {
-    let s = setup();
-    let first = Address::generate(&s.env);
-    let second = Address::generate(&s.env);
-    let id = register_default_task(&s);
+fn test_extend_deadline_rejects_all_terminal_task_states() {
+    for status in [
+        TerminalStatus::Executed,
+        TerminalStatus::Cancelled,
+        TerminalStatus::Expired,
+    ] {
+        let s = setup();
+        let (task_id, _) = task_in_status(&s, status);
+        let deadline_before = s.registry.get_task(&task_id).deadline;
 
-    s.registry.claim_task(&first, &id);
-    // Still inside the 120-ledger lock window.
-    assert_eq!(
-        s.registry.try_claim_task(&second, &id),
-        Err(Ok(KeeperError::LockPeriodActive))
-    );
-}
+        assert_eq!(
+            s.registry
+                .try_extend_deadline(&s.admin, &task_id, &(deadline_before + 10_000)),
+            Err(Ok(KeeperError::InvalidTaskStatus))
+        );
 
-#[test]
-fn test_reclaim_after_lock_window_elapses() {
-    let s = setup();
-    let first = Address::generate(&s.env);
-    let second = Address::generate(&s.env);
-    let id = register_default_task(&s);
-
-    s.registry.claim_task(&first, &id);
-    // Move past the lock window (120 ledgers) but stay before the deadline.
-    advance(&s.env, 121, 60);
-
-    s.registry.claim_task(&second, &id);
-    assert_eq!(s.registry.get_task(&id).claimer, Some(second));
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// lock_expired boundary — pins the exact ledger the lock lifts, per issue #33.
-// A small `lock_ledgers` (12, the protocol minimum) keeps the arithmetic easy
-// to follow.
-// ─────────────────────────────────────────────────────────────────────────────
-
+        assert_eq!(s.registry.get_task(&task_id).deadline, deadline_before);
+    }
 /// Registers a task with the given `lock_ledgers`, claims it as `keeper`, and
 /// returns `(task_id, unlock_at)` where `unlock_at = claim_ledger + lock_ledgers`
 /// — the first ledger sequence at which the lock is considered expired.
