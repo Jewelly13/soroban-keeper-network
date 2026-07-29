@@ -104,9 +104,15 @@ pub struct Task {
     pub calldata: Bytes,
     /// Reward escrowed in this contract (token units / XLM stroops).
     pub reward: i128,
-    /// Unix timestamp (seconds) after which the task may be expired.
+    /// Unix timestamp IN SECONDS after which the task may be expired. Not
+    /// directly comparable to `ttl_ledgers` — see that field.
     pub deadline: u64,
-    /// Ledger TTL for this storage entry.
+    /// Ledger TTL for this storage entry, IN LEDGERS (not seconds). Ledgers
+    /// close roughly every `SECONDS_PER_LEDGER` seconds, so this and
+    /// `deadline` are different units; `register_task`/`extend_deadline`
+    /// enforce that this always covers `deadline` plus a safety margin so the
+    /// entry cannot be evicted while its escrow is still live (see
+    /// `required_ttl_ledgers`).
     pub ttl_ledgers: u32,
     pub status: TaskStatus,
     /// Set when a keeper claims the task.
@@ -142,6 +148,13 @@ pub enum KeeperError {
     /// A function requiring configured state (`initialize` must have been
     /// called) was invoked on a registry that isn't configured yet.
     NotInitialized = 15,
+    /// `ttl_ledgers` does not cover the task's `deadline` plus the safety
+    /// margin — the storage entry could expire while the escrow is still
+    /// live. See [`required_ttl_ledgers`].
+    TtlTooShort = 16,
+    // 17 is reserved for `CalldataTooLarge`, added by a sibling in-flight PR
+    // (see #13 / register_task calldata bounding). Left as a gap rather than
+    // reused so the two branches don't collide on the same discriminant.
     // 16 is reserved for `TtlTooShort`, added by a sibling in-flight PR (see
     // #11 / register_task deadline-vs-TTL invariant). Left as a gap rather
     // than reused so the two branches don't collide on the same discriminant.
@@ -363,6 +376,28 @@ fn next_task_id(e: &Env) -> u64 {
     let next = id.checked_add(1).expect("task id counter exhausted");
     e.storage().instance().set(&DataKey::TaskCounter, &next);
     next
+}
+
+/// Ledgers close roughly every 5 seconds on Stellar. Used only to sanity-check
+/// that a task's storage outlives its deadline; a conservative estimate is
+/// correct here because over-estimating the ledger rate over-provisions TTL.
+const SECONDS_PER_LEDGER: u64 = 5;
+
+/// Extra ledgers kept beyond the deadline so `expire_task` (and `cancel_task`/
+/// `execute_task`) are still callable for a while after the deadline passes,
+/// giving a margin against clock drift between the two units below.
+const TTL_SAFETY_MARGIN_LEDGERS: u32 = 17_280; // ~1 day
+
+/// Minimum `ttl_ledgers` a task with the given `deadline` must be stored with
+/// so its Persistent storage entry cannot be evicted while the escrow it
+/// guards is still live. `deadline` is a unix timestamp (seconds);
+/// `ttl_ledgers` is a ledger count — the two are different units with no
+/// fixed conversion, so this is deliberately conservative
+/// (see [`SECONDS_PER_LEDGER`], [`TTL_SAFETY_MARGIN_LEDGERS`]).
+fn required_ttl_ledgers(e: &Env, deadline: u64) -> u64 {
+    let seconds_until_deadline = deadline.saturating_sub(e.ledger().timestamp());
+    let ledgers_until_deadline = seconds_until_deadline / SECONDS_PER_LEDGER;
+    ledgers_until_deadline + TTL_SAFETY_MARGIN_LEDGERS as u64
 }
 
 fn load_task(e: &Env, task_id: u64) -> Result<Task, KeeperError> {
@@ -615,7 +650,11 @@ impl KeeperRegistry {
         bump_instance(&e);
 
         // Escrow the reward from the owner into this contract.
-        reward_token(&e)?.transfer(&owner, &e.current_contract_address(), &reward);
+        let token = reward_token(&e)?;
+        if (ttl_ledgers as u64) < required_ttl_ledgers(&e, deadline) {
+            return Err(KeeperError::TtlTooShort);
+        }
+        token.transfer(&owner, &e.current_contract_address(), &reward);
 
         let task_id = next_task_id(&e);
         let task = Task {
@@ -699,6 +738,9 @@ impl KeeperRegistry {
         }
         if new_deadline <= task.deadline {
             return Err(KeeperError::DeadlinePassed);
+        }
+        if (task.ttl_ledgers as u64) < required_ttl_ledgers(&e, new_deadline) {
+            return Err(KeeperError::TtlTooShort);
         }
 
         bump_instance(&e);
