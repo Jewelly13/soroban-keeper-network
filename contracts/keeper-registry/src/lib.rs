@@ -409,7 +409,12 @@ fn fee_bps(e: &Env) -> u32 {
 }
 
 /// Returns (keeper_net, protocol_fee).
-fn split_reward(reward: i128, fee_bps: u32) -> Result<(i128, i128), KeeperError> {
+///
+/// `pub` (not crate-private) so the `invariants` module and fuzz targets in
+/// the separate `keeper-registry-fuzz` crate can call the exact same
+/// arithmetic the contract itself uses, rather than reimplementing the
+/// formula and risking the two drifting apart.
+pub fn split_reward(reward: i128, fee_bps: u32) -> (i128, i128) {
     let fee = reward
         .checked_mul(fee_bps as i128)
         .ok_or(KeeperError::ArithmeticOverflow)?
@@ -1168,6 +1173,9 @@ impl KeeperRegistry {
         VERSION
     }
 }
+
+#[cfg(any(test, fuzzing))]
+pub mod invariants;
 
 #[cfg(test)]
 mod test;
