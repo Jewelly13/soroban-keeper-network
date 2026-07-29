@@ -182,6 +182,16 @@ async function validateAndLoadConfig() {
       parse: (v) => v.toLowerCase() === "true",
       fallback: true,
     }),
+    eventsPageSize: requireEnv("EVENTS_PAGE_SIZE", {
+      parse: (v) => parseInt(v, 10),
+      validate: { fn: (v) => v > 0, reason: "must be a positive number" },
+      fallback: 100,
+    }),
+    eventsMaxPages: requireEnv("EVENTS_MAX_PAGES", {
+      parse: (v) => parseInt(v, 10),
+      validate: { fn: (v) => v > 0, reason: "must be a positive number" },
+      fallback: 10,
+    }),
   };
 }
 
@@ -342,6 +352,14 @@ async function readContract(server, sourcePublicKey, networkPassphrase, contract
 // Task fetching — reads pending tasks by querying events
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * Fetches TaskRegistered events across the window, following the pagination
+ * cursor. Bounded by `CONFIG.eventsMaxPages` so one very busy window cannot
+ * stall a round indefinitely; hitting the bound is logged, never silent.
+ *
+ * This pagination behaviour is compatible with Soroban RPC v1.2.0 and later,
+ * where `startLedger` and `cursor` are mutually exclusive.
+ */
 async function fetchPendingTasks(server, contractId, startLedger) {
   const tasks = [];
   try {
@@ -369,10 +387,28 @@ async function fetchPendingTasks(server, contractId, startLedger) {
       } catch (e) {
         // Skip malformed events
       }
+
+      pages++;
+      if (
+        !response.events ||
+        response.events.length < CONFIG.eventsPageSize ||
+        !response.cursor
+      ) {
+        break; // Window exhausted
+      }
+      cursor = response.cursor;
+    } catch (e) {
+      console.warn("⚠️  Failed to fetch events page:", e.message);
+      break; // Stop pagination on error
     }
-  } catch (e) {
-    console.warn("⚠️  Failed to fetch events:", e.message);
   }
+
+  if (pages === CONFIG.eventsMaxPages) {
+    console.warn(
+      `⚠️  Stopped fetching events after ${pages} pages — more may remain in this window.`
+    );
+  }
+
   return tasks;
 }
 
