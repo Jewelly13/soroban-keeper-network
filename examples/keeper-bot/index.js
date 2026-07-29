@@ -546,6 +546,8 @@ async function keeperLoop(
     for (const task of pendingTasks) {
       if (summary.processed >= CONFIG.maxTasksPerRound) break;
 
+      // The event-derived deadline is potentially stale, but it's a cheap
+      // client-side filter. is_claimable will check the true current deadline.
       if (task.deadline <= nowSeconds) {
         if (CONFIG.expireStaleTasks) {
           try {
@@ -574,6 +576,29 @@ async function keeperLoop(
       }
 
       try {
+        // Pre-flight check: is the task actually claimable right now? This
+        // is a read-only simulation, so it costs nothing. It confirms the
+        // task is still pending and not locked by another keeper.
+        const claimable = await readContract(
+          server,
+          keypair.publicKey(),
+          networkPassphrase,
+          contractId,
+          "is_claimable",
+          [nativeToScVal(task.taskId, { type: "u64" })]
+        );
+
+        if (!claimable) {
+          console.log(
+            `  ⏩  Skipping task ${task.taskId} — not claimable (already claimed or finished)`
+          );
+          continue;
+        }
+
+        // The pre-check is advisory, not a lock. A competitor can still
+        // claim the task in the interval between our simulation and our
+        // submission. The `claim_task` call can still fail, which is
+        // normal and expected.
         console.log(
           `  📌  Attempting to claim task ${task.taskId} (reward: ${task.reward})...`
         );
