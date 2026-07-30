@@ -6,13 +6,25 @@ Decision record for verifier failure handling. This document unblocks implementa
 
 ## Interface
 
-A verifier is an optional contract attached to a task. The verifier exposes the following Soroban contract entry point:
+A verifier is an optional contract attached to a task. The verifier exposes the following Soroban contract entry points:
 
 ```rust
-pub fn verify(env: Env, task: Task, proof: Bytes) -> bool
+/// Must equal `KEEPER_VERIFIER_INTERFACE_VERSION` (currently `1`).
+pub fn interface_version(env: Env) -> u32;
+
+pub fn verify(env: Env, task: Task, keeper: Address, proof: Bytes) -> bool
 ```
 
-The verifier returns `true` when the proof is acceptable and `false` otherwise. The task and proof are passed by value at the contract ABI boundary; generated Soroban clients may use references in their Rust-facing method signatures.
+The verifier returns `true` when the proof is acceptable and `false` otherwise. The task, keeper, and proof are passed by value at the contract ABI boundary; generated Soroban clients may use references in their Rust-facing method signatures.
+
+### Interface versioning
+
+The registry contract exposes its own `VERSION` constant for ABI detection. The verifier interface needs the same discipline: a contract written against v1 of `IKeeperVerifier` must not silently misbehave if the registry later calls it with a v2 calling convention.
+
+- `KEEPER_VERIFIER_INTERFACE_VERSION` (in `keeper-registry`) is the sole supported convention version.
+- Every verifier returns that value from `interface_version`.
+- `execute_task` reads `interface_version` **before** calling `verify`. On mismatch it returns `KeeperError::IncompatibleVerifierInterface` without calling `verify`, without crediting the keeper, and without changing task status.
+- When `verify`'s parameters or semantics change incompatibly, bump `KEEPER_VERIFIER_INTERFACE_VERSION` and update reference verifiers together. Older deployed verifiers will fail closed with the typed error until redeployed.
 
 A task without an attached verifier retains the existing behavior: `execute_task` does not perform an external call and proceeds with the normal reward accounting after its existing checks.
 
@@ -87,6 +99,11 @@ owner can attach a verifier contract at registration time, and
 /// proof verifier. Registered per-task via `register_task`'s optional
 /// `verifier` parameter (see §4, Attachment timing).
 pub trait IKeeperVerifier {
+    /// Calling-convention version. Must equal
+    /// `KEEPER_VERIFIER_INTERFACE_VERSION` or `execute_task` rejects before
+    /// `verify`.
+    fn interface_version(env: Env) -> u32;
+
     /// Returns `true` if `proof` is a valid witness that `keeper` correctly
     /// executed `task_id`'s off-chain work, `false` otherwise.
     ///
@@ -233,7 +250,8 @@ task, not a new required parameter with no default.
 
 | Question | Decision |
 |---|---|
-| Interface shape | `fn verify(env, task_id, keeper, proof) -> bool` — `keeper` included to bind the proof to the specific claim |
+| Interface shape | `fn interface_version(env) -> u32` plus `fn verify(env, task_id, keeper, proof) -> bool` — `keeper` included to bind the proof to the specific claim |
+| Interface versioning | Verifier reports `KEEPER_VERIFIER_INTERFACE_VERSION`; mismatch → `IncompatibleVerifierInterface` before `verify` |
 | Failure semantics | `execute_task` uses `try_invoke_contract`; a panicking or `false`-returning verifier both map to `KeeperError::VerificationFailed`, never a transaction-wide revert |
 | Resource budget | No in-contract ceiling reserved; the calling transaction's own resource footprint is the only limit — keeper bots should simulate first |
 | Attachment timing | Chosen at `register_task`, owner-changeable while `Pending`, immutable once claimed |
