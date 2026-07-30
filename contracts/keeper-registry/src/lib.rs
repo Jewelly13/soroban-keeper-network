@@ -582,6 +582,45 @@ fn fee_bps(e: &Env) -> u32 {
 
 /// Returns (keeper_net, protocol_fee).
 ///
+/// # Rounding guarantee
+///
+/// The protocol fee is `floor(reward * fee_bps / 10_000)` and the keeper
+/// receives the entire remainder. Rounding is therefore **always down for the
+/// protocol and always in the keeper's favour**, and this is a guarantee, not
+/// an incidental property of integer division:
+///
+/// - The protocol can never collect **more** than the nominal `fee_bps` rate.
+///   It may collect very slightly less.
+/// - The shortfall is bounded by **one stroop per execution** — the discarded
+///   remainder is strictly less than the divisor.
+/// - `keeper_net + fee == reward` holds exactly, for every input. No value is
+///   created or destroyed by the split (invariant I-1; see
+///   `docs/ARCHITECTURE.md`, "I-4: Fees are bounded and rounded down").
+///
+/// Rust's integer division truncates toward zero, which coincides with `floor`
+/// here because `register_task` rejects a non-positive `reward`, so this
+/// function is only ever reached with `reward > 0`.
+///
+/// ## Dust threshold
+///
+/// A consequence worth stating explicitly: for small rewards the fee rounds to
+/// **zero** entirely. The fee is non-zero only once
+///
+/// ```text
+/// reward >= ceil(10_000 / fee_bps)
+/// ```
+///
+/// At the 300 bps (3%) default that threshold is 34 stroops: a reward of 33
+/// yields a fee of 0 and the keeper takes all of it, while a reward of 34
+/// yields a fee of 1. Setting `min_reward` below that threshold means the
+/// protocol earns nothing on such tasks while still bearing their storage
+/// cost, which is why `min_reward` and `fee_bps` should be chosen together
+/// rather than independently. See the README tokenomics section.
+///
+/// Anyone reconciling expected against actual protocol revenue should expect a
+/// deficit of up to one stroop per executed task. That is this rounding rule,
+/// not a bug.
+///
 /// `pub` (not crate-private) so the `invariants` module and fuzz targets in
 /// the separate `keeper-registry-fuzz` crate can call the exact same
 /// arithmetic the contract itself uses, rather than reimplementing the

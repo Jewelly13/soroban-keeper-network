@@ -493,6 +493,49 @@ for the trust model and cross-contract panic-isolation semantics.
 - Protocol fee (`fee_bps`) is configurable by admin (default 3%).
 - Fees accumulate in the contract; admin sweeps to a treasury address.
 
+##### Fee rounding and the dust threshold
+
+The fee is computed with integer division, so it always rounds **down**:
+
+```text
+fee        = floor(reward * fee_bps / 10_000)
+keeper_net = reward - fee
+```
+
+This is a guarantee, not an accident of the implementation. The protocol can
+never collect more than the nominal `fee_bps` rate; it may collect very
+slightly less, and the shortfall is bounded by **one stroop per execution**,
+always in the keeper's favour. `keeper_net + fee == reward` holds exactly for
+every input, so nothing is created or destroyed by the split.
+
+Anyone reconciling expected protocol revenue against actual accrued fees should
+expect a deficit of up to one stroop per executed task. That is this rule, not
+a bug.
+
+**The dust threshold.** For small rewards the fee rounds to zero entirely. The
+fee is non-zero only once:
+
+```text
+min_reward >= ceil(10_000 / fee_bps)
+```
+
+At the 300 bps (3%) default that threshold is **34 stroops**:
+
+| `reward` | `fee_bps` | `fee` | `keeper_net` | effective rate |
+|---------:|----------:|------:|-------------:|---------------:|
+| 1 | 300 | 0 | 1 | 0% |
+| 33 | 300 | 0 | 33 | 0% |
+| 34 | 300 | 1 | 33 | 2.9% |
+| 100 | 300 | 3 | 97 | 3% |
+| 10 000 000 | 300 | 300 000 | 9 700 000 | 3% |
+
+This connects two parameters that are otherwise set independently. Choosing a
+`min_reward` below the threshold means the protocol earns **nothing** on those
+tasks while still bearing their storage cost, so `min_reward` and `fee_bps`
+should be chosen together. Setting `fee_bps` to `0` is also legal and gives the
+keeper the whole reward; `10_000` (100%) is legal too, and is the one setting
+where a keeper executes a task for no reward at all.
+
 #### Phase 2 — Governance Token ($KPRS)
 
 | Attribute | Value |
