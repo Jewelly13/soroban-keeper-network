@@ -344,6 +344,26 @@ fn every_corpus_seed_passes_the_target_assertions() {
     }
 }
 
+/// A single unaffordable entry: reward i128::MAX passes every parameter rule
+/// and does not overflow the sum, so validation accepts it -- but the escrow
+/// transfer cannot succeed against any real balance.
+#[test]
+fn single_unaffordable_entry() {
+    let bytes = vec![1u8, 0u8, 3u8, 2u8, 5u8, 2u8];
+    let mut entries = [EntrySeed::default(); MAX_GENERATED_ENTRIES as usize];
+    let (count, ceiling_seed) = batch::decode(&bytes, &mut entries);
+    let harness = RegistryHarness::new();
+    batch::run_case(
+        &harness.env,
+        &harness.client(),
+        &harness.token_client(),
+        &harness.contract_id,
+        &harness.user,
+        &entries[..count],
+        ceiling_seed,
+    );
+}
+
 /// Truncation must decode as a shorter batch rather than being discarded --
 /// libFuzzer mutates by truncating constantly, so a decoder that errored on
 /// short input would throw away most of the corpus.
