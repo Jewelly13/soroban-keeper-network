@@ -284,6 +284,60 @@ renews proportionally less often — roughly rent-neutral, while strictly
 improving idle tolerance. Both values sit far below the network's
 `max_entry_ttl`, and persistent entries clamp rather than fail at that ceiling,
 so there is headroom.
+### `save_task` TTL-extension cost
+
+`save_task` calls `extend_ttl` unconditionally, including on writes that leave
+`ttl_ledgers` untouched (`claim_task`, `execute_task`, `increase_reward`).
+Issue 0111 asked whether that unconditional call is paying an avoidable cost
+and whether a read-and-compare guard should be added. It was measured, and the
+answer is no on three independent grounds. The measurements live in
+`contracts/keeper-registry/tests/ttl_extension_cost.rs` and are reproducible
+with:
+
+```
+cargo test -p keeper-registry --test ttl_extension_cost -- --nocapture
+```
+
+**1. The guard is not implementable.** Reading an entry's current TTL is the
+load-bearing half of "read and compare", and contract code cannot do it.
+`Storage::get_ttl` exists only on the `soroban_sdk::testutils::storage` traits,
+compiled under `testutils` and absent from the contract-facing API. The
+underlying host function is likewise absent from the WASM host interface in
+`soroban-env-common`'s `env.json`; the only TTL reader exposed to contracts is
+`get_max_live_until_ledger`, which returns the network-wide maximum rather than
+this entry's remaining lifetime.
+
+**2. The host already short-circuits.** `Storage::extend_ttl` in
+`soroban-env-host` guards its storage-map insert behind
+`new_live_until > old_live_until && old_live_until - ledger_seq <= threshold`,
+so a redundant extension skips the expensive half host-side. Measured on
+soroban-sdk 22, against a 25,826-instruction baseline persistent write:
+
+| Call                                      | CPU delta | Memory delta |
+|-------------------------------------------|-----------|--------------|
+| `extend_ttl`, redundant (short-circuited)  | +2,437    | +376 bytes   |
+| `extend_ttl`, effective (insert performed) | +3,642    | +664 bytes   |
+
+The redundant call costs ~2.4k instructions — roughly 0.002% of Soroban's
+100M-instruction transaction budget. That figure is also the ceiling on what
+any guard could save, since a guard can at best elide the call entirely.
+
+**3. The redundant case barely arises.** The premise that a write leaving
+`ttl_ledgers` unchanged performs a redundant extension conflates two different
+things. `save_task` passes `extend_to = task.ttl_ledgers`, a TTL measured
+*from the current ledger*, not an absolute expiry — so an unchanged
+`ttl_ledgers` still means a genuinely later `live_until_ledger` whenever any
+ledger has closed since the previous write. An extension is redundant only for
+two writes landing in the *same* ledger, and a task's lifecycle calls are
+necessarily separate transactions. On the common path the extension is doing
+real work, which is exactly what the TTL/deadline invariant above depends on.
+
+No code change was made. `every_lifecycle_write_restores_the_full_ttl_window`
+is the regression test guarding conclusion 3: it walks a task through
+registration, top-up, deadline extension, claim, and execution with ledgers
+closing in between, and asserts the entry's TTL is restored to the full window
+after each write. A future guard that skipped extension too eagerly would fail
+it rather than silently reintroducing the early-archival risk.
 
 ## Review checklist
 

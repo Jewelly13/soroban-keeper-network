@@ -66,7 +66,7 @@
 //! indistinguishable to this verifier.
 #![no_std]
 
-use keeper_registry::{IKeeperVerifier, Task};
+use keeper_registry::{IKeeperVerifier, Task, KEEPER_VERIFIER_INTERFACE_VERSION};
 use soroban_sdk::{contract, contractimpl, contracttype, xdr::ToXdr, Address, Bytes, Env};
 
 /// How long a recorded inclusion marker survives in temporary storage
@@ -135,6 +135,10 @@ impl InclusionVerifier {
 
 #[contractimpl]
 impl IKeeperVerifier for InclusionVerifier {
+    fn interface_version(_env: Env) -> u32 {
+        KEEPER_VERIFIER_INTERFACE_VERSION
+    }
+
     fn verify(env: Env, task: Task, keeper: Address, _proof: Bytes) -> bool {
         let key = MarkerKey {
             task_identity: task_identity_bytes(&env, &task),

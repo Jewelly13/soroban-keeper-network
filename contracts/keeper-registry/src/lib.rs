@@ -202,12 +202,30 @@ pub struct Task {
 /// passes. A well-behaved verifier should therefore return `false` for a
 /// "proof didn't check out" outcome rather than panicking, reserving an
 /// actual panic for conditions that are genuinely exceptional.
+/// ## Interface versioning
+/// Every verifier must expose [`IKeeperVerifier::interface_version`] returning
+/// [`KEEPER_VERIFIER_INTERFACE_VERSION`]. `execute_task` checks that value
+/// before calling `verify` and rejects with
+/// [`KeeperError::IncompatibleVerifierInterface`] on mismatch, so a verifier
+/// written against an older calling convention cannot be invoked with a newer
+/// one (and vice versa).
 #[soroban_sdk::contractclient(name = "IKeeperVerifierClient")]
 pub trait IKeeperVerifier {
+    /// Version of the `IKeeperVerifier` calling convention this contract
+    /// implements. Must equal [`KEEPER_VERIFIER_INTERFACE_VERSION`] for the
+    /// registry to call [`IKeeperVerifier::verify`].
+    fn interface_version(env: Env) -> u32;
+
     /// Returns `true` if `proof` is a valid attestation that `keeper`
     /// performed the off-chain action `task` describes.
     fn verify(env: Env, task: Task, keeper: Address, proof: Bytes) -> bool;
 }
+
+/// Current `IKeeperVerifier` calling-convention version. Verifiers must
+/// return this from [`IKeeperVerifier::interface_version`]. Bump when
+/// `verify`'s parameters or semantics change in a way that would make an
+/// older verifier misbehave if called under the new convention.
+pub const KEEPER_VERIFIER_INTERFACE_VERSION: u32 = 1;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Errors
@@ -258,6 +276,9 @@ pub enum KeeperError {
     VerificationFailed = 19,
     /// Arithmetic operation would overflow or underflow.
     ArithmeticOverflow = 20,
+    /// The attached verifier reported an `interface_version` other than
+    /// [`KEEPER_VERIFIER_INTERFACE_VERSION`]. `verify` was not called.
+    IncompatibleVerifierInterface = 21,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -563,6 +584,28 @@ fn load_task(e: &Env, task_id: u64) -> Result<Task, KeeperError> {
         .ok_or(KeeperError::TaskNotFound)
 }
 
+/// Writes a task and renews its storage lifetime.
+///
+/// The `extend_ttl` below is deliberately unconditional. Issue 0111 asked
+/// whether it should be guarded by a read-and-compare on the entry's current
+/// TTL; that was measured and rejected on three grounds (see
+/// `docs/ARCHITECTURE.md`, "save_task TTL-extension cost", and the
+/// measurements in `tests/ttl_extension_cost.rs`):
+///
+/// 1. The guard cannot be written. Contract code has no way to read an entry's
+///    current TTL — `Storage::get_ttl` is `testutils`-only, and the host
+///    interface exposes no equivalent to on-chain code.
+/// 2. The host already short-circuits a redundant extension before its
+///    expensive storage-map insert, leaving ~2.4k CPU instructions against a
+///    100M-instruction transaction budget.
+/// 3. The redundant case is rare anyway. `extend_to` is a TTL relative to the
+///    *current* ledger, so an unchanged `ttl_ledgers` still buys a genuinely
+///    later expiry on every write that lands in a new ledger — which is every
+///    lifecycle call in practice.
+///
+/// Please do not add a guard here without re-deriving those numbers: the
+/// invariant this call upholds (a task's storage always outlives its escrow)
+/// is worth far more than the instructions a guard could save.
 fn save_task(e: &Env, task_id: u64, task: &Task) {
     e.storage().persistent().set(&DataKey::Task(task_id), task);
     e.storage().persistent().extend_ttl(
@@ -686,7 +729,7 @@ fn lock_expired(e: &Env, task: &Task) -> bool {
 
 /// Semantic version of the contract logic. Bumped on behavior changes so
 /// off-chain clients and indexers can detect which ABI they are talking to.
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 
 /// Maximum `calldata` length, in bytes. Sized to hold an encoded contract
 /// call — a target address, a function symbol, and a handful of scalar or
@@ -1051,8 +1094,14 @@ impl KeeperRegistry {
         }
 
         if let Some(verifier) = task.verifier.clone() {
-            let approved: bool =
-                IKeeperVerifierClient::new(&e, &verifier).verify(&task, &keeper, &proof);
+            let client = IKeeperVerifierClient::new(&e, &verifier);
+            // Reject incompatible interface versions before `verify` so a
+            // verifier written against a different calling convention cannot
+            // silently mis-handle the current argument layout.
+            if client.interface_version() != KEEPER_VERIFIER_INTERFACE_VERSION {
+                return Err(KeeperError::IncompatibleVerifierInterface);
+            }
+            let approved: bool = client.verify(&task, &keeper, &proof);
             if !approved {
                 emit_verification_failed(&e, task_id, &keeper);
                 return Err(KeeperError::VerificationFailed);
