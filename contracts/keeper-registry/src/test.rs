@@ -4878,3 +4878,264 @@ fn test_expire_task_recovers_escrow_from_a_task_stuck_behind_a_budget_exhausting
     assert_eq!(task_after_expiry.status, TaskStatus::Expired);
     assert_eq!(token.balance(&s.admin), owner_balance_before + reward);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// I-7: task ids are unique and never reused
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// I-7 (issue #86): `next_task_id` hands out a strictly increasing `u64` and
+/// never recycles an id, so an off-chain reference to a task id — an indexer's
+/// primary key, a keeper bot's local queue entry, a dApp's deep link — stays
+/// valid for the lifetime of the contract.
+///
+/// `next_task_id` only ever `checked_add(1)`s a monotonic counter, so the
+/// invariant should already hold; these tests prove it rather than trusting the
+/// implementation, and pin the `u64` behavior at the overflow boundary.
+///
+/// Self-contained (own fixture helpers rather than the module-level `setup()`)
+/// so the property can be read and run without the surrounding suite's shared
+/// state.
+mod i7_task_id_monotonicity {
+    // The contract crate is `#![no_std]`; the surrounding suite already pulls
+    // `std` in for the same reason (proptest's generated collections).
+    extern crate std;
+    use std::vec::Vec;
+
+    use proptest::prelude::*;
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger},
+        token, Address, Bytes, Env,
+    };
+
+    use crate::{DataKey, KeeperRegistry, KeeperRegistryClient, TaskStatus, TaskType};
+
+    /// Generous enough that a randomized plan can register, refund, and
+    /// re-register many times over without the owner running out of funds.
+    const MINT: i128 = 1_000_000_000_000i128;
+    const REWARD: i128 = 1_000i128;
+    const DEADLINE_OFFSET: u64 = 3_600;
+    /// `register_task` enforces `ttl_ledgers >= required_ttl_ledgers(deadline)`,
+    /// which for a one-hour deadline is `3_600 / 5 + 17_280 = 18_000`.
+    const TTL_LEDGERS: u32 = 20_000;
+    const LOCK_LEDGERS: u32 = 120;
+    const FEE_BPS: u32 = 300;
+
+    /// Returns `(env, owner, registry_id)`. The owner doubles as admin — this
+    /// property is about id allocation, which no admin function touches.
+    fn fixture() -> (Env, Address, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let owner = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        token::StellarAssetClient::new(&env, &token_id).mint(&owner, &MINT);
+
+        let registry_id = env.register(KeeperRegistry, ());
+        KeeperRegistryClient::new(&env, &registry_id).initialize(&owner, &token_id, &FEE_BPS);
+
+        (env, owner, registry_id)
+    }
+
+    fn register(env: &Env, owner: &Address, registry_id: &Address) -> u64 {
+        let deadline = env.ledger().timestamp() + DEADLINE_OFFSET;
+        KeeperRegistryClient::new(env, registry_id).register_task(
+            owner,
+            &TaskType::Liquidation,
+            &Bytes::from_slice(env, b"i7-monotonic"),
+            &REWARD,
+            &deadline,
+            &TTL_LEDGERS,
+            &LOCK_LEDGERS,
+            &None,
+        )
+    }
+
+    fn advance_past_deadline(env: &Env) {
+        env.ledger().with_mut(|ledger| {
+            ledger.sequence_number += 1;
+            ledger.timestamp += DEADLINE_OFFSET + 1;
+        });
+    }
+
+    /// Writes the task counter directly so the `u64::MAX` boundary is reachable
+    /// without the ~1.8e19 registrations it would otherwise take.
+    fn set_task_counter(env: &Env, registry_id: &Address, value: u64) {
+        env.as_contract(registry_id, || {
+            env.storage().instance().set(&DataKey::TaskCounter, &value);
+        });
+    }
+
+    /// How a freshly registered task is driven onward before the next
+    /// registration. Terminal variants are the point of the property: an id
+    /// belonging to a task the contract can no longer act on must still never
+    /// be handed out again.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Step {
+        /// Leave the task `Pending`.
+        LeaveOpen,
+        /// Owner pulls the escrow back out of a `Pending` task.
+        Cancel,
+        /// A keeper claims and executes it; the id belongs to a paid-out task.
+        Execute,
+        /// The deadline passes and anyone expires it, refunding the owner.
+        Expire,
+    }
+
+    impl Step {
+        fn expected_status(self) -> TaskStatus {
+            match self {
+                Step::LeaveOpen => TaskStatus::Pending,
+                Step::Cancel => TaskStatus::Cancelled,
+                Step::Execute => TaskStatus::Executed,
+                Step::Expire => TaskStatus::Expired,
+            }
+        }
+    }
+
+    fn apply(env: &Env, owner: &Address, registry_id: &Address, task_id: u64, step: Step) {
+        let registry = KeeperRegistryClient::new(env, registry_id);
+        match step {
+            Step::LeaveOpen => {}
+            Step::Cancel => registry.cancel_task(owner, &task_id),
+            Step::Execute => {
+                let keeper = Address::generate(env);
+                registry.claim_task(&keeper, &task_id);
+                registry.execute_task(&keeper, &task_id, &Bytes::from_slice(env, b"i7-proof"));
+            }
+            Step::Expire => {
+                advance_past_deadline(env);
+                registry.expire_task(&task_id);
+            }
+        }
+    }
+
+    fn step_strategy() -> impl Strategy<Value = Step> {
+        prop_oneof![
+            Just(Step::LeaveOpen),
+            Just(Step::Cancel),
+            Just(Step::Execute),
+            Just(Step::Expire),
+        ]
+    }
+
+    proptest! {
+        // Each case stands up a fresh `Env` and drives real contract calls, so
+        // the case count is tuned for a useful sequence length rather than
+        // proptest's default 256.
+        #![proptest_config(ProptestConfig::with_cases(48))]
+
+        /// I-7: across an arbitrary interleaving of registrations and
+        /// terminations, every issued id is strictly greater than every id
+        /// issued before it, and `task_count()` counts registrations rather
+        /// than live tasks.
+        #[test]
+        fn property_i7_task_ids_are_strictly_monotonic_and_never_reused(
+            plan in prop::collection::vec(step_strategy(), 1..12usize),
+        ) {
+            let (env, owner, registry_id) = fixture();
+            let registry = KeeperRegistryClient::new(&env, &registry_id);
+
+            let mut issued: Vec<u64> = Vec::new();
+
+            for &step in &plan {
+                let task_id = register(&env, &owner, &registry_id);
+
+                // Strictly greater than the most recent id, and — because the
+                // sequence is strictly increasing — than every id before it.
+                if let Some(&previous) = issued.last() {
+                    prop_assert!(
+                        task_id > previous,
+                        "issued id {} did not exceed the previously issued {}",
+                        task_id,
+                        previous
+                    );
+                }
+                // Stated directly as well, so a regression that broke
+                // monotonicity without breaking the last-id comparison (an
+                // id recycled from further back) still fails here.
+                prop_assert!(
+                    !issued.contains(&task_id),
+                    "issued id {} had already been handed out",
+                    task_id
+                );
+                issued.push(task_id);
+
+                apply(&env, &owner, &registry_id, task_id, step);
+
+                // Holds after the termination too: reaching a terminal state
+                // must not decrement the counter.
+                prop_assert_eq!(registry.task_count(), issued.len() as u64);
+            }
+
+            // `task_count()` after N registrations is N, no matter how many of
+            // those N have since been cancelled, executed, or expired.
+            prop_assert_eq!(registry.task_count(), plan.len() as u64);
+
+            for (index, (&task_id, &step)) in issued.iter().zip(&plan).enumerate() {
+                // Pins the current allocation as the dense `1..=N` sequence.
+                // Stricter than I-7 needs — I-7 only requires uniqueness and
+                // monotonicity — but true today and worth failing loudly on.
+                prop_assert_eq!(task_id, index as u64 + 1);
+
+                // The id is genuinely retired, not freed: a terminated task
+                // still resolves under its own id, in its terminal state.
+                prop_assert_eq!(
+                    registry.get_task(&task_id).status,
+                    step.expected_status()
+                );
+            }
+        }
+    }
+
+    /// I-7 at the last usable id: with the counter one below its ceiling,
+    /// `next_task_id` hands out `u64::MAX` and the task is registered normally.
+    #[test]
+    fn test_next_task_id_at_u64_max_minus_one_issues_u64_max() {
+        let (env, owner, registry_id) = fixture();
+        let registry = KeeperRegistryClient::new(&env, &registry_id);
+
+        set_task_counter(&env, &registry_id, u64::MAX - 1);
+
+        let task_id = register(&env, &owner, &registry_id);
+
+        assert_eq!(task_id, u64::MAX);
+        assert_eq!(registry.task_count(), u64::MAX);
+        assert_eq!(registry.get_task(&task_id).status, TaskStatus::Pending);
+    }
+
+    /// I-7 at the ceiling — **documented decision for issue #86**.
+    ///
+    /// `next_task_id` resolves exhaustion with
+    /// `.expect("task id counter exhausted")`: an untyped panic, not a
+    /// `KeeperError`. That is **accepted as-is; no follow-up issue is filed.**
+    /// The reasoning does not carry over from the `u32` overflows repaired in
+    /// wave 1:
+    ///
+    /// * The counter is a `u64`. Exhausting it takes `2^64 - 1` ≈ 1.8e19
+    ///   *successful* `register_task` calls, each a separate Stellar
+    ///   transaction paying a fee and doing a storage write. At a million
+    ///   registrations per second that is still ~584,000 years. It is not
+    ///   reachable by an attacker with a budget, only by a much older
+    ///   universe.
+    /// * The wave-1 `u32` cases were different in kind: `u32` ledger and
+    ///   amount arithmetic is reachable under ordinary operation, so those
+    ///   genuinely needed typed errors.
+    /// * Converting this to a typed error would widen `register_task`'s error
+    ///   surface with a variant no caller can ever observe, making every
+    ///   caller handle dead code.
+    ///
+    /// The test exists to pin the behavior, so a future refactor that changes
+    /// it fails loudly here instead of silently.
+    #[test]
+    #[should_panic(expected = "task id counter exhausted")]
+    fn test_next_task_id_at_u64_max_panics_by_design() {
+        let (env, owner, registry_id) = fixture();
+
+        set_task_counter(&env, &registry_id, u64::MAX);
+
+        register(&env, &owner, &registry_id);
+    }
+}
