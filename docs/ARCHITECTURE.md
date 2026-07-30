@@ -19,6 +19,13 @@ The registry owns the task lifecycle and stores:
 - task records; and
 - credited keeper balances.
 
+Every state transition publishes an event, and events are the query primitive
+for off-chain indexers and keeper bots. This document deliberately does not
+restate the topic and data shapes: the single canonical table lives in the
+[README events section](../README.md#events) and is transcribed from the `emit_*`
+functions in `contracts/keeper-registry/src/lib.rs`. Keep it there rather than
+duplicating it here, so the two cannot drift apart.
+
 ### Reward token
 
 The registry transfers the configured token when a task is registered, topped up, cancelled, expired, executed, or when a keeper withdraws rewards. The registry is therefore written against a token contract boundary and must preserve its safety properties even when token transfers are treated as external interactions.
