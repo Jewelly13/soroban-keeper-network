@@ -1612,7 +1612,7 @@ pub enum KeeperError {
     /// same claim.
     VerificationFailed = 19,
     /// Arithmetic operation would overflow or underflow.
-    ArithmeticOverflow = 19,
+    ArithmeticOverflow = 20,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1735,6 +1735,9 @@ pub fn emit_verifier_updated(e: &Env, task_id: u64, verifier: &Option<Address>) 
     e.events().publish(
         (symbol_short!("verifier"), symbol_short!("task")),
         (task_id, verifier.clone()),
+    );
+}
+
 pub fn emit_min_reward_updated(e: &Env, old_min: i128, new_min: i128) {
     e.events().publish(
         (symbol_short!("minrwd"), symbol_short!("admin")),
@@ -1913,7 +1916,7 @@ fn fee_bps(e: &Env) -> u32 {
 /// the separate `keeper-registry-fuzz` crate can call the exact same
 /// arithmetic the contract itself uses, rather than reimplementing the
 /// formula and risking the two drifting apart.
-pub fn split_reward(reward: i128, fee_bps: u32) -> (i128, i128) {
+pub fn split_reward(reward: i128, fee_bps: u32) -> Result<(i128, i128), KeeperError> {
     let fee = reward
         .checked_mul(fee_bps as i128)
         .ok_or(KeeperError::ArithmeticOverflow)?

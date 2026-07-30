@@ -246,3 +246,50 @@ Proposed. Per this issue's own acceptance criteria, 0072–0096 should wait
 for a maintainer to review and lock these decisions (or request changes)
 before building against them — this document is the basis for that
 review, not a substitute for it.
+
+## Implementation note (added while investigating #104/0079)
+
+The interface actually shipped (`contracts/keeper-registry/src/lib.rs`,
+via #97/#98/#99) diverges from two of this proposal's decisions above.
+Recorded here rather than silently edited into the proposal sections
+above, so the divergence itself is visible instead of erasing the
+original design record:
+
+- **§1, Interface shape**: the shipped `IKeeperVerifier::verify` takes
+  `task: Task` (the full struct), not `task_id: u64` as proposed here.
+  This has a real consequence: `Task` carries no `task_id` field (the
+  task's identifier is only the storage key it's stored under, never
+  passed to the verifier), so a verifier that wants to bind its check to
+  a specific task's *identity* can only do so via `Task`'s other fields
+  (`owner`, `calldata`, `deadline`, `reward`, ...) — not a guaranteed-
+  unique task identifier. Two distinct tasks that happen to share all of
+  those fields are indistinguishable to any verifier built against the
+  shipped interface. See `contracts/verifiers/signature-verifier/src/
+  lib.rs`'s module doc comment for a concrete verifier hitting this limit
+  in practice. Fixing it would mean adding `task_id: u64` as a parameter
+  to `IKeeperVerifier::verify` — a breaking change to an interface
+  reference verifiers already depend on, flagged here as a real, open
+  gap rather than fixed opportunistically by this doc update.
+- **§2, Failure semantics**: the shipped `execute_task` calls the
+  verifier via `IKeeperVerifierClient::new(&e, &verifier).verify(...)`,
+  which compiles to `Env::invoke_contract` (the *panicking* variant), not
+  `Env::try_invoke_contract` as this proposal specified. Concretely: a
+  verifier that panics is confirmed **not** isolated — it aborts the
+  entire `execute_task` transaction, exactly the failure mode this
+  proposal's §2 argued against and chose `try_invoke_contract` to avoid.
+  This is directly observable in the shipped code's own doc comments
+  (`IKeeperVerifier`'s "Cross-contract call semantics" section in
+  `lib.rs`) and exercised by
+  `test_execute_task_against_panicking_verifier_panics` in
+  `contracts/keeper-registry/src/test.rs`, which asserts the panic via
+  `#[should_panic]` specifically *because* it propagates. The recovery
+  path this proposal described as unnecessary (`expire_task` once the
+  deadline passes) is, in the shipped implementation, the *only*
+  recovery path for a task stuck behind a panicking verifier — matching
+  what §2's rejected alternative predicted, not what was decided.
+
+Both of these are genuine implementation-vs-proposal divergences, not
+errors in this document — they're recorded here as ground truth for
+anyone building against `IKeeperVerifier` today, since the interface
+that shipped is the one that matters, whatever this proposal originally
+decided.
