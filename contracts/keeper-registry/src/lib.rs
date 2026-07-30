@@ -414,14 +414,58 @@ pub fn emit_initialized(e: &Env, admin: &Address, reward_token: &Address, fee_bp
 // counter — every entry point reads it, so it must never be allowed to lapse
 // on an actively-used contract.
 
+// ── Tuning note (issue 0112) ─────────────────────────────────────────────────
+//
+// These two values were originally picked as round numbers from rough
+// ledger-time math. Issue 0112 asked for them to be re-derived against real
+// traffic. They were, and they are being kept unchanged. The full write-up is
+// in `docs/ARCHITECTURE.md` ("Instance TTL and traffic assumptions"); the
+// behaviour is pinned by `tests/instance_ttl_tuning.rs`. In short:
+//
+// * Ledger rate, measured: 5.009 s/ledger over 300,000 consecutive testnet
+//   ledgers (3,577,512 -> 3,877,512, 2026-07-13 to 2026-07-30). The
+//   `SECONDS_PER_LEDGER = 5` assumption these constants rest on is accurate to
+//   0.2%, and conservative in the safe direction. So 100,000 ledgers is 5.8
+//   days of lifetime and renewal opens with 2.9 days left.
+//
+// * Real call-frequency data: does not exist. The testnet deployment in
+//   DEPLOYMENTS.md recorded 4 events, all within 7 minutes of deployment, and
+//   nothing since. There is no traffic distribution to fit, so the values are
+//   justified against a stated assumption instead (see below).
+//
+// * Cost: renewal costs +3,298 CPU instructions and +1,664 memory bytes over
+//   the short-circuited no-op, against a 100M-instruction transaction budget.
+//   The threshold caps renewal at once per 50,000 ledgers of elapsed time no
+//   matter the call volume, so the amortized cost is negligible at any traffic
+//   level. Cost is simply not the binding constraint here, which is why moving
+//   the threshold in either direction buys nothing measurable.
+//
+// The assumption that does bind: a registry only needs to survive while it
+// holds escrow, and one that holds escrow cannot go silent. `expire_task` is
+// permissionless and mutating, and becomes callable the moment any task's
+// deadline passes — so a registry with anything at stake always has a call
+// available to renew it. A registry that archives is one with no open tasks,
+// where archival strands nothing and a RestoreFootprint brings it back with
+// its state intact.
+//
+// If real traffic data ever does appear and 5.8 days of idle tolerance proves
+// too short, the lever to reach for is `INSTANCE_BUMP_LEDGERS`, not the
+// threshold: rent is charged per ledger extended, so a larger window costs
+// proportionally more per renewal but renews proportionally less often, making
+// it roughly rent-neutral while strictly improving idle tolerance. Both values
+// sit far below the network's `max_entry_ttl`, and persistent entries clamp
+// rather than fail at that ceiling, so there is headroom to do it.
+
 /// Ledgers of instance-storage lifetime requested on each state-mutating
-/// call. At ~5s per ledger this is roughly 6 days; renewing it on every
-/// mutation means a contract that sees regular traffic never approaches
-/// archival.
+/// call. At the measured 5.009s per ledger this is 5.8 days; renewing it on
+/// every mutation means a contract that sees regular traffic never approaches
+/// archival. See the tuning note above before changing this.
 const INSTANCE_BUMP_LEDGERS: u32 = 100_000;
 /// Renew instance TTL only once fewer than this many ledgers remain, so the
 /// extension is a no-op on most calls and only costs resources when the
-/// entry is genuinely approaching expiry.
+/// entry is genuinely approaching expiry. At 50% of [`INSTANCE_BUMP_LEDGERS`]
+/// this leaves a 2.9-day band in which any single mutating call rescues the
+/// entry. See the tuning note above before changing this.
 const INSTANCE_BUMP_THRESHOLD: u32 = 50_000;
 
 /// Ledgers of persistent-storage lifetime requested for a keeper's reward
