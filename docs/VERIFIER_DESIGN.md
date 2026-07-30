@@ -293,3 +293,104 @@ errors in this document — they're recorded here as ground truth for
 anyone building against `IKeeperVerifier` today, since the interface
 that shipped is the one that matters, whatever this proposal originally
 decided.
+
+## Feasibility study: composing multiple verifiers (AND/OR)
+
+**Issue:** #194 (backlog 0125).  
+**Question:** Should the registry support multiple verifier addresses per
+task (AND/OR composition), or stay single-verifier and leave composition
+to the ecosystem?
+
+### Options considered
+
+#### A. First-class multi-verifier on the registry
+
+Extend `Task` with `verifiers: Vec<Address>` (or a small fixed array) plus
+a composition operator (`And` / `Or`). `execute_task` would invoke each
+address and combine the bools.
+
+Costs:
+
+- Storage and ABI growth on every task, including the common single-verifier
+  and no-verifier cases.
+- New validation (empty list? max length? operator required when `len > 1`?).
+- Proof encoding becomes ambiguous: one shared `proof` blob for N verifiers,
+  or N proofs? Either choice couples the registry ABI to composition.
+- Failure semantics multiply: which verifier failed? Does one panic abort the
+  batch of checks? Partial short-circuit for `Or`?
+- Resource budgeting (already "whole transaction only," per §3) becomes
+  harder to reason about once the registry itself nests an unbounded number
+  of external calls. Nested composite contracts have the same problem, but
+  the cost is then opt-in at the edge rather than paid by every registry
+  reader and the core execution path.
+
+Benefits: slightly nicer UX for owners who want AND/OR without deploying
+extra contracts.
+
+#### B. Single verifier + ecosystem composite contracts (recommended)
+
+Keep `Task.verifier: Option<Address>` exactly as shipped. A dApp that needs
+"oracle attestation AND signature" deploys a thin composite contract that
+implements `IKeeperVerifier`, holds the child verifier addresses (and any
+AND/OR policy) in its own storage, and in `verify` calls each child and
+combines the results. The registry never learns about composition.
+
+Benefits:
+
+- Matches the permissionless design elsewhere: complexity stays at the edge;
+  the registry stays a small coordination layer (`docs/ARCHITECTURE.md`).
+- No registry ABI / storage migration; existing tasks and bots unchanged.
+- Proof layout is defined by the composite author (e.g. concatenated
+  length-prefixed child proofs, or a single shared proof both children
+  understand) without forcing one scheme on the registry.
+- AND, OR, M-of-N, ordered short-circuit, and weighted policies are all
+  expressible without further registry issues.
+- Gas nesting is a property of the contracts the owner chose to attach —
+  the same trust decision they already make when picking any verifier.
+
+Costs: the owner (or ecosystem) must deploy a composite contract. That is
+the same class of cost as deploying any custom verifier, and is appropriate
+for the minority of tasks that need multi-check policies.
+
+### Gas-budgeting concern
+
+Issue 0076 / §3 concluded there is no in-contract sub-budget for a verifier
+call. Nested composites can make a single `execute_task` arbitrarily
+expensive. That is already true of any malicious or heavy single verifier;
+registry-level multi-verifier does not fix it and would still rely on the
+keeper simulating the transaction first. Composition at the edge does not
+make this worse in a way first-class multi-verifier would uniquely solve.
+
+### Recommendation
+
+**Keep the registry single-verifier-per-task. Composition is an
+ecosystem-level pattern, not a registry feature.**
+
+Do not file a first-class multi-verifier design/implementation issue unless
+a concrete product requirement appears that cannot be met by a composite
+contract (none identified in this study).
+
+### Follow-up: worked example composite verifier
+
+Add a fourth reference implementation under `contracts/verifiers/` (scope
+alongside 0077–0079's reference set), for example
+`contracts/verifiers/composite-verifier/`:
+
+- `initialize(left: Address, right: Address, mode: And | Or)`
+- `interface_version` / `verify` implementing `IKeeperVerifier`
+- `verify` calls `IKeeperVerifierClient` on `left` then `right` (short-circuit
+  on `And` failure / `Or` success), forwarding the same `(task, keeper, proof)`
+  or a documented split of `proof`
+- Tests: both approve; left rejects under And; either approves under Or;
+  end-to-end `execute_task` against the composite
+
+That example documents the pattern without growing registry surface area.
+Until it lands, the sketch above is sufficient guidance for dApp authors.
+
+### Decision table addendum
+
+| Question | Decision |
+|---|---|
+| Multi-verifier on one task | **Declined at registry layer** — use a composite `IKeeperVerifier` |
+| AND/OR operators in registry | **Declined** — encode in the composite contract |
+| Worked composite example | **Follow-up** reference crate (not blocking this decision) |
