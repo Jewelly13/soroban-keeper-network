@@ -243,6 +243,136 @@ interleavings of single and batch registration, and adds a batch-specific
 property: after any rejected batch — invalid entry, ceiling exceeded, or
 oversized — the owner's balance and the registry's escrow are both provably
 unchanged.
+## Instance TTL and traffic assumptions
+
+Instance storage holds the admin, reward token, pause flag, fee, and task
+counter. Every entry point reads it, so it must not lapse on a contract that is
+still in use. `bump_instance` renews it from every state-mutating call using
+`extend_ttl(INSTANCE_BUMP_THRESHOLD, INSTANCE_BUMP_LEDGERS)`.
+
+Issue 0112 asked for those two constants — originally round numbers from rough
+ledger-time math — to be re-derived against real traffic. They were, and they
+are unchanged. The behaviour is pinned by
+`contracts/keeper-registry/tests/instance_ttl_tuning.rs`:
+
+```
+cargo test -p keeper-registry --test instance_ttl_tuning -- --nocapture
+```
+
+### Ledger rate: measured, not assumed
+
+Sampling 300,000 consecutive testnet ledgers (3,577,512 → 3,877,512,
+2026-07-13 to 2026-07-30) gives **5.009 s/ledger**, against the
+`SECONDS_PER_LEDGER = 5` the constants assume — accurate to 0.2%, and
+conservative in the safe direction. So:
+
+| Constant                  | Ledgers | Wall-clock at measured rate |
+|---------------------------|---------|-----------------------------|
+| `INSTANCE_BUMP_LEDGERS`   | 100,000 | 5.80 days of lifetime       |
+| `INSTANCE_BUMP_THRESHOLD` | 50,000  | renewal opens at 2.90 days left |
+
+### Real traffic data: none exists
+
+The testnet deployment recorded in [DEPLOYMENTS.md](../DEPLOYMENTS.md) was
+created 2026-07-14 and has 4 events, all within 7 minutes of deployment, and
+nothing since. There is no call-frequency distribution to fit. The constants are
+therefore justified against an explicit assumption rather than observed
+frequency, and that assumption is stated below so it can be challenged when data
+does exist.
+
+### Cost is not the binding constraint
+
+Measured on `set_fee_bps`, the cheapest mutating entry point:
+
+| State                             | CPU    | Memory       |
+|-----------------------------------|--------|--------------|
+| Renewal short-circuited (safe band) | 82,446 | 13,588 bytes |
+| Renewal performed (danger band)     | 85,744 | 15,252 bytes |
+| **Delta**                           | +3,298 | +1,664 bytes |
+
+The threshold caps renewal at once per 50,000 ledgers of *elapsed time*
+regardless of call volume, so the amortized cost is negligible at any traffic
+level — ~0.003% of a 100M-instruction transaction budget, collected at most once
+every 2.9 days. Moving the threshold in either direction buys nothing
+measurable, which is why it was left alone.
+
+### The assumption that does bind
+
+A registry only needs to survive while it holds escrow, and **a registry holding
+escrow cannot go silent**. `expire_task` is permissionless and mutating, and
+becomes callable the moment any task's deadline passes — so a registry with
+anything at stake always has a call available to renew it, whether from the
+owner recovering funds or a keeper bot doing it as a courtesy while scanning.
+
+The registry that *can* archive is one with no open tasks. That case strands
+nothing: instance state is not lost, only made inaccessible until a
+RestoreFootprint brings it back with its values intact. This is the same
+tradeoff `bump_instance` documents for declining to renew on read-only views,
+which are simulated by clients for free and must stay side-effect-free.
+
+### If this needs revisiting
+
+Should real traffic data appear and 5.8 days of idle tolerance prove too short,
+the lever is `INSTANCE_BUMP_LEDGERS`, not the threshold. Rent is charged per
+ledger extended, so a larger window costs proportionally more per renewal but
+renews proportionally less often — roughly rent-neutral, while strictly
+improving idle tolerance. Both values sit far below the network's
+`max_entry_ttl`, and persistent entries clamp rather than fail at that ceiling,
+so there is headroom.
+### `save_task` TTL-extension cost
+
+`save_task` calls `extend_ttl` unconditionally, including on writes that leave
+`ttl_ledgers` untouched (`claim_task`, `execute_task`, `increase_reward`).
+Issue 0111 asked whether that unconditional call is paying an avoidable cost
+and whether a read-and-compare guard should be added. It was measured, and the
+answer is no on three independent grounds. The measurements live in
+`contracts/keeper-registry/tests/ttl_extension_cost.rs` and are reproducible
+with:
+
+```
+cargo test -p keeper-registry --test ttl_extension_cost -- --nocapture
+```
+
+**1. The guard is not implementable.** Reading an entry's current TTL is the
+load-bearing half of "read and compare", and contract code cannot do it.
+`Storage::get_ttl` exists only on the `soroban_sdk::testutils::storage` traits,
+compiled under `testutils` and absent from the contract-facing API. The
+underlying host function is likewise absent from the WASM host interface in
+`soroban-env-common`'s `env.json`; the only TTL reader exposed to contracts is
+`get_max_live_until_ledger`, which returns the network-wide maximum rather than
+this entry's remaining lifetime.
+
+**2. The host already short-circuits.** `Storage::extend_ttl` in
+`soroban-env-host` guards its storage-map insert behind
+`new_live_until > old_live_until && old_live_until - ledger_seq <= threshold`,
+so a redundant extension skips the expensive half host-side. Measured on
+soroban-sdk 22, against a 25,826-instruction baseline persistent write:
+
+| Call                                      | CPU delta | Memory delta |
+|-------------------------------------------|-----------|--------------|
+| `extend_ttl`, redundant (short-circuited)  | +2,437    | +376 bytes   |
+| `extend_ttl`, effective (insert performed) | +3,642    | +664 bytes   |
+
+The redundant call costs ~2.4k instructions — roughly 0.002% of Soroban's
+100M-instruction transaction budget. That figure is also the ceiling on what
+any guard could save, since a guard can at best elide the call entirely.
+
+**3. The redundant case barely arises.** The premise that a write leaving
+`ttl_ledgers` unchanged performs a redundant extension conflates two different
+things. `save_task` passes `extend_to = task.ttl_ledgers`, a TTL measured
+*from the current ledger*, not an absolute expiry — so an unchanged
+`ttl_ledgers` still means a genuinely later `live_until_ledger` whenever any
+ledger has closed since the previous write. An extension is redundant only for
+two writes landing in the *same* ledger, and a task's lifecycle calls are
+necessarily separate transactions. On the common path the extension is doing
+real work, which is exactly what the TTL/deadline invariant above depends on.
+
+No code change was made. `every_lifecycle_write_restores_the_full_ttl_window`
+is the regression test guarding conclusion 3: it walks a task through
+registration, top-up, deadline extension, claim, and execution with ledgers
+closing in between, and asserts the entry's TTL is restored to the full window
+after each write. A future guard that skipped extension too eagerly would fail
+it rather than silently reintroducing the early-archival risk.
 
 ## Review checklist
 
