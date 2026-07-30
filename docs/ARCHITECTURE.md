@@ -208,6 +208,82 @@ the entry's TTL on every mutation (claim, execute, top-up, deadline change),
 so an active task's storage lifetime keeps moving forward rather than only
 being set once at registration.
 
+## Instance TTL and traffic assumptions
+
+Instance storage holds the admin, reward token, pause flag, fee, and task
+counter. Every entry point reads it, so it must not lapse on a contract that is
+still in use. `bump_instance` renews it from every state-mutating call using
+`extend_ttl(INSTANCE_BUMP_THRESHOLD, INSTANCE_BUMP_LEDGERS)`.
+
+Issue 0112 asked for those two constants — originally round numbers from rough
+ledger-time math — to be re-derived against real traffic. They were, and they
+are unchanged. The behaviour is pinned by
+`contracts/keeper-registry/tests/instance_ttl_tuning.rs`:
+
+```
+cargo test -p keeper-registry --test instance_ttl_tuning -- --nocapture
+```
+
+### Ledger rate: measured, not assumed
+
+Sampling 300,000 consecutive testnet ledgers (3,577,512 → 3,877,512,
+2026-07-13 to 2026-07-30) gives **5.009 s/ledger**, against the
+`SECONDS_PER_LEDGER = 5` the constants assume — accurate to 0.2%, and
+conservative in the safe direction. So:
+
+| Constant                  | Ledgers | Wall-clock at measured rate |
+|---------------------------|---------|-----------------------------|
+| `INSTANCE_BUMP_LEDGERS`   | 100,000 | 5.80 days of lifetime       |
+| `INSTANCE_BUMP_THRESHOLD` | 50,000  | renewal opens at 2.90 days left |
+
+### Real traffic data: none exists
+
+The testnet deployment recorded in [DEPLOYMENTS.md](../DEPLOYMENTS.md) was
+created 2026-07-14 and has 4 events, all within 7 minutes of deployment, and
+nothing since. There is no call-frequency distribution to fit. The constants are
+therefore justified against an explicit assumption rather than observed
+frequency, and that assumption is stated below so it can be challenged when data
+does exist.
+
+### Cost is not the binding constraint
+
+Measured on `set_fee_bps`, the cheapest mutating entry point:
+
+| State                             | CPU    | Memory       |
+|-----------------------------------|--------|--------------|
+| Renewal short-circuited (safe band) | 82,446 | 13,588 bytes |
+| Renewal performed (danger band)     | 85,744 | 15,252 bytes |
+| **Delta**                           | +3,298 | +1,664 bytes |
+
+The threshold caps renewal at once per 50,000 ledgers of *elapsed time*
+regardless of call volume, so the amortized cost is negligible at any traffic
+level — ~0.003% of a 100M-instruction transaction budget, collected at most once
+every 2.9 days. Moving the threshold in either direction buys nothing
+measurable, which is why it was left alone.
+
+### The assumption that does bind
+
+A registry only needs to survive while it holds escrow, and **a registry holding
+escrow cannot go silent**. `expire_task` is permissionless and mutating, and
+becomes callable the moment any task's deadline passes — so a registry with
+anything at stake always has a call available to renew it, whether from the
+owner recovering funds or a keeper bot doing it as a courtesy while scanning.
+
+The registry that *can* archive is one with no open tasks. That case strands
+nothing: instance state is not lost, only made inaccessible until a
+RestoreFootprint brings it back with its values intact. This is the same
+tradeoff `bump_instance` documents for declining to renew on read-only views,
+which are simulated by clients for free and must stay side-effect-free.
+
+### If this needs revisiting
+
+Should real traffic data appear and 5.8 days of idle tolerance prove too short,
+the lever is `INSTANCE_BUMP_LEDGERS`, not the threshold. Rent is charged per
+ledger extended, so a larger window costs proportionally more per renewal but
+renews proportionally less often — roughly rent-neutral, while strictly
+improving idle tolerance. Both values sit far below the network's
+`max_entry_ttl`, and persistent entries clamp rather than fail at that ceiling,
+so there is headroom.
 ### `save_task` TTL-extension cost
 
 `save_task` calls `extend_ttl` unconditionally, including on writes that leave
