@@ -20,6 +20,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which would make the mapping from result back to requested id unrecoverable.
 - No storage iteration is introduced: every read is still O(1) by key against
   `DataKey::Task(id)`, and the caller supplies the bounded key set.
+- `get_tasks_range` rejects a window whose last id would exceed `u64::MAX` with
+  `ArithmeticOverflow` rather than wrapping around to low-numbered tasks. A
+  window ending exactly on `u64::MAX` is still accepted.
+- `Task` now derives `PartialEq`/`Eq`, matching `TaskType` and `TaskStatus`, so
+  batched results can be compared. Additive only — no XDR or behaviour change.
+- `VERSION` is deliberately unchanged: these are purely additive read-only
+  views and no existing function's behaviour is affected.
 
 ### Documented — protocol fee rounding guarantee (#26)
 
