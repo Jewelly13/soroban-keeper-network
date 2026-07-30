@@ -298,18 +298,18 @@ pub enum KeeperError {
 /// this gives the claiming keeper no realistic chance to build and submit its
 /// `execute_task` transaction before another keeper can reclaim the task out
 /// from under it.
-const MIN_LOCK_LEDGERS: u32 = 12; // ~1 minute
+pub const MIN_LOCK_LEDGERS: u32 = 12; // ~1 minute
 
 /// A lock window longer than this lets a single unresponsive keeper hold a
 /// task hostage for the better part of a day, with no possibility of
 /// takeover until `expire_task` becomes callable at the deadline.
-const MAX_LOCK_LEDGERS: u32 = 17_280; // ~1 day
+pub const MAX_LOCK_LEDGERS: u32 = 17_280; // ~1 day
 
 /// Persistent storage entries need enough runway to survive from
 /// registration through claim and execution without lapsing mid-flight.
 /// Below this, the TTL extension is not worth writing and risks the entry
 /// (and its escrowed reward) becoming inaccessible before a keeper can act.
-const MIN_TTL_LEDGERS: u32 = 1_000; // ~83 minutes
+pub const MIN_TTL_LEDGERS: u32 = 1_000; // ~83 minutes
 
 /// Hard cap on entries in a single [`KeeperRegistry::batch_register_tasks`]
 /// call, rejected with [`KeeperError::BatchTooLarge`].

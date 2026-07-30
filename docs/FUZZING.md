@@ -51,14 +51,39 @@ run the real, longer sessions (see "CI vs. local expectations" below).
 | Target | Status |
 |---|---|
 | `execute_task` | Compiles and runs cleanly. Exercises `execute_task`'s proof handling and, via the shared `invariants` module, I-1 (solvency, restricted to the executed task) and I-4 (fee bounding). |
-| `register_task` | **Currently does not compile** (pre-existing, not introduced by this change) — its `try_register_task` result-nesting doesn't match this `soroban-sdk` version's generated client, and it uses a `usize`/`u32` comparison that doesn't type-check. Needs a fix pass before it can be run; left as-is here since fixing the *content* of a different target is outside this document's scope. |
-| `smoke` | **Currently does not compile** (pre-existing) — calls `client.get_admin()` / `client.get_reward_token()`, which don't exist on the generated client (the real accessors are `admin()` / `reward_token_address()`, both returning `Option<Address>`), and `Env::address_is_contract`, which doesn't exist in this SDK version's `testutils` at all. |
+| `register_task` | Compiles and runs. Its `try_register_task` result-nesting and `usize`/`u32` comparisons were brought back in line with this `soroban-sdk` version's generated client, and the call updated for `register_task`'s `verifier` argument. |
+| `smoke` | Compiles and runs. `get_admin()`/`get_reward_token()` were replaced with the real accessors `admin()`/`reward_token_address()`, and the `Env::address_is_contract` assertions (no such method in this SDK) with direct equality against the harness's configured addresses. |
+| `batch_register_tasks` | Compiles and runs. Fuzzes batch shape (0 entries up to `MAX_BATCH_ENTRIES * 2`) and the per-entry parameter mix, asserting the contract never traps, every rejection is a typed `KeeperError` and the *correct* one, and that all-or-nothing holds — no token movement on any rejection. Seeded corpus under `fuzz/corpus/batch_register_tasks/`. |
 
-If you're picking up `register_task` or `smoke` as a fix: `cargo check
---features arbitrary,libfuzzer-sys --bin <name>` from `fuzz/` (with `RUSTFLAGS="--cfg
-fuzzing"` set, since `cfg(fuzzing)`-gated items like `keeper_registry::invariants`
-are otherwise configured out) reproduces the compile errors without needing
-nightly or an actual fuzzing run.
+To type-check a target without nightly or an actual fuzzing run:
+
+```bash
+cd fuzz
+RUSTFLAGS="--cfg fuzzing" cargo check --bins --features arbitrary,libfuzzer
+```
+
+`RUSTFLAGS="--cfg fuzzing"` is needed because `cfg(fuzzing)`-gated items like
+`keeper_registry::invariants` are otherwise configured out. The `libfuzzer`
+feature exists because `libfuzzer-sys` is declared as an optional dependency
+that no feature previously enabled, so targets could not resolve it at all
+under a plain `cargo check`. Every `[[bin]]` declares
+`required-features = ["libfuzzer"]`, so omitting the feature skips the fuzz
+targets entirely — which is what lets `cargo test -p keeper-registry-fuzz`
+run on platforms whose toolchain cannot link a libFuzzer runtime (MSVC
+stable, for one).
+
+### Verifying a target without libFuzzer
+
+`fuzz_target!` itself can only be exercised by `cargo +nightly fuzz run`. To
+keep targets verifiable everywhere, put the body in the fuzz *library* and
+leave the target as a thin wrapper — `batch_register_tasks` does this, with
+its logic in `keeper_registry_fuzz::batch`. `fuzz/tests/corpus_seeds.rs` then
+drives every committed seed through that same logic under an ordinary
+`cargo test`, so a broken assertion surfaces without a fuzzing run:
+
+```bash
+cargo test -p keeper-registry-fuzz --test corpus_seeds --features arbitrary
+```
 
 ## Adding a new fuzz target
 
