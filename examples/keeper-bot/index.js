@@ -44,7 +44,6 @@
 require("dotenv").config();
 
 const {
-  Address,
   Keypair,
   SorobanRpc,
   TransactionBuilder,
@@ -53,7 +52,6 @@ const {
   nativeToScVal,
   scValToNative,
   Contract,
-  StrKey,
 } = require("@stellar/stellar-sdk");
 
 const NETWORK_CONFIG = {
@@ -129,6 +127,7 @@ function profitMultipleScale(value) {
 }
 
 async function validateAndLoadConfig() {
+  const { StrKey } = require("@stellar/stellar-sdk"); // Moved inside to be used only here
   const network = requireEnv("NETWORK", {
     validate: { fn: (v) => Object.keys(NETWORK_CONFIG).includes(v), reason: `must be one of: ${Object.keys(NETWORK_CONFIG).join(", ")}` },
     fallback: "testnet",
@@ -341,10 +340,11 @@ async function fetchPendingTasks(server, contractId, startLedger) {
 
     for (const event of response.events || []) {
       try {
+        // TaskRegistered data is (task_id, owner, reward, deadline); the owner is not needed here.
         const [taskIdVal, , rewardVal, deadlineVal] = event.value.value();
         tasks.push({ taskId: scValToNative(taskIdVal), reward: scValToNative(rewardVal), deadline: scValToNative(deadlineVal) });
-      } catch (_) {
-        // Ignore malformed events and continue with the remaining events.
+      } catch (err) {
+        console.warn(`⚠️  Could not decode a TaskRegistered event: ${err.message} — the contract's event shape may have changed.`);
       }
 
       pages++;
