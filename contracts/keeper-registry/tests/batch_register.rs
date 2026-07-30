@@ -302,6 +302,57 @@ fn batch_rejects_each_invalid_entry_exactly_as_register_task_does() {
     assert_eq!(s.owner_balance(), OWNER_FUNDING);
 }
 
+/// Extracting `register_task`'s validation into shared helpers must not have
+/// reordered which error wins when several conditions fail at once.
+///
+/// The TTL-covers-deadline rule is deliberately kept *after* the `RewardToken`
+/// lookup rather than folded into `validate_task_params`, precisely so this
+/// ordering is preserved. These two cases are what would break if a future
+/// tidy-up merged them.
+#[test]
+fn register_task_error_ordering_is_unchanged_by_the_shared_helpers() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let registry_id = env.register(KeeperRegistry, ());
+    let registry = KeeperRegistryClient::new(&env, &registry_id);
+    let now = env.ledger().timestamp();
+
+    // Uninitialized registry plus a TTL that does not cover the deadline:
+    // NotInitialized wins, because the RewardToken lookup runs first.
+    let err = registry
+        .try_register_task(
+            &owner,
+            &TaskType::Liquidation,
+            &Bytes::new(&env),
+            &1_000i128,
+            &(now + 3_600),
+            &1_500u32,
+            &120u32,
+            &None,
+        )
+        .expect_err("uninitialized registry must reject")
+        .expect("typed error");
+    assert_eq!(err, KeeperError::NotInitialized);
+
+    // Uninitialized registry plus an invalid reward: InvalidReward wins,
+    // because parameter-shape validation runs before the lookup.
+    let err = registry
+        .try_register_task(
+            &owner,
+            &TaskType::Liquidation,
+            &Bytes::new(&env),
+            &0i128,
+            &(now + 3_600),
+            &20_000u32,
+            &120u32,
+            &None,
+        )
+        .expect_err("invalid reward must reject")
+        .expect("typed error");
+    assert_eq!(err, KeeperError::InvalidReward);
+}
+
 /// `set_min_reward` is enforced per entry, through the same shared helper.
 #[test]
 fn batch_honours_min_reward() {
