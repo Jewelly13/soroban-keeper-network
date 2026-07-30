@@ -319,18 +319,53 @@ pub enum KeeperError {
 /// this gives the claiming keeper no realistic chance to build and submit its
 /// `execute_task` transaction before another keeper can reclaim the task out
 /// from under it.
-const MIN_LOCK_LEDGERS: u32 = 12; // ~1 minute
+pub const MIN_LOCK_LEDGERS: u32 = 12; // ~1 minute
 
 /// A lock window longer than this lets a single unresponsive keeper hold a
 /// task hostage for the better part of a day, with no possibility of
 /// takeover until `expire_task` becomes callable at the deadline.
-const MAX_LOCK_LEDGERS: u32 = 17_280; // ~1 day
+pub const MAX_LOCK_LEDGERS: u32 = 17_280; // ~1 day
 
 /// Persistent storage entries need enough runway to survive from
 /// registration through claim and execution without lapsing mid-flight.
 /// Below this, the TTL extension is not worth writing and risks the entry
 /// (and its escrowed reward) becoming inaccessible before a keeper can act.
-const MIN_TTL_LEDGERS: u32 = 1_000; // ~83 minutes
+pub const MIN_TTL_LEDGERS: u32 = 1_000; // ~83 minutes
+
+/// Hard cap on entries in a single [`KeeperRegistry::batch_register_tasks`]
+/// call, rejected with [`KeeperError::BatchTooLarge`].
+///
+/// This is a *typed-error* guard rail, not the resource ceiling itself.
+/// Without it, an oversized batch fails by exhausting a transaction resource
+/// limit, which surfaces as an untyped host trap the caller cannot distinguish
+/// from a node problem. With it, a caller that overshoots gets an error it can
+/// act on.
+///
+/// ## Why 32
+///
+/// **CPU is not the binding constraint.** `batch_ceiling_is_within_budget` in
+/// `tests/batch_register.rs` measures a full 32-entry batch at ~6.5M CPU
+/// instructions — 6.5% of Soroban's 100M-instruction transaction budget — with
+/// per-entry cost scaling linearly at ~202k instructions. On CPU alone this
+/// could be several hundred entries.
+///
+/// **The footprint is.** Every entry writes one persistent `Task` ledger entry,
+/// and Soroban caps write entries per transaction via the
+/// `txMaxWriteLedgerEntries` network setting. That is a live network config
+/// value, not a compile-time constant, and the local test host does not enforce
+/// it — so it cannot be measured by the tests here and must be respected by
+/// construction instead. 32 leaves room for the batch's own writes plus the
+/// instance entry and the reward token's entries beneath a limit of that
+/// magnitude.
+///
+/// The remaining CPU headroom is not waste: production executes interpreted
+/// WASM, which costs materially more than the natively-compiled contract the
+/// test host measures, so the real-network figure is higher than 6.5%.
+///
+/// A future change that makes per-task registration more expensive shrinks that
+/// headroom and trips `batch_ceiling_is_within_budget`, rather than silently
+/// turning previously-valid batches into resource failures in production.
+pub const MAX_BATCH_ENTRIES: u32 = 32;
 
 /// Hard cap on entries in a single [`KeeperRegistry::batch_register_tasks`]
 /// call, rejected with [`KeeperError::BatchTooLarge`].

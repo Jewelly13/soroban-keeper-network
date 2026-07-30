@@ -27,6 +27,11 @@ cargo-fuzz = true
 # behavior was removed to make "which deps does this feature turn on"
 # unambiguous) — omitting `dep:` is what made this manifest fail to parse.
 arbitrary = ["dep:arbitrary"]
+# `libfuzzer-sys` was declared as an optional dependency but no feature ever
+# enabled it, so every fuzz target failed to resolve `libfuzzer_sys` under a
+# plain `cargo check`/`cargo test`. `cargo fuzz` enables this itself; the
+# feature exists so the targets can also be type-checked without it.
+libfuzzer = ["dep:libfuzzer-sys"]
 
 [dependencies]
 keeper-registry = { path = "../contracts/keeper-registry" }
@@ -60,6 +65,7 @@ path = "fuzz_targets/register_task.rs"
 test = false
 doc = false
 bench = false
+required-features = ["libfuzzer"]
 
 [[bin]]
 name = "smoke"
@@ -67,6 +73,7 @@ path = "fuzz_targets/smoke.rs"
 test = false
 doc = false
 bench = false
+required-features = ["libfuzzer"]
 
 [[bin]]
 name = "execute_task"
@@ -74,6 +81,15 @@ path = "fuzz_targets/execute_task.rs"
 test = false
 doc = false
 bench = false
+required-features = ["libfuzzer"]
+
+[[bin]]
+name = "batch_register_tasks"
+path = "fuzz_targets/batch_register_tasks.rs"
+test = false
+doc = false
+bench = false
+required-features = ["libfuzzer"]
 
 [[bin]]
 name = "register_task_calldata_bound"
