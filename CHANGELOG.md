@@ -6,6 +6,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — bounded batch task reads (#25)
+
+- New read-only views `get_tasks(ids)` and `get_tasks_range(from, count)` let
+  an indexer or keeper bot inspect many tasks in one call instead of one RPC
+  round trip per task. Both are bounded by `MAX_BATCH_READ` (50) and return
+  the new `BatchTooLarge` error when exceeded, rather than silently truncating
+  a page — a clipped result is indistinguishable from the end of a range.
+- The result is positionally aligned with the request: entry `i` is
+  `Some(task)` if the id at position `i` exists and `None` if it does not, so
+  one missing id does not fail the whole call. `Vec<Option<Task>>` is used
+  rather than a compacted `Vec<Task>` because `Task` carries no `task_id`,
+  which would make the mapping from result back to requested id unrecoverable.
+- No storage iteration is introduced: every read is still O(1) by key against
+  `DataKey::Task(id)`, and the caller supplies the bounded key set.
+
+### Documented — protocol fee rounding guarantee (#26)
+
+- `split_reward`'s rounding direction is now a stated guarantee rather than an
+  undocumented artifact of integer division: the fee is
+  `floor(reward * fee_bps / 10_000)` and the keeper receives the remainder, so
+  the protocol can never collect more than the nominal rate and the error is
+  bounded by one stroop per execution, always in the keeper's favour.
+- The `min_reward` / `fee_bps` dust threshold is documented in the README
+  tokenomics section: the fee is non-zero only once
+  `min_reward >= ceil(10_000 / fee_bps)`. Below that the protocol earns
+  nothing on a task while still bearing its storage cost — a relationship
+  between two parameters that were previously set independently.
+- Boundary tests pin the behaviour at `reward = 1`, the first reward yielding a
+  non-zero fee, `fee_bps = 0`, and `fee_bps = 10_000`. No behaviour change.
+
 ### Added — optional on-chain proof verifier (VERSION bumped to 3)
 
 - `register_task` now takes a required eighth parameter,
