@@ -290,6 +290,33 @@ A **shared, permissionless, on-chain coordination layer** where:
 - `transfer_admin` MUST require auth from BOTH current admin AND new admin.
 - `upgrade` MUST use `deployer().update_current_contract_wasm`.
 
+#### FR-8: Batch Task Reads
+- `get_tasks(ids: Vec<u64>) -> Vec<Option<Task>>` MUST read every requested id
+  in a single call, so an indexer or keeper bot does not need one RPC round
+  trip per task.
+- `get_tasks_range(from: u64, count: u32) -> Vec<Option<Task>>` MUST read the
+  contiguous ids `from … from + count - 1`. It is the convenience form for the
+  common "scan recent tasks" case, so a caller walking backwards from
+  `task_count` need not build a `Vec<u64>`.
+- Both MUST accept at most `MAX_BATCH_READ` (50) ids. The bound exists because
+  each id costs exactly one Persistent storage read charged against the
+  transaction's read-entry and read-bytes limits; at `MAX_CALLDATA_LEN` (1 KiB)
+  per task, 50 reads stay comfortably inside a single simulation.
+- Exceeding the bound MUST return `BatchTooLarge` rather than truncating — a
+  silently clipped page is indistinguishable from the genuine end of a range.
+- A range whose last id would exceed `u64::MAX` MUST return
+  `ArithmeticOverflow` rather than wrapping around to low ids.
+- **Missing ids** MUST be returned as `None` in place, not omitted: the result
+  is *positionally aligned* with the request (`out.len() == ids.len()`, and
+  `out[i]` corresponds to `ids[i]`). A single absent id MUST NOT fail the whole
+  call. `Vec<Option<Task>>` is used rather than a compacted `Vec<Task>` because
+  `Task` carries no `task_id` field — omitting missing ids would make the
+  mapping from result back to requested id unrecoverable. `None` is a void XDR
+  variant, so the alignment costs almost nothing on the wire.
+- `count == 0` and an empty `ids` MUST return an empty vector, not an error.
+- Duplicate ids are permitted and each is resolved independently.
+- Both are read-only views and are therefore never gated by `pause`.
+
 ---
 
 ### Non-Functional Requirements
@@ -305,6 +332,11 @@ A **shared, permissionless, on-chain coordination layer** where:
 - Instance storage for hot/shared data (admin, counter, flags).
 - Persistent storage for per-task data with explicit TTL management.
 - No unbounded iteration — no `Vec<task_id>` scanned in O(n); queries are by key.
+  This is a constraint on *storage*: the contract keeps no growing list that any
+  operation has to walk. It does not forbid a read-only view over a bounded,
+  caller-supplied set of keys — `get_tasks` / `get_tasks_range` (FR-8) are still
+  O(1) per key against `DataKey::Task(id)`, the caller supplies the keys, and
+  the count is capped by the `MAX_BATCH_READ` constant.
 - Events are the query primitive for off-chain indexers.
 
 ## What it does
