@@ -519,6 +519,28 @@ fn load_task(e: &Env, task_id: u64) -> Result<Task, KeeperError> {
         .ok_or(KeeperError::TaskNotFound)
 }
 
+/// Writes a task and renews its storage lifetime.
+///
+/// The `extend_ttl` below is deliberately unconditional. Issue 0111 asked
+/// whether it should be guarded by a read-and-compare on the entry's current
+/// TTL; that was measured and rejected on three grounds (see
+/// `docs/ARCHITECTURE.md`, "save_task TTL-extension cost", and the
+/// measurements in `tests/ttl_extension_cost.rs`):
+///
+/// 1. The guard cannot be written. Contract code has no way to read an entry's
+///    current TTL — `Storage::get_ttl` is `testutils`-only, and the host
+///    interface exposes no equivalent to on-chain code.
+/// 2. The host already short-circuits a redundant extension before its
+///    expensive storage-map insert, leaving ~2.4k CPU instructions against a
+///    100M-instruction transaction budget.
+/// 3. The redundant case is rare anyway. `extend_to` is a TTL relative to the
+///    *current* ledger, so an unchanged `ttl_ledgers` still buys a genuinely
+///    later expiry on every write that lands in a new ledger — which is every
+///    lifecycle call in practice.
+///
+/// Please do not add a guard here without re-deriving those numbers: the
+/// invariant this call upholds (a task's storage always outlives its escrow)
+/// is worth far more than the instructions a guard could save.
 fn save_task(e: &Env, task_id: u64, task: &Task) {
     e.storage().persistent().set(&DataKey::Task(task_id), task);
     e.storage().persistent().extend_ttl(
