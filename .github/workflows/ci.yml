@@ -5,8 +5,8 @@ name: CI
 #
 # Job policy (see docs/CI.md for the rationale):
 #   REQUIRED  — format, test, build-wasm. These block the merge.
-#   ADVISORY  — clippy, audit, coverage, wasm-size, bot. These report findings
-#               as annotations or a job summary but never fail your PR.
+#   ADVISORY  — clippy, audit, wasm-size, bot. These report findings as
+#               annotations or a job summary but never fail your PR.
 #
 # The split is deliberate. A contributor should never be blocked by a new
 # upstream advisory or a subjective lint, but formatting, a green test suite,
@@ -192,65 +192,6 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ───────────────────────────────────────────────────────────────────────────
-  # ADVISORY — line/region/function coverage via cargo-llvm-cov. Reported for
-  # visibility only: no threshold, and it can never fail the PR.
-  #
-  # Verified locally against this crate (cdylib, #![no_std], soroban-sdk
-  # testutils) before wiring this up — instrumentation works correctly and
-  # produces plausible, non-zero numbers (lib.rs came out around 96% region /
-  # 93% function / 97% line coverage over the current test suite).
-  #
-  # src/test.rs is excluded via --ignore-filename-regex: it's the test module
-  # itself, and since it necessarily runs whenever the tests run, including it
-  # pulls the reported number up to ~99% without saying anything about how
-  # well the actual contract logic in lib.rs is exercised. An unexplained
-  # exclusion list is how coverage numbers become fiction, so: this is the
-  # only exclusion, and this is why.
-  # ───────────────────────────────────────────────────────────────────────────
-  coverage:
-    name: Coverage (advisory)
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: llvm-tools-preview
-
-      - uses: taiki-e/install-action@cargo-llvm-cov
-
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: ${{ runner.os }}-cargo-coverage-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-coverage-
-
-      - name: Measure coverage
-        run: |
-          cargo llvm-cov --workspace --summary-only \
-            --ignore-filename-regex 'test\.rs$' \
-            | tee cov.txt
-
-      - name: Publish summary
-        run: |
-          {
-            echo "### Coverage"
-            echo
-            echo "_Advisory only — informational, not a gate. \`src/test.rs\` is excluded from the report (see job comment in ci.yml for why)._"
-            echo
-            echo '```'
-            cat cov.txt
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  # ───────────────────────────────────────────────────────────────────────────
   # ADVISORY — report the optimized WASM size so reviewers can spot a
   # regression without having to build locally.
   # ───────────────────────────────────────────────────────────────────────────
@@ -303,9 +244,8 @@ jobs:
   # lint nit there should not gate a contract PR.
   # ───────────────────────────────────────────────────────────────────────────
   bot:
-    name: Keeper bot (advisory)
+    name: Keeper bot (required)
     runs-on: ubuntu-latest
-    continue-on-error: true
     defaults:
       run:
         working-directory: examples/keeper-bot
@@ -326,7 +266,7 @@ jobs:
         run: node --check index.js
 
       - name: Lint
-        run: npm run lint --if-present
+        run: npm run lint
 
   # ───────────────────────────────────────────────────────────────────────────
   # Aggregate gate. Branch protection should require only this single check;
@@ -336,7 +276,7 @@ jobs:
     name: CI required checks
     runs-on: ubuntu-latest
     if: always()
-    needs: [format, test, build-wasm]
+    needs: [format, test, build-wasm, bot]
     steps:
       - name: Verify required jobs succeeded
         run: |
