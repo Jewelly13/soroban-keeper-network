@@ -124,19 +124,35 @@ duplicate the assertion logic inline in a new test or target. See
 the property tests in `test.rs` (search for `proptest!`) for how they're
 used from the test side.
 
-**Adding a new property.** The stateful, multi-task/multi-keeper
-model-checking harness (backlog 0061) that would let you generate and
-replay arbitrary *sequences* of contract calls doesn't exist yet — it's
-still open, separately-scoped work. Until it lands, new properties in this
-repo are written directly with `proptest!`, generating the *inputs* to a
-short, fixed sequence of calls (see any `property_i*` test in `test.rs`
-for the pattern: generate a reward and/or a small `Vec` of them, apply a
-fixed handful of calls, then assert one of the `invariants.rs` functions
-holds). This is deliberately narrower than full sequence-shrinking model
-checking — it catches "this specific invariant breaks for this input,"
-not "this arbitrary sequence of N calls breaks something." Extend the
-existing `property_i*` tests in place, in the same style, until the
-stateful harness exists and a wider rewrite becomes worthwhile.
+**Adding a new property.** There are now two shapes, and which one you want
+depends on whether your invariant is about a *single input* or a *sequence
+of calls*.
+
+*Input-shaped properties* are written directly with `proptest!`, generating
+the inputs to a short, fixed sequence of calls (see any `property_i*` test
+in `test.rs` for the pattern: generate a reward and/or a small `Vec` of
+them, apply a fixed handful of calls, then assert one of the
+`invariants.rs` functions holds). Use this when the invariant is "this
+holds for every input," and extend the existing `property_i*` tests in
+place, in the same style.
+
+*Sequence-shaped properties* build on the stateful model-checking harness
+in `contracts/keeper-registry/tests/model.rs` (backlog 0087). It generates
+randomized, mostly-valid sequences of calls across multiple tasks and
+keepers, keeps a plain-Rust `Model` of the expected state, and diffs the
+contract's observable state (`get_task`, `keeper_balance`, `fees_accrued`,
+`task_count`) against that model after **every** step. Use this when the
+invariant is "no arbitrary sequence of N calls breaks this" — it catches
+per-task bookkeeping bugs that a single aggregate assertion nets out to
+zero, and it tells you which call in the sequence broke things.
+
+To add one, hook into the harness rather than reimplementing the loop:
+pass a per-step check as the `after_each` closure to `Harness::run_with`,
+or assert against `Harness::model` once `Harness::run` returns.
+`Harness::assert_solvent` is the worked example. That file's module doc is
+the authoritative guide, including how to model an entry point the harness
+doesn't cover yet (`increase_reward`, `extend_deadline`,
+`update_verifier`, and the admin functions are all still unmodeled).
 
 ## Crash-to-regression convention
 
@@ -172,13 +188,16 @@ order:
 
 - **`register_task` and `smoke` fuzz targets don't currently compile** (see
   the table above) — fixing these is real, scoped work of its own.
-- **The stateful model-checking harness** (backlog 0061) for generating
-  and replaying arbitrary multi-call sequences, rather than fixed
-  sequences with fuzzed inputs.
-- **The full I-1..I-7 property test suite** (backlog 0054–0060) — this
-  repo currently has one compact `proptest!` per invariant (see
-  `test.rs`), not the exhaustive, sequence-driven exploration those
-  issues call for.
+- **The full I-1..I-7 property test suite** (backlog 0054–0060) — beyond
+  solvency, which is ported onto the model harness, this repo has one
+  compact `proptest!` per invariant (see `test.rs`), not the exhaustive,
+  sequence-driven exploration those issues call for. The harness they
+  should be built on now exists (see "Adding a new property" above);
+  porting each remaining invariant onto it is the outstanding work.
+- **Entry points the model harness doesn't model yet** —
+  `increase_reward`, `extend_deadline`, `update_verifier`, and the admin
+  functions, plus verifier-attached tasks. See `tests/model.rs`'s module
+  doc for what adding one involves.
 - **A CI fuzz job** (backlog 0066) and **`docs/CI.md`** (backlog 0043).
 - **A committed crash corpus** under `fuzz/corpus/*/regressions/` — none
   exists yet, since no crash has been found and minimized.

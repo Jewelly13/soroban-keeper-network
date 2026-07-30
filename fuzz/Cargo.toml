@@ -90,3 +90,10 @@ test = false
 doc = false
 bench = false
 required-features = ["libfuzzer"]
+
+[[bin]]
+name = "register_task_calldata_bound"
+path = "fuzz_targets/register_task_calldata_bound.rs"
+test = false
+doc = false
+bench = false

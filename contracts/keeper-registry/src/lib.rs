@@ -221,12 +221,30 @@ pub struct TaskParams {
 /// passes. A well-behaved verifier should therefore return `false` for a
 /// "proof didn't check out" outcome rather than panicking, reserving an
 /// actual panic for conditions that are genuinely exceptional.
+/// ## Interface versioning
+/// Every verifier must expose [`IKeeperVerifier::interface_version`] returning
+/// [`KEEPER_VERIFIER_INTERFACE_VERSION`]. `execute_task` checks that value
+/// before calling `verify` and rejects with
+/// [`KeeperError::IncompatibleVerifierInterface`] on mismatch, so a verifier
+/// written against an older calling convention cannot be invoked with a newer
+/// one (and vice versa).
 #[soroban_sdk::contractclient(name = "IKeeperVerifierClient")]
 pub trait IKeeperVerifier {
+    /// Version of the `IKeeperVerifier` calling convention this contract
+    /// implements. Must equal [`KEEPER_VERIFIER_INTERFACE_VERSION`] for the
+    /// registry to call [`IKeeperVerifier::verify`].
+    fn interface_version(env: Env) -> u32;
+
     /// Returns `true` if `proof` is a valid attestation that `keeper`
     /// performed the off-chain action `task` describes.
     fn verify(env: Env, task: Task, keeper: Address, proof: Bytes) -> bool;
 }
+
+/// Current `IKeeperVerifier` calling-convention version. Verifiers must
+/// return this from [`IKeeperVerifier::interface_version`]. Bump when
+/// `verify`'s parameters or semantics change in a way that would make an
+/// older verifier misbehave if called under the new convention.
+pub const KEEPER_VERIFIER_INTERFACE_VERSION: u32 = 1;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Errors
@@ -288,6 +306,9 @@ pub enum KeeperError {
     /// the caller-supplied `max_total_reward` ceiling. No entry was registered
     /// and no escrow was transferred.
     BatchRewardCeilingExceeded = 22,
+    /// The attached verifier reported an `interface_version` other than
+    /// [`KEEPER_VERIFIER_INTERFACE_VERSION`]. `verify` was not called.
+    IncompatibleVerifierInterface = 21,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -789,7 +810,7 @@ fn lock_expired(e: &Env, task: &Task) -> bool {
 
 /// Semantic version of the contract logic. Bumped on behavior changes so
 /// off-chain clients and indexers can detect which ABI they are talking to.
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 
 /// Maximum `calldata` length, in bytes. Sized to hold an encoded contract
 /// call — a target address, a function symbol, and a handful of scalar or
@@ -1226,8 +1247,14 @@ impl KeeperRegistry {
         }
 
         if let Some(verifier) = task.verifier.clone() {
-            let approved: bool =
-                IKeeperVerifierClient::new(&e, &verifier).verify(&task, &keeper, &proof);
+            let client = IKeeperVerifierClient::new(&e, &verifier);
+            // Reject incompatible interface versions before `verify` so a
+            // verifier written against a different calling convention cannot
+            // silently mis-handle the current argument layout.
+            if client.interface_version() != KEEPER_VERIFIER_INTERFACE_VERSION {
+                return Err(KeeperError::IncompatibleVerifierInterface);
+            }
+            let approved: bool = client.verify(&task, &keeper, &proof);
             if !approved {
                 emit_verification_failed(&e, task_id, &keeper);
                 return Err(KeeperError::VerificationFailed);

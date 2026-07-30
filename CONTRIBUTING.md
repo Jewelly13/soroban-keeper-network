@@ -75,7 +75,7 @@ docs/                       Architecture, deployment, and demo documentation
 .github/                    CI, issue templates, and pull-request template
 ```
 
-Rust contract changes normally belong in `contracts/keeper-registry/src/`. Contract tests are in `contracts/keeper-registry/src/test.rs`.
+Rust contract changes normally belong in `contracts/keeper-registry/src/`. Contract tests are in `contracts/keeper-registry/src/test.rs`. Properties about arbitrary *sequences* of calls go on the stateful model-checking harness in `contracts/keeper-registry/tests/model.rs` instead — see that file's module doc, and `docs/FUZZING.md`'s "Adding a new property".
 
 ---
 
