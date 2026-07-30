@@ -37,7 +37,7 @@
 //! it doesn't share that contract's panic-on-invalid-input caveat.
 #![no_std]
 
-use keeper_registry::{IKeeperVerifier, Task};
+use keeper_registry::{IKeeperVerifier, Task, KEEPER_VERIFIER_INTERFACE_VERSION};
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, Address, Bytes, BytesN,
     Env,
@@ -161,6 +161,10 @@ fn decode_proof(proof: &Bytes) -> Option<(i128, u64)> {
 
 #[contractimpl]
 impl IKeeperVerifier for OracleVerifier {
+    fn interface_version(_env: Env) -> u32 {
+        KEEPER_VERIFIER_INTERFACE_VERSION
+    }
+
     fn verify(env: Env, _task: Task, _keeper: Address, proof: Bytes) -> bool {
         let (oracle, tolerance_bps, staleness_threshold_secs): (Address, u32, u64) =
             match (
