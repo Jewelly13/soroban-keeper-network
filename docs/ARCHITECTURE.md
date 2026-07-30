@@ -208,6 +208,42 @@ the entry's TTL on every mutation (claim, execute, top-up, deadline change),
 so an active task's storage lifetime keeps moving forward rather than only
 being set once at registration.
 
+## Batch registration
+
+`batch_register_tasks(owner, tasks: Vec<TaskParams>, max_total_reward)` registers
+many tasks for one owner in a single transaction, amortizing the per-transaction
+overhead a dApp would otherwise pay once per task.
+
+**Auth.** Every entry shares one `owner`, who authorizes once. That is the point
+of the entry point, but it means the owner signs for a total they cannot read off
+the signature payload. `max_total_reward` is the mitigation: the owner commits to
+a ceiling upfront and the call is rejected with `BatchRewardCeilingExceeded` if
+the entries sum above it, before any transfer happens.
+
+**All-or-nothing.** Soroban transactions are atomic, so partial success is not
+expressible — returning `Err` discards every state change and transfer made
+during the call. Validation nonetheless runs over all entries before any
+transfer, so common rejections never touch the token contract at all rather than
+relying on rollback. An empty batch is an accepted no-op.
+
+**Validation parity.** Both entry points run the same `validate_task_params` and
+`validate_ttl_covers_deadline` helpers, so a batch can never accept an entry
+`register_task` would reject. `batch_rejects_each_invalid_entry_exactly_as_register_task_does`
+asserts that equivalence case by case.
+
+**Size cap.** `MAX_BATCH_ENTRIES` is 32, rejected with `BatchTooLarge`. CPU is
+not what makes 32 the cap — a full batch measures ~6.5M instructions, 6.5% of the
+100M transaction budget, scaling linearly at ~202k per entry. The binding
+constraint is the per-transaction ledger write-entry footprint
+(`txMaxWriteLedgerEntries`), one persistent entry per task, which is a live
+network config the test host does not enforce. See the constant's doc comment.
+
+**Conservation.** `tests/model.rs` extends the I-1 solvency property to arbitrary
+interleavings of single and batch registration, and adds a batch-specific
+property: after any rejected batch — invalid entry, ceiling exceeded, or
+oversized — the owner's balance and the registry's escrow are both provably
+unchanged.
+
 ## Review checklist
 
 For a change that touches fund movement or task lifecycle, reviewers should verify:
