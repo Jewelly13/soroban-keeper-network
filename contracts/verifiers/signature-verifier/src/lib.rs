@@ -48,7 +48,7 @@
 
 #![no_std]
 
-use keeper_registry::{IKeeperVerifier, Task};
+use keeper_registry::{IKeeperVerifier, Task, KEEPER_VERIFIER_INTERFACE_VERSION};
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, xdr::ToXdr, Address, Bytes, BytesN, Env,
 };
@@ -114,6 +114,10 @@ pub fn signed_message(e: &Env, task: &Task) -> Bytes {
 
 #[contractimpl]
 impl IKeeperVerifier for SignatureVerifier {
+    fn interface_version(_env: Env) -> u32 {
+        KEEPER_VERIFIER_INTERFACE_VERSION
+    }
+
     fn verify(env: Env, task: Task, _keeper: Address, proof: Bytes) -> bool {
         let signer: BytesN<32> = match env.storage().instance().get(&DataKey::Signer) {
             Some(s) => s,
