@@ -778,14 +778,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
 
 [[package]]
-name = "inclusion-verifier"
-version = "0.1.0"
-dependencies = [
- "keeper-registry",
- "soroban-sdk",
-]
-
-[[package]]
 name = "indexmap"
 version = "1.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -949,14 +941,6 @@ name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
-
-[[package]]
-name = "oracle-verifier"
-version = "0.1.0"
-dependencies = [
- "keeper-registry",
- "soroban-sdk",
-]
 
 [[package]]
 name = "p256"
@@ -1378,16 +1362,6 @@ checksum = "77549399552de45a898a580c1b41d445bf730df867cc44e6c0233bbc4b8329de"
 dependencies = [
  "digest",
  "rand_core 0.6.4",
-]
-
-[[package]]
-name = "signature-verifier"
-version = "0.1.0"
-dependencies = [
- "ed25519-dalek",
- "keeper-registry",
- "rand 0.8.7",
- "soroban-sdk",
 ]
 
 [[package]]
