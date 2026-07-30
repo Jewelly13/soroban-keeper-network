@@ -3722,3 +3722,876 @@ fn test_execute_task_none_verifier_path_unchanged() {
     assert_eq!(s.registry.get_task(&task_id).status, TaskStatus::Executed);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// #106 — update_verifier
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_update_verifier_succeeds_while_pending() {
+    let s = setup();
+    let reward = 1_000_000i128;
+    let deadline = s.env.ledger().timestamp() + 3_600;
+    let task_id = s.registry.register_task(
+        &s.admin,
+        &TaskType::Liquidation,
+        &calldata(&s.env),
+        &reward,
+        &deadline,
+        &17_280u32,
+        &120u32,
+        &None,
+    );
+
+    let verifier_id = s.env.register(always_approve_verifier::AlwaysApproveVerifier, ());
+    s.registry
+        .update_verifier(&s.admin, &task_id, &Some(verifier_id.clone()));
+
+    let task = s.registry.get_task(&task_id);
+    assert_eq!(task.verifier, Some(verifier_id));
+
+    // Clearing it back to None also works while still Pending.
+    s.registry.update_verifier(&s.admin, &task_id, &None);
+    assert_eq!(s.registry.get_task(&task_id).verifier, None);
+}
+
+#[test]
+fn test_update_verifier_rejected_once_task_is_claimed() {
+    let s = setup();
+    let reward = 1_000_000i128;
+    let deadline = s.env.ledger().timestamp() + 3_600;
+    let task_id = s.registry.register_task(
+        &s.admin,
+        &TaskType::Liquidation,
+        &calldata(&s.env),
+        &reward,
+        &deadline,
+        &17_280u32,
+        &120u32,
+        &None,
+    );
+    let keeper = Address::generate(&s.env);
+    s.registry.claim_task(&keeper, &task_id);
+
+    let verifier_id = s.env.register(always_approve_verifier::AlwaysApproveVerifier, ());
+    assert_eq!(
+        s.registry
+            .try_update_verifier(&s.admin, &task_id, &Some(verifier_id)),
+        Err(Ok(KeeperError::InvalidTaskStatus))
+    );
+    // Unchanged.
+    assert_eq!(s.registry.get_task(&task_id).verifier, None);
+}
+
+#[test]
+fn test_update_verifier_rejects_non_owner() {
+    let s = setup();
+    let reward = 1_000_000i128;
+    let deadline = s.env.ledger().timestamp() + 3_600;
+    let task_id = s.registry.register_task(
+        &s.admin,
+        &TaskType::Liquidation,
+        &calldata(&s.env),
+        &reward,
+        &deadline,
+        &17_280u32,
+        &120u32,
+        &None,
+    );
+
+    let stranger = Address::generate(&s.env);
+    let verifier_id = s.env.register(always_approve_verifier::AlwaysApproveVerifier, ());
+    assert_eq!(
+        s.registry
+            .try_update_verifier(&stranger, &task_id, &Some(verifier_id)),
+        Err(Ok(KeeperError::NotTaskOwner))
+    );
+}
+
+#[test]
+fn test_update_verifier_rejected_when_paused() {
+    let s = setup();
+    let reward = 1_000_000i128;
+    let deadline = s.env.ledger().timestamp() + 3_600;
+    let task_id = s.registry.register_task(
+        &s.admin,
+        &TaskType::Liquidation,
+        &calldata(&s.env),
+        &reward,
+        &deadline,
+        &17_280u32,
+        &120u32,
+        &None,
+    );
+
+    s.registry.pause(&s.admin);
+    let verifier_id = s.env.register(always_approve_verifier::AlwaysApproveVerifier, ());
+    assert_eq!(
+        s.registry
+            .try_update_verifier(&s.admin, &task_id, &Some(verifier_id)),
+        Err(Ok(KeeperError::ContractPaused))
+    );
+}
+
+#[test]
+fn test_update_verifier_emits_event() {
+    let s = setup();
+    let reward = 1_000_000i128;
+    let deadline = s.env.ledger().timestamp() + 3_600;
+    let task_id = s.registry.register_task(
+        &s.admin,
+        &TaskType::Liquidation,
+        &calldata(&s.env),
+        &reward,
+        &deadline,
+        &17_280u32,
+        &120u32,
+        &None,
+    );
+
+    let verifier_id = s.env.register(always_approve_verifier::AlwaysApproveVerifier, ());
+    let before = s.env.events().all().len();
+    s.registry
+        .update_verifier(&s.admin, &task_id, &Some(verifier_id));
+    assert!(s.env.events().all().len() > before);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #111 — execute_task against a verifier that consumes excessive resources
+//
+// The verifier below does a configurable number of persistent-storage writes
+// before returning `true` — a stand-in for "does something resource-intensive"
+// per the issue's own suggested approach. The test drives that count up under
+// a tightly capped budget (`env.cost_estimate().budget().reset_limits(...)`)
+// to find the point where the call starts failing on resource exhaustion
+// rather than any contract logic, and confirms two things at that boundary:
+//   1. The failure is a clean host-level error, not a panic that corrupts
+//      test state or a silently-wrong `false` verification result.
+//   2. No partial state mutation survives — the task is exactly as it was
+//      before the call, same as the panicking-verifier findings in #110/0075.
+// ─────────────────────────────────────────────────────────────────────────────
+
+mod expensive_verifier {
+    use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, Env};
+
+    #[contracttype]
+    enum DataKey {
+        Slot(u32),
+    }
+
+    #[contract]
+    pub struct ExpensiveVerifier;
+
+    #[contractimpl]
+    impl ExpensiveVerifier {
+        /// Writes `work_units` persistent-storage entries, then approves.
+        /// `proof`'s first byte selects how much work to do so a single
+        /// deployed instance can be reused across increasing loads.
+        pub fn verify(
+            env: Env,
+            _task: crate::Task,
+            _keeper: Address,
+            proof: Bytes,
+        ) -> bool {
+            let work_units: u32 = proof.get(0).unwrap_or(0) as u32;
+            for i in 0..work_units {
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::Slot(i), &Bytes::from_array(&env, &[0u8; 256]));
+            }
+            true
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Verifier mocks (#98/#99/#106) — minimal, test-only contracts following the
+// established `mod reentrant_token { ... }` local-mock-contract pattern.
+// ─────────────────────────────────────────────────────────────────────────────
+
+mod always_approve_verifier {
+    use soroban_sdk::{contract, contractimpl, Address, Bytes, Env};
+
+    #[contract]
+    pub struct AlwaysApproveVerifier;
+
+    #[contractimpl]
+    impl AlwaysApproveVerifier {
+        pub fn verify(_env: Env, _task: crate::Task, _keeper: Address, _proof: Bytes) -> bool {
+            true
+        }
+    }
+}
+
+mod always_reject_verifier {
+    use soroban_sdk::{contract, contractimpl, Address, Bytes, Env};
+
+    #[contract]
+    pub struct AlwaysRejectVerifier;
+
+    #[contractimpl]
+    impl AlwaysRejectVerifier {
+        pub fn verify(_env: Env, _task: crate::Task, _keeper: Address, _proof: Bytes) -> bool {
+            false
+        }
+    }
+}
+
+fn register_task_with_verifier(s: &Setup, reward: i128, verifier: &Address) -> u64 {
+    let deadline = s.env.ledger().timestamp() + 3_600;
+    s.registry.register_task(
+        &s.admin,
+        &TaskType::Liquidation,
+        &calldata(&s.env),
+        &reward,
+        &deadline,
+        &17_280u32,
+        &120u32,
+        &Some(verifier.clone()),
+    )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #99 — execute_task with a verifier attached
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_execute_task_with_always_approve_verifier_matches_no_verifier_outcome() {
+    let s = setup();
+    let verifier_id = s.env.register(always_approve_verifier::AlwaysApproveVerifier, ());
+    let reward = 1_000_000i128;
+    let task_id = register_task_with_verifier(&s, reward, &verifier_id);
+
+    let keeper = Address::generate(&s.env);
+    s.registry.claim_task(&keeper, &task_id);
+
+    let proof = Bytes::from_slice(&s.env, b"proof-bytes");
+    s.registry.execute_task(&keeper, &task_id, &proof);
+
+    // Check events immediately after the call that emits them: each
+    // top-level client call is its own host invocation, and
+    // `s.env.events().all()` only reflects the most recent one — any
+    // further contract calls (even read-only ones like `get_task`) start a
+    // new invocation and the previous one's events are no longer visible.
+    let all_events = s.env.events().all();
+    let verfail_topic: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("verfail"), symbol_short!("task")).into_val(&s.env);
+    let verfail_fired = all_events.iter().any(|(contract, topics, _)| {
+        contract == s.registry.address && topics == verfail_topic
+    });
+    assert!(
+        !verfail_fired,
+        "TaskVerificationFailed must not fire when the verifier approves"
+    );
+
+    let exec_topic: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("exec"), symbol_short!("task")).into_val(&s.env);
+    let exec_fired = all_events.iter().any(|(contract, topics, _)| {
+        contract == s.registry.address && topics == exec_topic
+    });
+    assert!(exec_fired, "TaskExecuted must still fire");
+
+    // Same outcome as the no-verifier path: full net reward credited, fee
+    // accrued, task Executed.
+    let (expected_net, expected_fee) = split_reward(reward, 300u32);
+    assert_eq!(s.registry.keeper_balance(&keeper), expected_net);
+    assert_eq!(s.registry.fees_accrued(), expected_fee);
+
+    let task = s.registry.get_task(&task_id);
+    assert_eq!(task.status, TaskStatus::Executed);
+}
+
+#[test]
+fn test_execute_task_with_always_reject_verifier() {
+    let s = setup();
+    let verifier_id = s.env.register(always_reject_verifier::AlwaysRejectVerifier, ());
+    let reward = 1_000_000i128;
+    let task_id = register_task_with_verifier(&s, reward, &verifier_id);
+
+    let keeper = Address::generate(&s.env);
+    s.registry.claim_task(&keeper, &task_id);
+
+    let proof = Bytes::from_slice(&s.env, b"first-attempt-proof");
+    let result = s.registry.try_execute_task(&keeper, &task_id, &proof);
+    assert_eq!(result, Err(Ok(KeeperError::VerificationFailed)));
+
+    // Note: we don't assert TaskVerificationFailed's presence in
+    // `s.env.events().all()` here. Soroban's host rolls back a whole call
+    // frame — events included — whenever that frame's top-level function
+    // returns `Err` (see `with_frame`/`call_n_internal` in
+    // soroban-env-host), even though the error itself is "recoverable" from
+    // the caller's perspective via `try_`. So an event published right
+    // before an `Err` return is never observable by any caller, in any
+    // Soroban contract; `emit_verification_failed`'s call site in
+    // `execute_task` can't be exercised by a test that also checks the
+    // `Err` result. What we *can* and do verify below is the actually
+    // observable contract: the typed error, and that state didn't change.
+
+    // Task remains Claimed — not Executed, not reverted to Pending.
+    let task = s.registry.get_task(&task_id);
+    assert_eq!(task.status, TaskStatus::Claimed);
+    assert_eq!(task.claimer, Some(keeper.clone()));
+
+    // No token transfer / keeper crediting occurred.
+    assert_eq!(s.registry.keeper_balance(&keeper), 0i128);
+    assert_eq!(s.registry.fees_accrued(), 0i128);
+
+    // A second execute_task call (different proof bytes, same always-reject
+    // verifier) fails the same way — the rejection is repeatable, not a
+    // one-shot state change.
+    let proof2 = Bytes::from_slice(&s.env, b"second-attempt-different-proof");
+    let result2 = s.registry.try_execute_task(&keeper, &task_id, &proof2);
+    assert_eq!(result2, Err(Ok(KeeperError::VerificationFailed)));
+
+    let task_after_retry = s.registry.get_task(&task_id);
+    assert_eq!(task_after_retry.status, TaskStatus::Claimed);
+    assert_eq!(task_after_retry.claimer, Some(keeper));
+}
+
+#[test]
+fn test_execute_task_none_verifier_path_unchanged() {
+    // The base MVP path (no verifier attached) must behave identically to
+    // before this feature existed — required explicitly by #99's acceptance
+    // criteria, on top of the fact that all 100 pre-existing tests already
+    // pass unmodified.
+    let s = setup();
+fn setup_task_with_expensive_verifier() -> (Setup, u64, Address, i128) {
+    let s = setup();
+    let verifier_id = s.env.register(expensive_verifier::ExpensiveVerifier, ());
+    let reward = 1_000_000i128;
+    let deadline = s.env.ledger().timestamp() + 3_600;
+    let task_id = s.registry.register_task(
+        &s.admin,
+        &TaskType::Liquidation,
+        &calldata(&s.env),
+        &reward,
+        &deadline,
+        &17_280u32,
+        &120u32,
+        &None,
+    );
+    let keeper = Address::generate(&s.env);
+    s.registry.claim_task(&keeper, &task_id);
+
+    let proof = Bytes::from_slice(&s.env, b"proof-bytes");
+    s.registry.execute_task(&keeper, &task_id, &proof);
+
+    let (expected_net, expected_fee) = split_reward(reward, 300u32);
+    assert_eq!(s.registry.keeper_balance(&keeper), expected_net);
+    assert_eq!(s.registry.fees_accrued(), expected_fee);
+    assert_eq!(s.registry.get_task(&task_id).status, TaskStatus::Executed);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #106 — update_verifier
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_update_verifier_succeeds_while_pending() {
+    let s = setup();
+    let reward = 1_000_000i128;
+    let deadline = s.env.ledger().timestamp() + 3_600;
+    let task_id = s.registry.register_task(
+        &s.admin,
+        &TaskType::Liquidation,
+        &calldata(&s.env),
+        &reward,
+        &deadline,
+        &17_280u32,
+        &120u32,
+        &None,
+    );
+
+    let verifier_id = s.env.register(always_approve_verifier::AlwaysApproveVerifier, ());
+    s.registry
+        .update_verifier(&s.admin, &task_id, &Some(verifier_id.clone()));
+
+    let task = s.registry.get_task(&task_id);
+    assert_eq!(task.verifier, Some(verifier_id));
+
+    // Clearing it back to None also works while still Pending.
+    s.registry.update_verifier(&s.admin, &task_id, &None);
+    assert_eq!(s.registry.get_task(&task_id).verifier, None);
+}
+
+#[test]
+fn test_update_verifier_rejected_once_task_is_claimed() {
+    let s = setup();
+    let reward = 1_000_000i128;
+    let deadline = s.env.ledger().timestamp() + 3_600;
+    let task_id = s.registry.register_task(
+        &s.admin,
+        &TaskType::Liquidation,
+        &calldata(&s.env),
+        &Some(verifier_id),
+    );
+    let keeper = Address::generate(&s.env);
+    s.registry.claim_task(&keeper, &task_id);
+    (s, task_id, keeper, reward)
+}
+
+/// A `proof` whose first byte is `work_units` — see `ExpensiveVerifier::verify`.
+fn proof_requesting_work(env: &Env, work_units: u8) -> Bytes {
+    Bytes::from_array(env, &[work_units])
+}
+
+#[test]
+fn test_execute_task_succeeds_against_expensive_verifier_under_default_budget() {
+    // Under the default (untouched) test budget, a moderate amount of
+    // verifier work still succeeds — establishes the baseline before we
+    // tighten the budget to find the failure boundary below.
+    let (s, task_id, keeper, reward) = setup_task_with_expensive_verifier();
+    let proof = proof_requesting_work(&s.env, 50);
+    s.registry.execute_task(&keeper, &task_id, &proof);
+
+    let task = s.registry.get_task(&task_id);
+    assert_eq!(task.status, TaskStatus::Executed);
+    let (expected_net, _) = split_reward(reward, 300u32);
+    assert_eq!(s.registry.keeper_balance(&keeper), expected_net);
+}
+
+#[test]
+#[should_panic]
+fn test_execute_task_against_expensive_verifier_exhausts_a_tight_budget() {
+    // Cap the budget tightly, then ask the verifier to do far more work than
+    // that budget allows. This empirically establishes the failure mode:
+    // resource exhaustion during a nested contract call is a host-level
+    // error that aborts the whole transaction (via the same frame-rollback
+    // mechanism documented on IKeeperVerifier and exercised by #110's
+    // panicking-verifier tests) — not a graceful `false` result, and not a
+    // panic that leaves storage half-written. `#[should_panic]` is the same
+    // no_std-compatible mechanism #110 uses for the equivalent claim about a
+    // panicking verifier (this crate's `#![no_std]` makes
+    // `std::panic::catch_unwind` unavailable even in `#[cfg(test)]` code).
+    // `Env`'s Drop impl (soroban-sdk's test harness) writes a test snapshot
+    // on drop, which itself needs to iterate storage under the budget. Once
+    // we deliberately exhaust the budget below, that snapshot-on-drop would
+    // hit the same exhausted budget while unwinding this panic and abort the
+    // whole test binary ("panic in a destructor during cleanup") instead of
+    // failing just this test. `EnvTestConfig` is plain (non-shared) state
+    // captured by value into every `Env`/client clone at the point it's
+    // cloned, so this must be set on the *original* `Env` before any client
+    // is constructed from it — setting it on `Setup.env` afterwards doesn't
+    // reach `Setup.registry`'s already-cloned internal `Env`. Disabling it
+    // is safe: this test's only assertion is that the call panics, and the
+    // state left behind is checked by the separate expire_task-recovery
+    // test below instead (using its own fresh `Setup`).
+    let mut env = Env::default();
+    env.set_config(soroban_sdk::testutils::EnvTestConfig {
+        capture_snapshot_at_drop: false,
+    });
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    token::StellarAssetClient::new(&env, &token_id).mint(&admin, &10_000_000i128);
+    let registry_id = env.register(KeeperRegistry, ());
+    let registry = KeeperRegistryClient::new(&env, &registry_id);
+    registry.initialize(&admin, &token_id, &300u32);
+
+    let verifier_id = env.register(expensive_verifier::ExpensiveVerifier, ());
+    let reward = 1_000_000i128;
+    let deadline = env.ledger().timestamp() + 3_600;
+    let task_id = registry.register_task(
+        &admin,
+        &TaskType::Liquidation,
+        &calldata(&env),
+        &reward,
+        &deadline,
+        &17_280u32,
+        &120u32,
+        &None,
+    );
+    let keeper = Address::generate(&s.env);
+    s.registry.claim_task(&keeper, &task_id);
+
+    let verifier_id = s.env.register(always_approve_verifier::AlwaysApproveVerifier, ());
+    assert_eq!(
+        s.registry
+            .try_update_verifier(&s.admin, &task_id, &Some(verifier_id)),
+        Err(Ok(KeeperError::InvalidTaskStatus))
+    );
+    // Unchanged.
+    assert_eq!(s.registry.get_task(&task_id).verifier, None);
+}
+
+#[test]
+fn test_update_verifier_rejects_non_owner() {
+    let s = setup();
+    let reward = 1_000_000i128;
+    let deadline = s.env.ledger().timestamp() + 3_600;
+    let task_id = s.registry.register_task(
+        &s.admin,
+        &TaskType::Liquidation,
+        &calldata(&s.env),
+        &reward,
+        &deadline,
+        &17_280u32,
+        &120u32,
+        &None,
+    );
+
+    let stranger = Address::generate(&s.env);
+    let verifier_id = s.env.register(always_approve_verifier::AlwaysApproveVerifier, ());
+    assert_eq!(
+        s.registry
+            .try_update_verifier(&stranger, &task_id, &Some(verifier_id)),
+        Err(Ok(KeeperError::NotTaskOwner))
+    );
+}
+
+#[test]
+fn test_update_verifier_rejected_when_paused() {
+    let s = setup();
+    let reward = 1_000_000i128;
+    let deadline = s.env.ledger().timestamp() + 3_600;
+    let task_id = s.registry.register_task(
+        &s.admin,
+        &TaskType::Liquidation,
+        &calldata(&s.env),
+        &reward,
+        &deadline,
+        &17_280u32,
+        &120u32,
+        &None,
+    );
+
+    s.registry.pause(&s.admin);
+    let verifier_id = s.env.register(always_approve_verifier::AlwaysApproveVerifier, ());
+    assert_eq!(
+        s.registry
+            .try_update_verifier(&s.admin, &task_id, &Some(verifier_id)),
+        Err(Ok(KeeperError::ContractPaused))
+    );
+}
+
+#[test]
+fn test_update_verifier_emits_event() {
+    let s = setup();
+    let reward = 1_000_000i128;
+    let deadline = s.env.ledger().timestamp() + 3_600;
+    let task_id = s.registry.register_task(
+        &s.admin,
+        &TaskType::Liquidation,
+        &calldata(&s.env),
+        &reward,
+        &deadline,
+        &17_280u32,
+        &120u32,
+        &None,
+    );
+
+    let verifier_id = s.env.register(always_approve_verifier::AlwaysApproveVerifier, ());
+    let before = s.env.events().all().len();
+    s.registry
+        .update_verifier(&s.admin, &task_id, &Some(verifier_id));
+    assert!(s.env.events().all().len() > before);
+        &Some(verifier_id),
+    );
+    let keeper = Address::generate(&env);
+    registry.claim_task(&keeper, &task_id);
+
+    // Tight but not zero: enough for the setup/register/claim above to have
+    // happened, but far too little for hundreds of persistent writes.
+    env.cost_estimate().budget().reset_limits(2_000_000, 2_000_000);
+
+    let proof = proof_requesting_work(&env, 255);
+
+    // A resource-exhaustion failure inside a nested call is a non-recoverable
+    // host error (not a typed contract error), so — consistent with #110's
+    // panicking-verifier findings — it propagates and aborts the caller's
+    // transaction rather than surfacing as `Err(KeeperError::...)`.
+    registry.execute_task(&keeper, &task_id, &proof);
+}
+
+#[test]
+fn test_expire_task_recovers_escrow_from_a_task_stuck_behind_a_budget_exhausting_verifier() {
+    // Companion to the panic test above, structured like #110's
+    // expire_task-recovery test: since the aborting call can't be followed
+    // by assertions in the same test function, this test independently
+    // confirms the actual recovery guarantee — a task stuck behind a
+    // verifier that will always blow the budget is not permanently bricked;
+    // expire_task still recovers the escrowed reward once the deadline
+    // passes, exactly as it does for a panicking verifier.
+    let (s, task_id, keeper, reward) = setup_task_with_expensive_verifier();
+    s.env.cost_estimate().budget().reset_limits(2_000_000, 2_000_000);
+
+    let task_before_expiry = s.registry.get_task(&task_id);
+    assert_eq!(task_before_expiry.status, TaskStatus::Claimed);
+    assert_eq!(task_before_expiry.claimer, Some(keeper.clone()));
+    assert_eq!(s.registry.keeper_balance(&keeper), 0i128);
+
+    let token = token::Client::new(&s.env, &s.token_id);
+    let owner_balance_before = token.balance(&s.admin);
+
+    advance(&s.env, 1, 3_601);
+    s.env.cost_estimate().budget().reset_unlimited();
+    s.registry.expire_task(&task_id);
+
+    let task_after_expiry = s.registry.get_task(&task_id);
+    assert_eq!(task_after_expiry.status, TaskStatus::Expired);
+    assert_eq!(token.balance(&s.admin), owner_balance_before + reward);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// I-7: task ids are unique and never reused
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// I-7 (issue #86): `next_task_id` hands out a strictly increasing `u64` and
+/// never recycles an id, so an off-chain reference to a task id — an indexer's
+/// primary key, a keeper bot's local queue entry, a dApp's deep link — stays
+/// valid for the lifetime of the contract.
+///
+/// `next_task_id` only ever `checked_add(1)`s a monotonic counter, so the
+/// invariant should already hold; these tests prove it rather than trusting the
+/// implementation, and pin the `u64` behavior at the overflow boundary.
+///
+/// Self-contained (own fixture helpers rather than the module-level `setup()`)
+/// so the property can be read and run without the surrounding suite's shared
+/// state.
+mod i7_task_id_monotonicity {
+    // The contract crate is `#![no_std]`; the surrounding suite already pulls
+    // `std` in for the same reason (proptest's generated collections).
+    extern crate std;
+    use std::vec::Vec;
+
+    use proptest::prelude::*;
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger},
+        token, Address, Bytes, Env,
+    };
+
+    use crate::{DataKey, KeeperRegistry, KeeperRegistryClient, TaskStatus, TaskType};
+
+    /// Generous enough that a randomized plan can register, refund, and
+    /// re-register many times over without the owner running out of funds.
+    const MINT: i128 = 1_000_000_000_000i128;
+    const REWARD: i128 = 1_000i128;
+    const DEADLINE_OFFSET: u64 = 3_600;
+    /// `register_task` enforces `ttl_ledgers >= required_ttl_ledgers(deadline)`,
+    /// which for a one-hour deadline is `3_600 / 5 + 17_280 = 18_000`.
+    const TTL_LEDGERS: u32 = 20_000;
+    const LOCK_LEDGERS: u32 = 120;
+    const FEE_BPS: u32 = 300;
+
+    /// Returns `(env, owner, registry_id)`. The owner doubles as admin — this
+    /// property is about id allocation, which no admin function touches.
+    fn fixture() -> (Env, Address, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let owner = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        token::StellarAssetClient::new(&env, &token_id).mint(&owner, &MINT);
+
+        let registry_id = env.register(KeeperRegistry, ());
+        KeeperRegistryClient::new(&env, &registry_id).initialize(&owner, &token_id, &FEE_BPS);
+
+        (env, owner, registry_id)
+    }
+
+    fn register(env: &Env, owner: &Address, registry_id: &Address) -> u64 {
+        let deadline = env.ledger().timestamp() + DEADLINE_OFFSET;
+        KeeperRegistryClient::new(env, registry_id).register_task(
+            owner,
+            &TaskType::Liquidation,
+            &Bytes::from_slice(env, b"i7-monotonic"),
+            &REWARD,
+            &deadline,
+            &TTL_LEDGERS,
+            &LOCK_LEDGERS,
+            &None,
+        )
+    }
+
+    fn advance_past_deadline(env: &Env) {
+        env.ledger().with_mut(|ledger| {
+            ledger.sequence_number += 1;
+            ledger.timestamp += DEADLINE_OFFSET + 1;
+        });
+    }
+
+    /// Writes the task counter directly so the `u64::MAX` boundary is reachable
+    /// without the ~1.8e19 registrations it would otherwise take.
+    fn set_task_counter(env: &Env, registry_id: &Address, value: u64) {
+        env.as_contract(registry_id, || {
+            env.storage().instance().set(&DataKey::TaskCounter, &value);
+        });
+    }
+
+    /// How a freshly registered task is driven onward before the next
+    /// registration. Terminal variants are the point of the property: an id
+    /// belonging to a task the contract can no longer act on must still never
+    /// be handed out again.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Step {
+        /// Leave the task `Pending`.
+        LeaveOpen,
+        /// Owner pulls the escrow back out of a `Pending` task.
+        Cancel,
+        /// A keeper claims and executes it; the id belongs to a paid-out task.
+        Execute,
+        /// The deadline passes and anyone expires it, refunding the owner.
+        Expire,
+    }
+
+    impl Step {
+        fn expected_status(self) -> TaskStatus {
+            match self {
+                Step::LeaveOpen => TaskStatus::Pending,
+                Step::Cancel => TaskStatus::Cancelled,
+                Step::Execute => TaskStatus::Executed,
+                Step::Expire => TaskStatus::Expired,
+            }
+        }
+    }
+
+    fn apply(env: &Env, owner: &Address, registry_id: &Address, task_id: u64, step: Step) {
+        let registry = KeeperRegistryClient::new(env, registry_id);
+        match step {
+            Step::LeaveOpen => {}
+            Step::Cancel => registry.cancel_task(owner, &task_id),
+            Step::Execute => {
+                let keeper = Address::generate(env);
+                registry.claim_task(&keeper, &task_id);
+                registry.execute_task(&keeper, &task_id, &Bytes::from_slice(env, b"i7-proof"));
+            }
+            Step::Expire => {
+                advance_past_deadline(env);
+                registry.expire_task(&task_id);
+            }
+        }
+    }
+
+    fn step_strategy() -> impl Strategy<Value = Step> {
+        prop_oneof![
+            Just(Step::LeaveOpen),
+            Just(Step::Cancel),
+            Just(Step::Execute),
+            Just(Step::Expire),
+        ]
+    }
+
+    proptest! {
+        // Each case stands up a fresh `Env` and drives real contract calls, so
+        // the case count is tuned for a useful sequence length rather than
+        // proptest's default 256.
+        #![proptest_config(ProptestConfig::with_cases(48))]
+
+        /// I-7: across an arbitrary interleaving of registrations and
+        /// terminations, every issued id is strictly greater than every id
+        /// issued before it, and `task_count()` counts registrations rather
+        /// than live tasks.
+        #[test]
+        fn property_i7_task_ids_are_strictly_monotonic_and_never_reused(
+            plan in prop::collection::vec(step_strategy(), 1..12usize),
+        ) {
+            let (env, owner, registry_id) = fixture();
+            let registry = KeeperRegistryClient::new(&env, &registry_id);
+
+            let mut issued: Vec<u64> = Vec::new();
+
+            for &step in &plan {
+                let task_id = register(&env, &owner, &registry_id);
+
+                // Strictly greater than the most recent id, and — because the
+                // sequence is strictly increasing — than every id before it.
+                if let Some(&previous) = issued.last() {
+                    prop_assert!(
+                        task_id > previous,
+                        "issued id {} did not exceed the previously issued {}",
+                        task_id,
+                        previous
+                    );
+                }
+                // Stated directly as well, so a regression that broke
+                // monotonicity without breaking the last-id comparison (an
+                // id recycled from further back) still fails here.
+                prop_assert!(
+                    !issued.contains(&task_id),
+                    "issued id {} had already been handed out",
+                    task_id
+                );
+                issued.push(task_id);
+
+                apply(&env, &owner, &registry_id, task_id, step);
+
+                // Holds after the termination too: reaching a terminal state
+                // must not decrement the counter.
+                prop_assert_eq!(registry.task_count(), issued.len() as u64);
+            }
+
+            // `task_count()` after N registrations is N, no matter how many of
+            // those N have since been cancelled, executed, or expired.
+            prop_assert_eq!(registry.task_count(), plan.len() as u64);
+
+            for (index, (&task_id, &step)) in issued.iter().zip(&plan).enumerate() {
+                // Pins the current allocation as the dense `1..=N` sequence.
+                // Stricter than I-7 needs — I-7 only requires uniqueness and
+                // monotonicity — but true today and worth failing loudly on.
+                prop_assert_eq!(task_id, index as u64 + 1);
+
+                // The id is genuinely retired, not freed: a terminated task
+                // still resolves under its own id, in its terminal state.
+                prop_assert_eq!(
+                    registry.get_task(&task_id).status,
+                    step.expected_status()
+                );
+            }
+        }
+    }
+
+    /// I-7 at the last usable id: with the counter one below its ceiling,
+    /// `next_task_id` hands out `u64::MAX` and the task is registered normally.
+    #[test]
+    fn test_next_task_id_at_u64_max_minus_one_issues_u64_max() {
+        let (env, owner, registry_id) = fixture();
+        let registry = KeeperRegistryClient::new(&env, &registry_id);
+
+        set_task_counter(&env, &registry_id, u64::MAX - 1);
+
+        let task_id = register(&env, &owner, &registry_id);
+
+        assert_eq!(task_id, u64::MAX);
+        assert_eq!(registry.task_count(), u64::MAX);
+        assert_eq!(registry.get_task(&task_id).status, TaskStatus::Pending);
+    }
+
+    /// I-7 at the ceiling — **documented decision for issue #86**.
+    ///
+    /// `next_task_id` resolves exhaustion with
+    /// `.expect("task id counter exhausted")`: an untyped panic, not a
+    /// `KeeperError`. That is **accepted as-is; no follow-up issue is filed.**
+    /// The reasoning does not carry over from the `u32` overflows repaired in
+    /// wave 1:
+    ///
+    /// * The counter is a `u64`. Exhausting it takes `2^64 - 1` ≈ 1.8e19
+    ///   *successful* `register_task` calls, each a separate Stellar
+    ///   transaction paying a fee and doing a storage write. At a million
+    ///   registrations per second that is still ~584,000 years. It is not
+    ///   reachable by an attacker with a budget, only by a much older
+    ///   universe.
+    /// * The wave-1 `u32` cases were different in kind: `u32` ledger and
+    ///   amount arithmetic is reachable under ordinary operation, so those
+    ///   genuinely needed typed errors.
+    /// * Converting this to a typed error would widen `register_task`'s error
+    ///   surface with a variant no caller can ever observe, making every
+    ///   caller handle dead code.
+    ///
+    /// The test exists to pin the behavior, so a future refactor that changes
+    /// it fails loudly here instead of silently.
+    #[test]
+    #[should_panic(expected = "task id counter exhausted")]
+    fn test_next_task_id_at_u64_max_panics_by_design() {
+        let (env, owner, registry_id) = fixture();
+
+        set_task_counter(&env, &registry_id, u64::MAX);
+
+        register(&env, &owner, &registry_id);
+    }
+}
