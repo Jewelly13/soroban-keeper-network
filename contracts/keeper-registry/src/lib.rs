@@ -42,7 +42,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, log, symbol_short, token, Address, Bytes,
-    BytesN, Env,
+    BytesN, Env, Vec,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -137,6 +137,25 @@ pub struct Task {
     /// `None` behaves exactly as the pre-verifier MVP: `execute_task` trusts
     /// the claimer's `proof` unconditionally. `Some(addr)` gates crediting
     /// the keeper on `addr.verify(...)` returning `true` — see `execute_task`.
+    pub verifier: Option<Address>,
+}
+
+/// The per-task fields `register_task` takes individually, bundled so
+/// [`KeeperRegistry::batch_register_tasks`] can accept a `Vec` of them.
+///
+/// Deliberately mirrors `register_task`'s parameter list one-for-one (minus
+/// `owner`, which the whole batch shares): the two entry points run the same
+/// validation through [`validate_task_params`], so any field that exists on one
+/// path must exist on the other or they would drift.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct TaskParams {
+    pub task_type: TaskType,
+    pub calldata: Bytes,
+    pub reward: i128,
+    pub deadline: u64,
+    pub ttl_ledgers: u32,
+    pub lock_ledgers: u32,
     pub verifier: Option<Address>,
 }
 
@@ -276,6 +295,17 @@ pub enum KeeperError {
     VerificationFailed = 19,
     /// Arithmetic operation would overflow or underflow.
     ArithmeticOverflow = 20,
+    /// A `batch_register_tasks` call carried more entries than
+    /// [`MAX_BATCH_ENTRIES`].
+    ///
+    /// Exists so an oversized batch fails as a *typed contract error* the
+    /// caller can handle, rather than as an untyped host resource-exhaustion
+    /// trap. See [`MAX_BATCH_ENTRIES`] for why the cap sits where it does.
+    BatchTooLarge = 21,
+    /// The sum of all `reward` fields in a `batch_register_tasks` call exceeded
+    /// the caller-supplied `max_total_reward` ceiling. No entry was registered
+    /// and no escrow was transferred.
+    BatchRewardCeilingExceeded = 22,
     /// The attached verifier reported an `interface_version` other than
     /// [`KEEPER_VERIFIER_INTERFACE_VERSION`]. `verify` was not called.
     IncompatibleVerifierInterface = 21,
@@ -302,6 +332,41 @@ const MAX_LOCK_LEDGERS: u32 = 17_280; // ~1 day
 /// (and its escrowed reward) becoming inaccessible before a keeper can act.
 const MIN_TTL_LEDGERS: u32 = 1_000; // ~83 minutes
 
+/// Hard cap on entries in a single [`KeeperRegistry::batch_register_tasks`]
+/// call, rejected with [`KeeperError::BatchTooLarge`].
+///
+/// This is a *typed-error* guard rail, not the resource ceiling itself.
+/// Without it, an oversized batch fails by exhausting a transaction resource
+/// limit, which surfaces as an untyped host trap the caller cannot distinguish
+/// from a node problem. With it, a caller that overshoots gets an error it can
+/// act on.
+///
+/// ## Why 32
+///
+/// **CPU is not the binding constraint.** `batch_ceiling_is_within_budget` in
+/// `tests/batch_register.rs` measures a full 32-entry batch at ~6.5M CPU
+/// instructions — 6.5% of Soroban's 100M-instruction transaction budget — with
+/// per-entry cost scaling linearly at ~202k instructions. On CPU alone this
+/// could be several hundred entries.
+///
+/// **The footprint is.** Every entry writes one persistent `Task` ledger entry,
+/// and Soroban caps write entries per transaction via the
+/// `txMaxWriteLedgerEntries` network setting. That is a live network config
+/// value, not a compile-time constant, and the local test host does not enforce
+/// it — so it cannot be measured by the tests here and must be respected by
+/// construction instead. 32 leaves room for the batch's own writes plus the
+/// instance entry and the reward token's entries beneath a limit of that
+/// magnitude.
+///
+/// The remaining CPU headroom is not waste: production executes interpreted
+/// WASM, which costs materially more than the natively-compiled contract the
+/// test host measures, so the real-network figure is higher than 6.5%.
+///
+/// A future change that makes per-task registration more expensive shrinks that
+/// headroom and trips `batch_ceiling_is_within_budget`, rather than silently
+/// turning previously-valid batches into resource failures in production.
+pub const MAX_BATCH_ENTRIES: u32 = 32;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Events — emitted for off-chain keeper bots to consume
 // ─────────────────────────────────────────────────────────────────────────────
@@ -310,6 +375,17 @@ pub fn emit_task_registered(e: &Env, task_id: u64, owner: &Address, reward: i128
     e.events().publish(
         (symbol_short!("reg"), symbol_short!("task")),
         (task_id, owner.clone(), reward, deadline),
+    );
+}
+
+/// Fired once per successful `batch_register_tasks` call, in addition to the
+/// per-task `reg`/`task` events every entry still emits. Lets an indexer
+/// recognise that a run of registrations arrived as one atomic batch without
+/// having to infer it from transaction grouping.
+pub fn emit_batch_registered(e: &Env, owner: &Address, count: u32, total_reward: i128) {
+    e.events().publish(
+        (symbol_short!("batchreg"), symbol_short!("task")),
+        (owner.clone(), count, total_reward),
     );
 }
 
@@ -577,6 +653,77 @@ fn required_ttl_ledgers(e: &Env, deadline: u64) -> u64 {
     ledgers_until_deadline + TTL_SAFETY_MARGIN_LEDGERS as u64
 }
 
+/// Validates the parameter-shape rules a task must satisfy at registration.
+///
+/// Single source of truth shared by `register_task` and
+/// `batch_register_tasks`, following the same pattern `fee_bps` established:
+/// the two entry points must never be able to disagree about what a valid task
+/// looks like. Checks run in exactly the order `register_task` used before the
+/// extraction, so the error a given bad input produces is unchanged.
+///
+/// Does *not* include the TTL-covers-deadline rule — see
+/// [`validate_ttl_covers_deadline`] for why that one is applied separately.
+fn validate_task_params(e: &Env, params: &TaskParams) -> Result<(), KeeperError> {
+    if params.reward <= 0 {
+        return Err(KeeperError::InvalidReward);
+    }
+    let min_reward: i128 = e.storage().instance().get(&DataKey::MinReward).unwrap_or(0);
+    if params.reward < min_reward {
+        return Err(KeeperError::InvalidReward);
+    }
+    if params.deadline <= e.ledger().timestamp() {
+        return Err(KeeperError::DeadlinePassed);
+    }
+    if params.calldata.len() > MAX_CALLDATA_LEN {
+        return Err(KeeperError::CalldataTooLarge);
+    }
+    if !(MIN_LOCK_LEDGERS..=MAX_LOCK_LEDGERS).contains(&params.lock_ledgers) {
+        return Err(KeeperError::InvalidTaskParams);
+    }
+    if params.ttl_ledgers < MIN_TTL_LEDGERS {
+        return Err(KeeperError::InvalidTaskParams);
+    }
+    Ok(())
+}
+
+/// The TTL-covers-deadline rule (see [`required_ttl_ledgers`]).
+///
+/// Kept out of [`validate_task_params`] purely to preserve `register_task`'s
+/// original check ordering: this rule was applied *after* the `RewardToken`
+/// lookup, so on an uninitialized registry `NotInitialized` wins over
+/// `TtlTooShort`. Folding it into the earlier block would silently reorder
+/// those two errors.
+fn validate_ttl_covers_deadline(e: &Env, params: &TaskParams) -> Result<(), KeeperError> {
+    if (params.ttl_ledgers as u64) < required_ttl_ledgers(e, params.deadline) {
+        return Err(KeeperError::TtlTooShort);
+    }
+    Ok(())
+}
+
+/// Allocates an id, writes the task record, and emits its registration event.
+///
+/// Assumes validation and escrow transfer have already happened — it is the
+/// "effects" half that `register_task` and `batch_register_tasks` share.
+fn create_task(e: &Env, owner: &Address, params: TaskParams) -> u64 {
+    let task_id = next_task_id(e);
+    let task = Task {
+        owner: owner.clone(),
+        task_type: params.task_type,
+        calldata: params.calldata,
+        reward: params.reward,
+        deadline: params.deadline,
+        ttl_ledgers: params.ttl_ledgers,
+        status: TaskStatus::Pending,
+        claimer: None,
+        claim_ledger: None,
+        lock_ledgers: params.lock_ledgers,
+        verifier: params.verifier,
+    };
+    save_task(e, task_id, &task);
+    emit_task_registered(e, task_id, owner, task.reward, task.deadline);
+    task_id
+}
+
 fn load_task(e: &Env, task_id: u64) -> Result<Task, KeeperError> {
     e.storage()
         .persistent()
@@ -832,54 +979,126 @@ impl KeeperRegistry {
         require_not_paused(&e)?;
         owner.require_auth();
 
-        if reward <= 0 {
-            return Err(KeeperError::InvalidReward);
-        }
-        let min_reward: i128 = e.storage().instance().get(&DataKey::MinReward).unwrap_or(0);
-        if reward < min_reward {
-            return Err(KeeperError::InvalidReward);
-        }
-        if deadline <= e.ledger().timestamp() {
-            return Err(KeeperError::DeadlinePassed);
-        }
-        if calldata.len() > MAX_CALLDATA_LEN {
-            return Err(KeeperError::CalldataTooLarge);
-        }
-        if !(MIN_LOCK_LEDGERS..=MAX_LOCK_LEDGERS).contains(&lock_ledgers) {
-            return Err(KeeperError::InvalidTaskParams);
-        }
-        if ttl_ledgers < MIN_TTL_LEDGERS {
-            return Err(KeeperError::InvalidTaskParams);
-        }
-
-        bump_instance(&e);
-
-        // Escrow the reward from the owner into this contract.
-        let token = reward_token(&e)?;
-        if (ttl_ledgers as u64) < required_ttl_ledgers(&e, deadline) {
-            return Err(KeeperError::TtlTooShort);
-        }
-        token.transfer(&owner, &e.current_contract_address(), &reward);
-
-        let task_id = next_task_id(&e);
-        let task = Task {
-            owner: owner.clone(),
+        let params = TaskParams {
             task_type,
             calldata,
             reward,
             deadline,
             ttl_ledgers,
-            status: TaskStatus::Pending,
-            claimer: None,
-            claim_ledger: None,
             lock_ledgers,
             verifier,
         };
-        save_task(&e, task_id, &task);
-        emit_task_registered(&e, task_id, &owner, reward, deadline);
+        validate_task_params(&e, &params)?;
+
+        bump_instance(&e);
+
+        // Escrow the reward from the owner into this contract.
+        let token = reward_token(&e)?;
+        validate_ttl_covers_deadline(&e, &params)?;
+        token.transfer(&owner, &e.current_contract_address(), &params.reward);
+
+        let reward = params.reward;
+        let task_id = create_task(&e, &owner, params);
 
         log!(&e, "Task {} registered reward={}", task_id, reward);
         Ok(task_id)
+    }
+
+    // ── batch_register_tasks ─────────────────────────────────────────────────
+    //
+    // Registers many tasks for one owner in a single transaction, amortizing
+    // the per-transaction overhead a dApp would otherwise pay once per task.
+    //
+    // Arguments:
+    //   owner            — address funding every task in the batch (auths once)
+    //   tasks            — per-entry parameters; see `TaskParams`
+    //   max_total_reward — ceiling the caller commits to upfront; the batch is
+    //                      rejected outright if the entries sum above it
+    //
+    // Returns the new task ids in input order, so a caller can correlate
+    // `result[i]` with `tasks[i]`.
+
+    /// Registers a batch of tasks atomically.
+    ///
+    /// ## Auth model
+    /// Every entry shares one `owner`, who authorizes once for the whole batch.
+    /// That is the point of the entry point, but it means the owner signs for a
+    /// total they cannot see in the signature payload alone. `max_total_reward`
+    /// is the mitigation: the owner commits to a ceiling upfront, and the call
+    /// is rejected if the entries sum above it. An owner reviewing a batch
+    /// therefore bounds their escrow exposure regardless of what the entries
+    /// turn out to contain.
+    ///
+    /// ## All-or-nothing
+    /// Soroban transactions are atomic: returning `Err` from an entry point
+    /// discards every state change and token transfer made during the call. So
+    /// partial success is not merely undesirable here, it is not expressible —
+    /// there is no way for some entries to commit while others fail. Validation
+    /// is nonetheless run over *all* entries before *any* transfer, so the
+    /// common rejection paths never touch the token contract at all rather than
+    /// relying on rollback to undo transfers.
+    ///
+    /// An empty batch is accepted as a no-op returning an empty vector. A dApp
+    /// looping over a possibly-empty work list should not have to special-case
+    /// it, and a no-op cannot violate any accounting invariant.
+    ///
+    /// ## Ordering
+    /// Ids are allocated in input order, so `result.get(i)` is the id of
+    /// `tasks.get(i)`.
+    pub fn batch_register_tasks(
+        e: Env,
+        owner: Address,
+        tasks: Vec<TaskParams>,
+        max_total_reward: i128,
+    ) -> Result<Vec<u64>, KeeperError> {
+        require_not_paused(&e)?;
+        owner.require_auth();
+
+        if tasks.len() > MAX_BATCH_ENTRIES {
+            return Err(KeeperError::BatchTooLarge);
+        }
+
+        bump_instance(&e);
+        let token = reward_token(&e)?;
+
+        // ── Phase 1: validate everything, transfer nothing ───────────────────
+        //
+        // Runs the identical checks `register_task` applies, via the same
+        // helpers, so a batch can never accept an entry the single-task path
+        // would reject. Summing here also means the ceiling is enforced before
+        // the token contract is touched.
+        let mut total_reward: i128 = 0;
+        for params in tasks.iter() {
+            validate_task_params(&e, &params)?;
+            validate_ttl_covers_deadline(&e, &params)?;
+            total_reward = total_reward
+                .checked_add(params.reward)
+                .ok_or(KeeperError::ArithmeticOverflow)?;
+        }
+        if total_reward > max_total_reward {
+            return Err(KeeperError::BatchRewardCeilingExceeded);
+        }
+
+        // ── Phase 2: escrow and create ───────────────────────────────────────
+        //
+        // One transfer per entry, mirroring what N separate `register_task`
+        // calls would do. Collapsing these into a single transfer of
+        // `total_reward` is deliberately left to issue 0115, which weighs it
+        // against this contract's per-task escrow accounting.
+        let mut task_ids = Vec::new(&e);
+        for params in tasks.iter() {
+            token.transfer(&owner, &e.current_contract_address(), &params.reward);
+            task_ids.push_back(create_task(&e, &owner, params));
+        }
+
+        emit_batch_registered(&e, &owner, task_ids.len(), total_reward);
+        log!(
+            &e,
+            "Batch registered {} tasks total_reward={}",
+            task_ids.len(),
+            total_reward
+        );
+        Ok(task_ids)
     }
 
     // ── increase_reward ──────────────────────────────────────────────────────
