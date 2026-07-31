@@ -1,16 +1,20 @@
 # Batch Operations Design & Integration Guide (E05)
 
-**Status: proposed design, not implemented.** `batch_register_tasks` does not
-exist in `contracts/keeper-registry/src/lib.rs` yet — the README's Phase 2
-Roadmap still lists "Batch task registration" as unchecked. This document
-answers issue 0097's design questions and issue 0108's integration-guide ask
-together, pinning the interface on paper before issue 0098 implements it —
-the same pattern `docs/VERIFIER_DESIGN.md` used for the E04 verifier field.
-**No contract code changes are made by this document.**
+**Status: implemented.** `batch_register_tasks` now exists in
+`contracts/keeper-registry/src/lib.rs`, together with the `MAX_BATCH_SIZE`
+guard and the `max_total_reward` ceiling this document specified. This
+document originally answered issue 0097's design questions and issue 0108's
+integration-guide ask by pinning the interface on paper — the same pattern
+`docs/VERIFIER_DESIGN.md` used for the E04 verifier field — and it is now
+also the reference for the shipped behaviour.
 
-Everything below that describes calling `batch_register_tasks` is what the
-API is expected to look like once 0098/0103/0104 land, not something you can
-call against the contract today.
+One caveat carried over from the design phase: the batch-size ceiling
+(`MAX_BATCH_SIZE`, currently **50**) is a *conservative, not yet empirically
+measured* bound. Measuring the real ceiling against Soroban's per-transaction
+budget is issue 0104's job (see §4); until it lands, treat 50 as a safety
+guard, not a tuned optimum. Callers should read it from the contract via the
+`max_batch_size()` view rather than hardcoding it, so a later revision does
+not silently invalidate their chunking logic.
 
 ## 1. Why batch registration
 
@@ -70,10 +74,25 @@ and resubmits the whole batch.
 
 ## 4. Resource ceiling
 
-**Not yet empirically measurable** — an empirical number requires an actual
-`batch_register_tasks` implementation to measure against Soroban's
-per-transaction CPU/memory budget, which is issue 0104's job once 0098
-lands. What can be stated now, to guide implementation:
+**Enforced at 50 entries (`MAX_BATCH_SIZE`), not yet empirically tuned.** The
+contract rejects a batch over that size with `KeeperError::BatchTooLarge`
+before doing any work, so an oversized batch fails with an actionable typed
+error rather than an opaque host-level resource-exhaustion failure. Measuring
+the *real* ceiling against Soroban's per-transaction CPU/memory budget remains
+issue 0104's job; 50 is deliberately conservative until then. What informs it:
+
+- Entry count is only half the story. Each entry writes one `Task`, whose
+  `calldata` alone may be up to `MAX_CALLDATA_LEN` (1024) bytes — 50 entries
+  is already ~50 KB of ledger writes before the rest of the `Task` struct, the
+  per-entry token transfer, and the per-entry event are counted. A batch of
+  small-`calldata` entries has far more headroom than a batch of
+  maximum-sized ones, and a caller who packs both large payloads and many
+  entries can still exhaust the budget *below* the 50-entry cap.
+- Read the cap from the contract (`max_batch_size()`) rather than hardcoding
+  50, so issue 0104's revision does not silently break your chunking.
+
+The rest of this section is the original design-phase reasoning, retained
+because it is what issue 0104 should follow when it measures:
 
 - `register_task`'s own per-call cost (auth, one storage write of a
   `Task`-sized value, one TTL bump, one event) is the per-entry unit cost a
@@ -93,11 +112,11 @@ lands. What can be stated now, to guide implementation:
   a dApp should apply, using a placeholder ceiling — substitute the real
   number issue 0104 measures and documents.
 
-**The contract should enforce an explicit `MAX_BATCH_SIZE` constant**, sized
+**The contract enforces an explicit `MAX_BATCH_SIZE` constant**, to be resized
 from that measurement with headroom, so a caller that submits too large a
-batch gets a clear typed error (e.g. `KeeperError::BatchTooLarge`) rather
-than an opaque host-level resource-exhaustion failure. This is what issue
-0104's regression test is pinning against.
+batch gets a clear typed error (`KeeperError::BatchTooLarge`) rather than an
+opaque host-level resource-exhaustion failure. This is what issue 0104's
+regression test pins against.
 
 ## 5. Return shape
 
@@ -106,7 +125,7 @@ the same order as the input `tasks` vector, so the caller can zip its own
 input list against the result to know which task id corresponds to which
 entry it submitted.
 
-## 6. Pinned function signature
+## 6. Function signature (as shipped)
 
 ```rust
 /// One entry in a `batch_register_tasks` call — the same fields
@@ -133,7 +152,31 @@ pub fn batch_register_tasks(
     tasks: Vec<BatchTaskParams>,
     max_total_reward: i128,
 ) -> Result<Vec<u64>, KeeperError>;
+
+/// Read-only: the deployed contract's own `MAX_BATCH_SIZE`. Chunk against
+/// this rather than a hardcoded constant.
+pub fn max_batch_size(e: Env) -> u32;
 ```
+
+### Error variants introduced
+
+| Variant | Discriminant | Raised when |
+|---|---|---|
+| `BatchTooLarge` | 20 | `tasks.len() > MAX_BATCH_SIZE` |
+| `EmptyBatch` | 21 | `tasks` is empty — rejected rather than treated as a no-op, so a caller whose off-chain filter produced nothing finds out instead of paying for a transaction that registered nothing |
+| `BatchRewardCeilingExceeded` | 22 | `sum(tasks[].reward) > max_total_reward` |
+
+A batch also returns any of `register_task`'s existing per-entry errors
+(`InvalidReward`, `DeadlinePassed`, `CalldataTooLarge`, `InvalidTaskParams`),
+plus `ContractPaused` and `InvalidReward` for a non-positive
+`max_total_reward`. Per-entry validation is shared with `register_task`
+through one internal helper, so the two paths cannot drift into accepting
+different task shapes.
+
+**Validation happens before any transfer.** The implementation sweeps every
+entry and totals the rewards up front, then checks the ceiling, and only then
+performs the escrow transfers. A batch that will be rejected therefore never
+pays for even one cross-contract token transfer first.
 
 ## 7. `max_total_reward` and batch-size tradeoffs
 
@@ -170,15 +213,14 @@ Scenario: a lending protocol has identified 40 undercollateralized positions
 after a price move and needs a liquidation task registered for each one,
 in one submission rather than 40 separate transactions.
 
-**Sizing against the ceiling (§4):** once issue 0104 measures and documents
-the real practical ceiling, sizing is a single division. Illustrating with a
-placeholder ceiling of 150 entries per call (substitute the real, documented
-number): this dApp's 40 positions fit in one batch, well under budget. If the
-same dApp instead had 500 positions to register, it would split into
-`ceil(500 / 150) = 4` batches of at most 150 entries each, computing a
-separate `max_total_reward` per batch (the sum of *that batch's* rewards
-only — never the sum across batches, since each is an independent atomic
-call per §3).
+**Sizing against the ceiling (§4):** sizing is a single division against the
+enforced `MAX_BATCH_SIZE` (currently 50 — read it from `max_batch_size()`
+rather than hardcoding, since issue 0104 may revise it). This dApp's 40
+positions fit in one batch. If the same dApp instead had 500 positions to
+register, it would split into `ceil(500 / 50) = 10` batches of at most 50
+entries each, computing a separate `max_total_reward` per batch (the sum of
+*that batch's* rewards only — never the sum across batches, since each is an
+independent atomic call per §3).
 
 ### Raw contract-call context (Rust cross-contract call)
 

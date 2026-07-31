@@ -112,7 +112,7 @@ A **shared, permissionless, on-chain coordination layer** where:
 ### Phase 2 (Roadmap)
 
 - [ ] **On-chain execution verifier interface** — target contracts implement `IKeeperVerifier` and the registry calls them to verify execution succeeded
-- [ ] **Batch task registration** — register multiple tasks in one transaction
+- [x] **Batch task registration** — `batch_register_tasks` registers up to `MAX_BATCH_SIZE` tasks in one transaction under a single owner auth, with a `max_total_reward` escrow ceiling (see [docs/BATCH_OPERATIONS.md](docs/BATCH_OPERATIONS.md))
 - [ ] **EIP-like task conditions** — on-chain `checkUpkeep` callback before claiming
 - [ ] **Keeper reputation scores** — slash stake for missed executions
 - [ ] **Keeper staking** — stake XLM or governance token for priority and dispute resolution
@@ -275,21 +275,24 @@ A **shared, permissionless, on-chain coordination layer** where:
 - `transfer_admin` MUST require auth from BOTH current admin AND new admin.
 - `upgrade` MUST use `deployer().update_current_contract_wasm`.
 
-#### Planned: FR-8 — Batch Task Registration (not yet implemented)
+#### FR-8 — Batch Task Registration
 
-`batch_register_tasks` is design-only at this point (see
-[docs/BATCH_OPERATIONS.md](docs/BATCH_OPERATIONS.md)) — the Phase 2 roadmap
-item above — and is not part of the deployed contract. Once implemented, the
-normative requirements are expected to read:
+`batch_register_tasks` is implemented; see
+[docs/BATCH_OPERATIONS.md](docs/BATCH_OPERATIONS.md) for the full design and
+integration guide.
 - `batch_register_tasks` MUST require the owner's auth once for the entire
   batch, not per entry.
 - MUST reject the whole call, with zero transfers, if the sum of the
   batch's rewards exceeds the caller-supplied `max_total_reward`.
+- MUST reject the whole call, with zero transfers, if any single entry fails
+  the same validation `register_task` applies.
+- MUST reject a batch larger than `MAX_BATCH_SIZE` with `BatchTooLarge`,
+  rather than letting it fail as opaque resource exhaustion.
 - MUST return task ids in the same order as the input entries.
 
-This entry is recorded ahead of implementation, in the same spirit as this
-section's other entries being a testable spec — but it is **not** a live
-requirement of the current contract until issue 0098 lands.
+Note that `MAX_BATCH_SIZE` is currently a conservative guard rather than a
+measured ceiling — issue 0104 owns the empirical measurement. Read the live
+value from the `max_batch_size()` view instead of hardcoding it.
 
 ---
 
