@@ -414,7 +414,7 @@ fn fee_bps(e: &Env) -> u32 {
 /// the separate `keeper-registry-fuzz` crate can call the exact same
 /// arithmetic the contract itself uses, rather than reimplementing the
 /// formula and risking the two drifting apart.
-pub fn split_reward(reward: i128, fee_bps: u32) -> (i128, i128) {
+pub fn split_reward(reward: i128, fee_bps: u32) -> Result<(i128, i128), KeeperError> {
     let fee = reward
         .checked_mul(fee_bps as i128)
         .ok_or(KeeperError::ArithmeticOverflow)?
