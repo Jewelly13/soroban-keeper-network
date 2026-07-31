@@ -476,3 +476,164 @@ with a before/after to point at.
 
 Filed as its own implementation issue:
 [`.github/backlog/issues/0202-batch-register-collapse-escrow-transfers.md`](../.github/backlog/issues/0202-batch-register-collapse-escrow-transfers.md).
+
+---
+
+## 10. Feasibility — batch cancel for an owner's own pending tasks
+
+**Study, not a change.** Issue 0099 examined batch claim and batch execute and
+found both risky: they are permissionless, contested between competing keepers,
+and an all-or-nothing batch turns one lost race into N lost claims.
+`cancel_task` has none of that risk profile. It is single-owner,
+single-auth, and only ever touches tasks the caller already owns — Pending
+ones, or Claimed ones whose lock window has lapsed. So the atomicity objections
+from 0099 mostly do not apply, and the question becomes whether
+`batch_cancel_tasks` is worth building on its own merits.
+
+### 10.1 Is there real demand?
+
+The motivating case is a dApp winding down: a lending protocol that registered
+40 liquidation-watch tasks after a market move, then saw the price recover and
+wants its escrow back rather than leaving 40 bounties outstanding. Today that
+is 40 transactions, 40 signatures, 40 fees.
+
+But unlike registration, cancellation has a **free alternative**:
+`expire_task` is permissionless and refunds the owner. An owner who simply
+waits for the deadline gets every task's escrow back without signing or paying
+for anything — a keeper bot scanning for work will typically expire stale tasks
+as a courtesy (`examples/keeper-bot` does exactly this). Batch registration has
+no such fallback: tasks do not register themselves.
+
+So the demand is narrower than for registration, and it reduces to one thing:
+**how much the owner values getting its capital back now rather than at the
+deadline.** For a protocol with 40 × 1 XLM outstanding and a 1-hour deadline,
+the answer is "not much". For one running long-dated tasks (`ttl_ledgers` and
+deadlines measured in days) with meaningful sums escrowed, waiting out the
+deadline is a real balance-sheet cost, and the alternative is paying N
+transaction fees to unwind. That case is real but not universal.
+
+Secondary, and worth naming because it is not about capital: an owner
+correcting a mistake — 40 tasks registered with wrong calldata — wants them
+gone *now*, before a keeper executes against the bad payload and earns the
+bounty. Deadline-waiting does not help there, because the failure mode is
+execution, not expiry.
+
+### 10.2 Is the implementation as simple as it looks?
+
+The naive shape is "loop the existing single-task validation and refund logic,
+all under one owner auth", and structurally that is right. The per-task work
+is unchanged: check owner, check status (Pending, or Claimed with an elapsed
+lock), mark Cancelled, save, refund.
+
+**But the reentrancy question is not answerable by "cancel_task is simple",
+and batching does change the analysis.** Working through it properly:
+
+`cancel_task` today is CEI-ordered: it writes `status = Cancelled` and saves
+*before* calling `token.transfer`. A re-entrant `cancel_task` for the same id
+finds the task already Cancelled and is rejected by the status guard. That is
+the property the comment in `contracts/keeper-registry/src/lib.rs` claims, and
+it holds.
+
+Now batch it. A loop of `{validate, mark, save, transfer}` performs **N
+transfers, and therefore opens N re-entry windows in one transaction**, where
+`cancel_task` opens one. Each window is entered mid-batch, with tasks `1..i`
+already Cancelled-and-refunded and tasks `i+1..N` still Pending. Three things
+to check:
+
+1. **Can a re-entrant call double-refund a task the outer loop already
+   handled?** No. Those tasks are already `Cancelled` in storage — the write
+   happened before the transfer that opened the window. The status guard
+   rejects them. This is exactly the single-task guarantee, and batching does
+   not weaken it.
+
+2. **Can a re-entrant call cancel a task the outer loop has not reached yet,
+   and cause a double refund when the loop gets there?** This is the one that
+   matters, and **the answer depends on an implementation detail that the
+   naive shape gets wrong.**
+
+   If the batch loads all N tasks up front — the natural "gather, validate,
+   then refund" structure, and the one that makes the up-front validation
+   sweep in `batch_register_tasks` (§6) look like the pattern to copy — then
+   the loop is working from a **stale snapshot**. A re-entrant cancel of task
+   `j > i` would mark `j` Cancelled and refund it; the outer loop would later
+   reach its cached copy of `j`, still showing `Pending`, mark it Cancelled
+   again, and refund it a **second time**. The status guard never fires,
+   because it was evaluated against the snapshot. That is a straightforward
+   double-spend out of pooled escrow, and it breaks I-1.
+
+   If instead each iteration loads the task fresh from storage immediately
+   before validating it, the re-entrant cancel is visible: the outer loop's
+   load returns `Cancelled`, the status guard rejects, and the whole batch
+   reverts atomically. Safe.
+
+   So: **`batch_cancel_tasks` must load each task inside the loop, not
+   pre-load a snapshot.** This is the opposite of what `batch_register_tasks`
+   does, and for a good reason — registration validates *inputs*, which cannot
+   change under it, while cancellation validates *stored state*, which can.
+   Anyone copying the registration structure onto cancellation would introduce
+   this bug, which is precisely why the question was worth asking rather than
+   waving through.
+
+3. **Does anything about the CEI discussion in issues 0002/0057 change?** The
+   ordering rule itself does not: effects before interaction, per task. What
+   changes is that the batch now interleaves *another task's* effects after
+   an interaction, so "CEI holds for this function" has to be read as "CEI
+   holds for each iteration, and no iteration's interaction can invalidate a
+   later iteration's checks" — which is point 2, and which the fresh-load
+   requirement is what actually secures.
+
+Note that a re-entrant `cancel_task` also needs its own owner authorization to
+succeed at all: Soroban's auth framework scopes auth to a specific invocation,
+so a nested call from the token contract is not covered by the outer batch's
+auth entry. That makes the attack require either a contract account with a
+permissive `__check_auth`, or an owner who signed for it. **This is a mitigating
+factor, not the guarantee** — the fresh-load requirement should stand on its own
+rather than resting on an auth argument about a malicious reward token, since
+the reward token is admin-configured and a compromised or malicious one is
+exactly the threat model CEI exists for.
+
+### 10.3 The refunds should be collapsed, and here it is strictly safer
+
+§9 recommended collapsing `batch_register_tasks`' N inbound transfers into one.
+For cancellation the same move is available and the security argument is
+*stronger*, not merely neutral:
+
+- Mark all N tasks Cancelled and save them, accumulating the total refund.
+- Then perform **one** transfer of `sum(refunds)` to the owner.
+
+That reduces the re-entry windows from N to exactly one, and places that single
+window *after every effect in the call* — textbook checks-effects-interactions,
+and a better posture than `cancel_task` × N achieves today across N separate
+transactions. It also sidesteps point 2 entirely: with all writes committed
+before any transfer, there is no "task the loop has not reached yet".
+
+The §9.2 hazard transfers across too: the summed refund becomes the money, so
+the total must be accumulated from the same `task.reward` values that were
+written, and an I-1 assertion after a batch cancel is the test that catches the
+whole class of bug.
+
+### 10.4 Recommendation
+
+**Build it** — but rank it below the outstanding measurement work (issue 0104)
+and the §9 transfer collapse (issue 0202), and only with the constraints below,
+which are what make it safe rather than merely simple.
+
+Reasoning:
+
+- The risk profile genuinely differs from 0099's batch claim/execute. There is
+  no cross-keeper race to lose: the caller owns every task, holds sole
+  authority over it, and no competing party can invalidate an entry between
+  simulation and submission. All-or-nothing atomicity, which was the fatal
+  flaw for batch claim, is here just the same semantics `cancel_task` already
+  has.
+- The demand is real but narrower than for registration (§10.1), because
+  `expire_task` gives owners a free unwind path that registration has no
+  analogue for. That is the reason to rank it below 0104/0202, not a reason to
+  decline it.
+- The reentrancy analysis (§10.2) turns up a concrete, non-obvious bug that a
+  reasonable implementer would write, which is an argument for building it
+  *deliberately with that constraint documented* rather than leaving it to be
+  filed later by someone who did not do this analysis.
+
+Filed as its own implementation issue:
+[`.github/backlog/issues/0203-batch-cancel-tasks.md`](../.github/backlog/issues/0203-batch-cancel-tasks.md).

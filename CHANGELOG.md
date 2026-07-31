@@ -76,6 +76,20 @@ guidance: [docs/BATCH_OPERATIONS.md](docs/BATCH_OPERATIONS.md).
   a silent solvency violation rather than a wrong ceiling check. Filed as
   backlog issue 0202.
 
+### Added — batch cancel feasibility study
+
+- [docs/BATCH_OPERATIONS.md](docs/BATCH_OPERATIONS.md) §10: is a
+  `batch_cancel_tasks` worth building, given that issue 0099's cross-keeper
+  race objections do not apply to a single-owner, single-auth operation?
+  Recommends building it, ranked below issues 0104 and 0202, and filed as
+  backlog issue 0203. The reentrancy question is answered rather than assumed
+  away: batching turns one re-entry window into N, and a "gather, then refund"
+  structure copied from `batch_register_tasks` is a **double-spend** — a
+  re-entrant cancel of a not-yet-reached task refunds it, and the outer loop
+  then refunds its stale cached copy again. Each task must be loaded fresh
+  inside the loop; collapsing the refunds into one transfer after all effects
+  removes the window class entirely.
+
 ### Fixed — restore work silently reverted by an unrelated merge
 
 - `split_reward`'s return type (`Result<(i128, i128), KeeperError>`) and its
