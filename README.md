@@ -20,6 +20,9 @@
 | [Architecture](docs/ARCHITECTURE.md) | Components, task lifecycle, storage, money invariants, trust model |
 | [Fuzzing & property testing](docs/FUZZING.md) | Running/adding fuzz targets, the shared invariant module, crash-to-regression convention |
 | [Verifier design (E04)](docs/VERIFIER_DESIGN.md) | Proposed `IKeeperVerifier` interface for optional on-chain proof verification |
+| [Batch operations (E05)](docs/BATCH_OPERATIONS.md) | Proposed `batch_register_tasks` design + integration guide |
+| [Storage layout survey](docs/STORAGE_LAYOUT.md) | `Task` struct storage-cost findings and recommendations |
+| [CI](docs/CI.md) | What each CI job checks and which are advisory vs. required |
 | [Deploying & running](docs/DEPLOYING.md) | Testnet deploy walkthrough and keeper-bot operator guide |
 | [Deployments](DEPLOYMENTS.md) | Canonical record of on-chain addresses |
 | [Contributing](CONTRIBUTING.md) | How to pick up an issue and open your first PR |
@@ -271,6 +274,22 @@ A **shared, permissionless, on-chain coordination layer** where:
 - `set_fee_bps` MUST reject values > 10 000.
 - `transfer_admin` MUST require auth from BOTH current admin AND new admin.
 - `upgrade` MUST use `deployer().update_current_contract_wasm`.
+
+#### Planned: FR-8 — Batch Task Registration (not yet implemented)
+
+`batch_register_tasks` is design-only at this point (see
+[docs/BATCH_OPERATIONS.md](docs/BATCH_OPERATIONS.md)) — the Phase 2 roadmap
+item above — and is not part of the deployed contract. Once implemented, the
+normative requirements are expected to read:
+- `batch_register_tasks` MUST require the owner's auth once for the entire
+  batch, not per entry.
+- MUST reject the whole call, with zero transfers, if the sum of the
+  batch's rewards exceeds the caller-supplied `max_total_reward`.
+- MUST return task ids in the same order as the input entries.
+
+This entry is recorded ahead of implementation, in the same spirit as this
+section's other entries being a testable spec — but it is **not** a live
+requirement of the current contract until issue 0098 lands.
 
 ---
 
