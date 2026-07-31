@@ -356,7 +356,8 @@ All events use two-topic format `(verb_symbol, noun_symbol)` for efficient filte
 
 ```text
 contracts/keeper-registry/  Soroban keeper registry contract
-examples/keeper-bot/         Example keeper bot
+examples/keeper-bot/         Example keeper bot (keeper side)
+examples/batch-register/     Batch registration helper (task-owner side)
 a fuzz/                        Fuzzing targets and shared support code
 docs/                        Architecture, deployment, and demo documentation
 ```
@@ -554,6 +555,22 @@ npm install
 cp .env.example .env
 # Edit .env with your secret key and contract ID
 npm run start:testnet
+```
+
+### Registering Tasks in Bulk
+
+The owner-side counterpart: reads a JSON or CSV task list and registers the
+whole list in one `batch_register_tasks` call. See
+[examples/batch-register/README.md](examples/batch-register/README.md) for the
+file format and the reasoning behind how it sets `max_total_reward`.
+
+```bash
+cd examples/batch-register
+npm install
+cp .env.example .env
+# Edit .env with your funded owner secret key and contract ID
+node index.js tasks.example.json --dry-run   # validate + preview
+node index.js tasks.example.json             # submit
 ```
 
 ---

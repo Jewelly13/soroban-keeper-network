@@ -261,6 +261,15 @@ match registry.try_batch_register_tasks(&env.current_contract_address(), &tasks,
 }
 ```
 
+### Off-chain context (Node.js)
+
+A runnable owner-side script implementing exactly this flow — reading a task
+list from JSON or CSV, validating entries locally, chunking against
+`max_batch_size()`, and reporting the returned ids — lives in
+[`examples/batch-register/`](../examples/batch-register/README.md). Its README
+covers the file format and walks through the `max_total_reward` choice in §7
+terms.
+
 ### Raw contract-call context (Soroban CLI)
 
 ```bash
