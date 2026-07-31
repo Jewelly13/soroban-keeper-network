@@ -1,230 +1,248 @@
-# Batch Operations (E05)
+# Batch Operations Design & Integration Guide (E05)
 
-Design record and epic retrospective for batch entry points on the keeper
-registry. This document is the decision surface for epic E05: what was built,
-what was studied, and what was explicitly declined so those negative results
-stay discoverable.
+**Status: proposed design, not implemented.** `batch_register_tasks` does not
+exist in `contracts/keeper-registry/src/lib.rs` yet — the README's Phase 2
+Roadmap still lists "Batch task registration" as unchecked. This document
+answers issue 0097's design questions and issue 0108's integration-guide ask
+together, pinning the interface on paper before issue 0098 implements it —
+the same pattern `docs/VERIFIER_DESIGN.md` used for the E04 verifier field.
+**No contract code changes are made by this document.**
 
-## Status
+Everything below that describes calling `batch_register_tasks` is what the
+API is expected to look like once 0098/0103/0104 land, not something you can
+call against the contract today.
 
-Epic E05 ships **batch registration** (`batch_register_tasks`) and
-`claim_first_available` as the only multi-task claim helper. Naive batch claim,
-batch execute, batch cancel, and collapsed escrow transfers were studied and
-**declined** (see [Epic E05 retrospective](#epic-e05-retrospective)).
+## 1. Why batch registration
 
-## `batch_register_tasks` design
+`register_task` pays a fixed per-call overhead — owner auth, one storage
+write, one instance TTL bump, one event — for every single task. A dApp with
+many similar tasks to register at once (e.g. a lending protocol opening N
+liquidation watches after a market listing) pays that overhead N times over
+N separate transactions. `batch_register_tasks` amortizes it: one auth, one
+transaction, N storage writes.
 
-### Motivation
+## 2. Auth model
 
-A dApp registering many similar tasks currently pays full per-call overhead
-(`require_auth`, instance bumps, events) once per `register_task`. A batch
-entry point amortizes that fixed cost inside one transaction while preserving
-the same per-task validation and escrow accounting as the single-task path.
+**The batch shares one owner and one auth**, exactly like a single
+`register_task` call: `owner.require_auth()` is checked once for the whole
+batch, not once per entry. This matches the existing single-task UX and
+avoids requiring N separate signatures for what the caller intends as one
+logical action.
 
-### Auth model
+The risk this creates: an owner reviews and signs a transaction containing
+batch contents at simulation time, but (in principle) the batch's *effect* —
+total escrow pulled — could differ from what was reviewed if the entries
+were mutated between simulation and submission. Soroban authorization is
+scoped to the specific invocation's arguments (the signed auth entry commits
+to the exact `tasks` vector and its rewards), so unlike an ERC-20-style
+unlimited approval, this is **not** the same class of risk as an approve/
+transferFrom mismatch — the signature is over the actual argument bytes, so
+the batch itself cannot be silently swapped for a different one without
+invalidating the signature. `max_total_reward` (§6, from issue 0103) exists
+as an explicit, human-readable ceiling on top of that: even correctly-signed
+batch contents get an extra sum check the caller doesn't have to reason
+through the full argument encoding to verify at a glance.
 
-All entries in one call share a single `owner`. That owner authorizes once for
-the whole batch. To prevent a crafted payload from escrowing more than the
-owner intended (for example if transaction contents change between review and
-submission), the call takes an explicit `max_total_reward: i128` ceiling. Before
-any token transfer, the sum of entry rewards is checked against that ceiling;
-exceeding it rejects the entire call with no transfers.
+## 3. Partial-failure semantics
 
-### Partial-failure semantics
+**Whole-batch atomicity — no partial success.** A Soroban contract
+invocation is atomic by construction: if the function returns `Err`, the
+host reverts every storage write and token transfer the call made, and none
+of it lands on-chain. There is no host-level primitive for "commit entries
+1–7, skip entry 8" within a single function call — partial success would
+have to be hand-rolled by catching per-entry failures and choosing to
+continue, which this design rejects for two reasons:
 
-Soroban transactions are atomic. Partial success inside one contract call is
-not a meaningful alternative without inventing a custom per-entry result model
-that still commits storage and transfers for the successes — which would
-complicate solvency (I-1) and the "no silent partial escrow" guarantee.
+- It would mean a batch could pull escrow from the owner for M ≤ N tasks
+  while silently dropping the rest, requiring the caller's off-chain code to
+  reconcile which task ids were actually created — the same "did my batch
+  partially land" bookkeeping problem `execute_task`'s all-or-nothing
+  design already avoids for a single task.
+- `register_task`'s existing semantics are all-or-nothing per call; batching
+  should not introduce a second, inconsistent failure model alongside it.
 
-**Decision: all-or-nothing.** Every entry is validated first; only if the whole
-batch is valid do transfers and storage writes proceed. Any invalid entry (or
-ceiling breach) reverts the call with a typed error and zero token movement.
+If any entry has an invalid `reward` (`<= 0` or below `MinReward`), an
+invalid `deadline`, oversized `calldata`, or out-of-range `lock_ledgers`/
+`ttl_ledgers` — or the batch's total exceeds `max_total_reward` — **the
+entire call is rejected and zero transfers occur**, with a typed error
+identifying which validation failed. The caller corrects the offending entry
+and resubmits the whole batch.
 
-### Return shape
+## 4. Resource ceiling
+
+**Not yet empirically measurable** — an empirical number requires an actual
+`batch_register_tasks` implementation to measure against Soroban's
+per-transaction CPU/memory budget, which is issue 0104's job once 0098
+lands. What can be stated now, to guide implementation:
+
+- `register_task`'s own per-call cost (auth, one storage write of a
+  `Task`-sized value, one TTL bump, one event) is the per-entry unit cost a
+  batch of N entries roughly multiplies by N, plus the batch call's own
+  fixed overhead (one auth check, iterating the input `Vec`, one aggregate
+  `max_total_reward` sum check up front).
+- Issue 0107 adds pinned CPU-instruction ceiling tests for `claim_task` and
+  `execute_task` using `env.cost_estimate().budget()`
+  (`contracts/keeper-registry/src/test.rs`). The same measurement technique
+  applies directly to `register_task` and, once implemented,
+  `batch_register_tasks` — issue 0104 should measure the real batch call at
+  increasing N until it approaches Soroban's per-transaction instruction
+  budget, and pin the largest N that stays comfortably under it as the
+  practical ceiling, exactly as issue 0104's acceptance criteria describe.
+- Until that measurement exists, treat any batch size guidance as
+  provisional. The worked example in §7 below illustrates the *reasoning*
+  a dApp should apply, using a placeholder ceiling — substitute the real
+  number issue 0104 measures and documents.
+
+**The contract should enforce an explicit `MAX_BATCH_SIZE` constant**, sized
+from that measurement with headroom, so a caller that submits too large a
+batch gets a clear typed error (e.g. `KeeperError::BatchTooLarge`) rather
+than an opaque host-level resource-exhaustion failure. This is what issue
+0104's regression test is pinning against.
+
+## 5. Return shape
+
+`register_task` returns a single `u64`. A batch call returns a `Vec<u64>` in
+the same order as the input `tasks` vector, so the caller can zip its own
+input list against the result to know which task id corresponds to which
+entry it submitted.
+
+## 6. Pinned function signature
 
 ```rust
-pub struct TaskParams {
+/// One entry in a `batch_register_tasks` call — the same fields
+/// `register_task` takes, minus `owner` (shared across the whole batch).
+#[contracttype]
+#[derive(Clone)]
+pub struct BatchTaskParams {
     pub task_type: TaskType,
     pub calldata: Bytes,
     pub reward: i128,
     pub deadline: u64,
     pub ttl_ledgers: u32,
     pub lock_ledgers: u32,
-    pub verifier: Option<Address>,
 }
 
+/// Registers every entry in `tasks` under a single owner auth. Rejects the
+/// entire call (zero transfers, zero tasks registered) if any entry fails
+/// `register_task`'s existing per-entry validation, if `tasks` exceeds
+/// `MAX_BATCH_SIZE`, or if the sum of all entries' `reward` exceeds
+/// `max_total_reward`. Returns task ids in the same order as `tasks`.
 pub fn batch_register_tasks(
     e: Env,
     owner: Address,
-    tasks: Vec<TaskParams>,
+    tasks: Vec<BatchTaskParams>,
     max_total_reward: i128,
 ) -> Result<Vec<u64>, KeeperError>;
 ```
 
-Returned task ids are in **input order** so the caller can correlate results
-without a secondary lookup.
+## 7. `max_total_reward` and batch-size tradeoffs
 
-### Guardrails
+These are the two levers a dApp integrator actually controls, and they pull
+in opposite directions:
 
-| Guardrail | Purpose |
-|---|---|
-| Shared validation helper with `register_task` | Single and batch paths cannot drift |
-| `max_total_reward` ceiling | Caps total escrow the owner commits to in one auth |
-| Per-entry parameter bounds | Same reward / lock / TTL / calldata rules as single register |
-| Optional `verifier` per entry | Mix of verified and trust-the-proof tasks in one batch |
-| Empty batch rejected | Avoids a no-op that still burns fees for nothing useful |
-| Practical size ceiling | Stay under Soroban per-transaction CPU/memory budget |
+- **`max_total_reward` too tight** (set to exactly the batch's current sum,
+  or below it): protects the owner precisely, but any legitimate late
+  addition to the batch — or simply computing the sum with a rounding bug —
+  makes the whole call fail, including the valid entries within it (§3: no
+  partial success). Guidance: set it to the actual sum of the batch you are
+  submitting, not a round-number guess; since the whole call is atomic, there
+  is no benefit to padding it — padding only widens the window in which a
+  batch could authorize more escrow than the caller reviewed, which is the
+  exact risk this parameter exists to close (§2).
+- **`max_total_reward` too loose** (e.g. an arbitrary large constant "to be
+  safe"): defeats the purpose entirely — it stops being a meaningful ceiling
+  the owner reviewed and becomes a rubber stamp. Always compute it from the
+  batch you are actually about to submit.
+- **Batch size too large**: more amortization of the fixed per-call
+  overhead, but higher risk of hitting Soroban's per-transaction resource
+  budget (§4) — and if it does, the *entire* batch fails atomically, so an
+  oversized batch doesn't even partially help. Guidance: chunk large
+  worklists into batches at or under the measured/documented ceiling (§4),
+  not in one unbounded call.
+- **Batch size too small**: safely under budget, but reduces to close to
+  `register_task`'s per-call overhead again, eroding the reason to batch at
+  all. Guidance: batch as close to the measured ceiling as comfortably fits,
+  not the smallest number that "feels safe."
 
-### Resource ceiling
+## 8. Worked example — a dApp with N pending tasks
 
-Each entry costs roughly one `register_task` worth of storage writes, TTL
-extension, event emission, and one SAC transfer. Empirically, batches on the
-order of **tens of tasks** (guidance target: pin a regression test around a
-measured practical ceiling once implementation lands; treat ~32 as a starting
-integrator heuristic, not a hard host limit) remain comfortable; larger
-batches should be split client-side. The permanent ceiling is owned by the
-resource-limit regression test (issue 0104), not hard-coded into the ABI.
+Scenario: a lending protocol has identified 40 undercollateralized positions
+after a price move and needs a liquidation task registered for each one,
+in one submission rather than 40 separate transactions.
 
-### Escrow transfers
+**Sizing against the ceiling (§4):** once issue 0104 measures and documents
+the real practical ceiling, sizing is a single division. Illustrating with a
+placeholder ceiling of 150 entries per call (substitute the real, documented
+number): this dApp's 40 positions fit in one batch, well under budget. If the
+same dApp instead had 500 positions to register, it would split into
+`ceil(500 / 150) = 4` batches of at most 150 entries each, computing a
+separate `max_total_reward` per batch (the sum of *that batch's* rewards
+only — never the sum across batches, since each is an independent atomic
+call per §3).
 
-`batch_register_tasks` performs **one token transfer per entry**, matching
-`register_task`. Collapsing to a single `sum(rewards)` transfer was studied
-and declined — see the retrospective.
-
----
-
-## `claim_first_available`
-
-When a keeper can execute any of several pending tasks, a naive
-`batch_claim(tasks)` is worse than N single claims under contention (see
-0099). The supported alternative:
+### Raw contract-call context (Rust cross-contract call)
 
 ```rust
-pub fn claim_first_available(
-    e: Env,
-    keeper: Address,
-    candidates: Vec<u64>,
-) -> Result<u64, KeeperError>;
+// In the calling dApp contract. `registry` is the KeeperRegistry contract
+// address; `positions` is this contract's own list of undercollateralized
+// position ids, already computed off-chain or by a prior on-chain step.
+let registry = KeeperRegistryClient::new(&env, &registry_contract_id);
+
+let mut tasks: Vec<BatchTaskParams> = Vec::new(&env);
+let mut total_reward: i128 = 0;
+for position_id in positions.iter() {
+    let reward = liquidation_bounty_for(&env, position_id); // this dApp's own sizing logic
+    total_reward = total_reward.checked_add(reward).expect("reward sum overflow");
+    tasks.push_back(BatchTaskParams {
+        task_type: TaskType::Liquidation,
+        calldata: encode_liquidation_calldata(&env, position_id),
+        reward,
+        deadline: env.ledger().timestamp() + 3600,
+        ttl_ledgers: 17_280,
+        lock_ledgers: 120,
+    });
+}
+
+// max_total_reward is the exact sum just computed above — not padded (§7).
+match registry.try_batch_register_tasks(&env.current_contract_address(), &tasks, &total_reward) {
+    Ok(Ok(task_ids)) => {
+        // task_ids[i] corresponds to positions[i] — zip them to record locally.
+    }
+    Ok(Err(KeeperError::BatchTooLarge)) => {
+        // Split `positions` into smaller chunks (§4/§7) and resubmit each
+        // chunk as its own batch call — do not assume any entries landed.
+    }
+    Ok(Err(_)) | Err(_) => {
+        // Any other rejection: zero tasks were registered, zero escrow
+        // moved (§3). Fix the flagged entry and resubmit the whole batch.
+    }
+}
 ```
 
-Tries candidates in order using the same rules as `claim_task`, returns the
-first successfully claimed id, or a typed error if none were claimable. This
-expresses "give me any one of these" without all-or-nothing multi-claim
-atomicity.
+### Raw contract-call context (Soroban CLI)
 
----
+```bash
+stellar contract invoke \
+  --id "$REGISTRY_CONTRACT_ID" \
+  --source owner \
+  --network testnet \
+  -- \
+  batch_register_tasks \
+  --owner "$OWNER_ADDRESS" \
+  --tasks '[{"task_type":"Liquidation","calldata":"...","reward":"1000000","deadline":"1780000000","ttl_ledgers":17280,"lock_ledgers":120}, ...]' \
+  --max_total_reward "40000000"
+```
 
-## Epic E05 retrospective
+### Handling a rejected batch
 
-Closing summary of what shipped versus what was studied and declined. A reader
-should not need to open the linked issues to know the decision and the rough
-why; the links hold the longer reasoning trail.
+Because failure is all-or-nothing (§3), the caller's error-handling only has
+two cases to reason about, not "how many of my 40 tasks actually landed":
 
-### What shipped
-
-| Feature | Guardrails / notes |
-|---|---|
-| `batch_register_tasks` | Single-owner auth; `max_total_reward` ceiling; all-or-nothing validation; ids in input order; shared validation with `register_task`; optional per-entry `verifier` |
-| `claim_first_available` | First-success claim over a candidate list; no multi-claim all-or-nothing |
-
-### What was studied and declined
-
-#### Batch claim and batch execute (issue 0099 / #124)
-
-**Decision: do not build naive `batch_claim` or `batch_execute`. Prefer
-`claim_first_available` for multi-candidate claiming; keep execute single-task.**
-
-**Why.**
-
-- **Batch claim.** `claim_task` is permissionless FCFS. A multi-task claim in
-  one Soroban transaction is atomic: if any candidate was taken by another
-  keeper moments earlier, the entire batch reverts — including claims that
-  would have succeeded alone. Under real contention that makes batching
-  strictly worse for the keeper. Benefit concentrates in low-contention
-  settings where the fee savings are smallest.
-- **`claim_first_available`.** Tries candidates until one succeeds, so a
-  single lost race does not discard other opportunities. That is the useful
-  multi-task claim shape and is what shipped (issue 0101 / #170 family).
-- **Batch execute.** The keeper already holds exclusive locks, so competing
-  claims are not the failure mode. A verifier rejection (or panic) on one
-  task still forces all-or-nothing revert and blocks crediting for every
-  other already-proven task in the batch. Keepers can submit N independent
-  `execute_task` transactions and isolate failures; registry-level batch
-  execute adds complexity without a clear win once verifiers exist.
-
-Detail: [issue #124](https://github.com/soroban-tooling/soroban-keeper-network/issues/124)
-(backlog 0099).
-
-#### Batch cancel for an owner's own tasks (issue 0114 / #183)
-
-**Decision: do not build `batch_cancel_tasks` in this epic.**
-
-**Why.**
-
-- Demand is real in principle (a dApp winding down a stale watch set), but the
-  owner already controls every target task and can call `cancel_task` N times
-  without cross-keeper races. The UX pain is client-side fee amortization, not
-  a missing protocol primitive.
-- Implementation is not free: each cancel refunds via a token transfer. A
-  batch of N refunds is N external calls in one transaction. That multiplies
-  the surface area of the CEI / reentrancy analysis that wave 1 already had to
-  get right for single-task cancel (issues 0002 / 0057): every refund must
-  still mark the task terminal before transfer, and a reentrant token cannot
-  observe a non-terminal twin. Looping the proven single-path helper is safe
-  but does not remove that review burden; collapsing refunds would change
-  accounting.
-- Relative to calling `cancel_task` N times (or a thin off-chain multicall
-  wrapper), on-contract batch cancel does not pay for its complexity in this
-  epic. Revisit only if integrator demand shows repeated large cancel bursts
-  that cannot be handled client-side.
-
-Detail: [issue #183](https://github.com/soroban-tooling/soroban-keeper-network/issues/183)
-(backlog 0114).
-
-#### Collapsing escrow transfers in `batch_register_tasks` (issue 0115 / #184)
-
-**Decision: keep one token transfer per batch entry; do not collapse to a
-single `sum(rewards)` transfer.**
-
-**Why.**
-
-- Each task's reward must remain independently refundable via `cancel_task` /
-  `expire_task`. A collapsed deposit still requires per-task reward fields in
-  storage, so the accounting model does not simplify — it gains a second
-  representation (bulk deposit vs per-task escrow) that must stay consistent
-  with solvency invariant I-1.
-- Failure midway through a collapsed design is harder to reason about: either
-  the bulk transfer happens before all task rows exist (temporary surplus that
-  must never be sweepable as fees), or rows exist before the bulk transfer
-  (temporary deficit). Per-entry transfer-then-record mirrors `register_task`
-  and keeps the existing conservation proof structure.
-- Resource savings of N-1 SAC calls are real but modest next to per-entry
-  storage, TTL, and event costs that dominate a large batch. Complexity cost
-  outweighs the gas win for the current model.
-
-Detail: [issue #184](https://github.com/soroban-tooling/soroban-keeper-network/issues/184)
-(backlog 0115).
-
-### Summary table
-
-| Topic | Outcome | One-line why |
-|---|---|---|
-| `batch_register_tasks` | **Built** | Amortizes owner-side registration; all-or-nothing + reward ceiling |
-| `claim_first_available` | **Built** | Multi-candidate claim without all-or-nothing races |
-| Batch claim (all-or-nothing) | **Declined** | Contention makes atomic multi-claim worse than singles |
-| Batch execute | **Declined** | One verifier failure would block unrelated payouts |
-| Batch cancel | **Declined** | N× `cancel_task` is enough; CEI cost not justified |
-| Collapsed escrow transfer | **Declined** | Breaks simple per-task escrow / I-1 story for little gas gain |
-
-### Issue index
-
-| Backlog | GitHub | Topic |
-|---|---|---|
-| 0097 | #122 | Batch register API design |
-| 0098 | #123 | Batch register implementation |
-| 0099 | #124 | Batch claim / execute feasibility |
-| 0101 | #170+ | `claim_first_available` |
-| 0114 | #183 | Batch cancel feasibility |
-| 0115 | #184 | Transfer collapsing investigation |
-| 0118 | #187 | This retrospective |
+1. **Validation error on a specific entry** (bad reward, oversized calldata,
+   etc.) or **sum exceeds `max_total_reward`**: zero tasks were registered.
+   Fix the flagged entry (or recompute the sum) and resubmit the identical
+   batch — no cleanup of partially-created state is ever needed.
+2. **`BatchTooLarge`** (or an opaque resource-exhaustion failure, which the
+   `MAX_BATCH_SIZE` guard in §4 is meant to prevent from ever surfacing this
+   way): split the worklist into smaller batches at or under the documented
+   ceiling and submit them as separate calls.

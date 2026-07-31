@@ -5,8 +5,9 @@ name: CI
 #
 # Job policy (see docs/CI.md for the rationale):
 #   REQUIRED  — format, test, build-wasm. These block the merge.
-#   ADVISORY  — clippy, audit, coverage, wasm-size, bot. These report findings
-#               as annotations or a job summary but never fail your PR.
+#   ADVISORY  — clippy, audit, wasm-size, fuzz-pr, resource-cost, bot. These
+#               report findings as annotations or a job summary but never
+#               fail your PR.
 #
 # The split is deliberate. A contributor should never be blocked by a new
 # upstream advisory or a subjective lint, but formatting, a green test suite,
@@ -192,65 +193,6 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ───────────────────────────────────────────────────────────────────────────
-  # ADVISORY — line/region/function coverage via cargo-llvm-cov. Reported for
-  # visibility only: no threshold, and it can never fail the PR.
-  #
-  # Verified locally against this crate (cdylib, #![no_std], soroban-sdk
-  # testutils) before wiring this up — instrumentation works correctly and
-  # produces plausible, non-zero numbers (lib.rs came out around 96% region /
-  # 93% function / 97% line coverage over the current test suite).
-  #
-  # src/test.rs is excluded via --ignore-filename-regex: it's the test module
-  # itself, and since it necessarily runs whenever the tests run, including it
-  # pulls the reported number up to ~99% without saying anything about how
-  # well the actual contract logic in lib.rs is exercised. An unexplained
-  # exclusion list is how coverage numbers become fiction, so: this is the
-  # only exclusion, and this is why.
-  # ───────────────────────────────────────────────────────────────────────────
-  coverage:
-    name: Coverage (advisory)
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: llvm-tools-preview
-
-      - uses: taiki-e/install-action@cargo-llvm-cov
-
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: ${{ runner.os }}-cargo-coverage-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-coverage-
-
-      - name: Measure coverage
-        run: |
-          cargo llvm-cov --workspace --summary-only \
-            --ignore-filename-regex 'test\.rs$' \
-            | tee cov.txt
-
-      - name: Publish summary
-        run: |
-          {
-            echo "### Coverage"
-            echo
-            echo "_Advisory only — informational, not a gate. \`src/test.rs\` is excluded from the report (see job comment in ci.yml for why)._"
-            echo
-            echo '```'
-            cat cov.txt
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  # ───────────────────────────────────────────────────────────────────────────
   # ADVISORY — report the optimized WASM size so reviewers can spot a
   # regression without having to build locally.
   # ───────────────────────────────────────────────────────────────────────────
@@ -287,6 +229,19 @@ jobs:
             "$RAW" -o optimized.wasm
           raw_bytes=$(stat -c%s "$RAW")
           opt_bytes=$(stat -c%s optimized.wasm)
+
+          # Baseline is the last-known-good optimized size, committed at
+          # .github/wasm-size-baseline.txt (see docs/CI.md for the update
+          # process). Comparing against it turns this from "here is a number"
+          # into "here is whether this PR moved the needle."
+          baseline_bytes=$(grep -o '^[0-9]\+' .github/wasm-size-baseline.txt)
+          delta=$((opt_bytes - baseline_bytes))
+          # Integer percentage (rounds toward zero), one decimal place, no bc/python dependency.
+          delta_pct_x10=$((delta * 1000 / baseline_bytes))
+          delta_pct_whole=$((delta_pct_x10 / 10))
+          delta_pct_frac=$((delta_pct_x10 % 10))
+          if [ "$delta_pct_frac" -lt 0 ]; then delta_pct_frac=$((-delta_pct_frac)); fi
+
           {
             echo "### Contract WASM size"
             echo
@@ -296,16 +251,134 @@ jobs:
             printf '| release + wasm-opt -Oz | %s | %s |\n' "$opt_bytes" "$((opt_bytes / 1024))"
             echo
             echo "The optimized figure is what actually gets deployed to the network."
+            echo
+            printf 'Baseline (`.github/wasm-size-baseline.txt`): **%s bytes**. Delta: **%+d bytes (%+d.%d%%)**.\n' \
+              "$baseline_bytes" "$delta" "$delta_pct_whole" "$delta_pct_frac"
+            echo
+            # 5% is picked because ordinary incremental changes (a new field,
+            # an extra check) move the optimized binary by a small fraction
+            # of a percent; a jump past 5% is either a deliberate feature
+            # landing (fine, but worth a human glance) or a regression (e.g.
+            # debug info or an unintended dependency leaking into release).
+            # Advisory only, per this job's continue-on-error policy.
+            if [ "$delta_pct_x10" -ge 50 ]; then
+              echo "**:warning: WASM size grew by more than 5% relative to the baseline.** If this is intentional, update \`.github/wasm-size-baseline.txt\` per \`docs/CI.md\` before merging."
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # ADVISORY — time-boxed fuzz run. Every registered target (fuzz/fuzz_targets/)
+  # gets a short, fixed-budget run so regressions are caught continuously
+  # instead of only when a contributor remembers to fuzz locally. Only runs
+  # when the PR touches contracts/keeper-registry/ or fuzz/. See
+  # fuzz-nightly.yml for the longer, corpus-persisting counterpart.
+  # ───────────────────────────────────────────────────────────────────────────
+  fuzz-pr:
+    name: Fuzz (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for relevant changes
+        id: changes
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+          elif git diff --name-only "$BASE_SHA" "$HEAD_SHA" | grep -qE '^(contracts/keeper-registry/|fuzz/)'; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "relevant=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Rust (nightly)
+        if: steps.changes.outputs.relevant == 'true'
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo
+        if: steps.changes.outputs.relevant == 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            fuzz/target
+          key: ${{ runner.os }}-cargo-fuzz-${{ hashFiles('fuzz/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-fuzz-
+
+      - name: Install cargo-fuzz
+        if: steps.changes.outputs.relevant == 'true'
+        run: cargo install cargo-fuzz --locked
+
+      - name: Run fuzz targets (60s each)
+        if: steps.changes.outputs.relevant == 'true'
+        run: ./scripts/run-fuzz-targets.sh 60 "Fuzz run (fuzz-pr)"
+
+      - name: Skip notice
+        if: steps.changes.outputs.relevant == 'false'
+        run: |
+          {
+            echo "### Fuzz run (fuzz-pr)"
+            echo
+            echo "Skipped — no changes under \`contracts/keeper-registry/\` or \`fuzz/\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload crash artifacts
+        if: always() && steps.changes.outputs.relevant == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-pr-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # ADVISORY — per-entry-point resource cost. Reports CPU instructions and
+  # memory bytes for one representative call to each state-changing entry
+  # point, compared against a checked-in baseline, in the same style as
+  # wasm-size's binary-size report.
+  # ───────────────────────────────────────────────────────────────────────────
+  resource-cost:
+    name: Resource cost report (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-test-
+
+      - name: Measure resource cost per entry point
+        run: |
+          cargo test -p keeper-registry --locked resource_report -- --ignored --nocapture
+
+      - name: Compare against baseline and report
+        run: ./scripts/report-resource-cost.sh
 
   # ───────────────────────────────────────────────────────────────────────────
   # ADVISORY — the example keeper bot. It is a reference implementation, so a
   # lint nit there should not gate a contract PR.
   # ───────────────────────────────────────────────────────────────────────────
   bot:
-    name: Keeper bot (advisory)
+    name: Keeper bot (required)
     runs-on: ubuntu-latest
-    continue-on-error: true
     defaults:
       run:
         working-directory: examples/keeper-bot
@@ -326,7 +399,7 @@ jobs:
         run: node --check index.js
 
       - name: Lint
-        run: npm run lint --if-present
+        run: npm run lint
 
   # ───────────────────────────────────────────────────────────────────────────
   # Aggregate gate. Branch protection should require only this single check;
@@ -336,7 +409,7 @@ jobs:
     name: CI required checks
     runs-on: ubuntu-latest
     if: always()
-    needs: [format, test, build-wasm]
+    needs: [format, test, build-wasm, bot]
     steps:
       - name: Verify required jobs succeeded
         run: |

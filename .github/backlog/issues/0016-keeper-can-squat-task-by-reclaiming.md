@@ -15,7 +15,7 @@ depends_on: []
 ```rust
 match task.status {
     TaskStatus::Pending => {}
-    TaskStatus::Claimed {
+    TaskStatus::Claimed => {
         // Only allow a takeover once the current lock has expired.
         if !lock_expired(&e, &task) {
             return Err(KeeperError::LockPeriodActive);
@@ -53,35 +53,19 @@ There is a milder version too: a keeper parking profitable tasks to execute late
 
 Holding a task requires making progress. A keeper that has claimed and not executed cannot indefinitely exclude others.
 
-## Design decision
+## Suggested approach
 
-The standalone mitigation selected for this issue is the cheap incumbent guard:
+This needs design discussion before code — please comment on the issue with your approach first. Some options, none obviously correct:
 
-- When a task is already `Claimed` and its lock has expired, `claim_task` rejects the request if the caller is the existing `claimer`.
-- A different keeper may still claim the task immediately after the lock expires.
-- No new `Task` field is required, so there are no storage-layout changes for existing deployments.
+**Block immediate self-re-claim.** Reject `claim_task` when `task.claimer == Some(keeper)` and the task is already `Claimed`. Simplest, and it makes the exclusion cost a second address — which is trivial to obtain, so this is a speed bump rather than a fix.
 
-The guard is intentionally limited in scope. Soroban addresses are inexpensive to create, so an operator controlling multiple addresses can still rotate identities and continue suppressing a task. Fully addressing that residual Sybil weakness requires the Phase 2 staking/slashing design. Until then, this patch prevents the direct single-address re-claim loop and preserves the existing permissionless takeover path.
+**Cap total claims per task.** Store a claim counter; once it exceeds a bound the task can only be executed or expired. Bounded and simple to reason about, at the cost of one more field in `Task`.
 
-## Implementation requirements
+**Cooldown after a lapsed claim.** Record that an address let a lock lapse and exclude it from re-claiming that task for N ledgers, giving competitors a clear window. More storage, but it targets the actual behaviour.
 
-`claim_task` must compare the requested keeper with the incumbent before replacing `claimer` or `claim_ledger`:
+**Make it expensive.** Require a stake to claim and slash it when a claim lapses without execution. This is the economically sound answer and it is exactly what the Phase 2 staking work is for — which means this issue may be better resolved as "documented limitation, fixed by staking" than as a standalone patch.
 
-```rust
-TaskStatus::Claimed => {
-    if !lock_expired(&e, &task) {
-        return Err(KeeperError::LockPeriodActive);
-    }
-    if task.claimer.as_ref() == Some(keeper) {
-        return Err(KeeperError::LockPeriodActive);
-    }
-}
-```
-
-The test suite must cover both sides of the rule:
-
-1. The same keeper cannot claim repeatedly after successive lock windows.
-2. A different keeper can claim after the lock window expires.
+A perfectly acceptable outcome for this issue is a PR that adds the cheap guard *and* documents the residual weakness in the README's "Known Design Decisions", rather than an elaborate mechanism that staking will replace.
 
 ## Acceptance criteria
 

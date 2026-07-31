@@ -6,20 +6,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added — optional on-chain proof verifier (VERSION bumped to 3)
+### Fixed — restore work silently reverted by an unrelated merge
 
-- `register_task` now takes a required eighth parameter,
-  `verifier: Option<Address>`. `None` behaves exactly as before this change;
-  `Some(addr)` attaches an `IKeeperVerifier`-implementing contract that
-  `execute_task` calls before crediting the keeper, rejecting with the new
-  `VerificationFailed` error (and a `TaskVerificationFailed` event) if it
-  returns `false`. This is a breaking ABI change — every existing
-  `register_task` call site must add the new argument.
-- New `update_verifier` entry point lets the task owner change or clear a
-  task's verifier while it is still `Pending`.
-- New events: `TaskVerificationFailed` (`("verfail", "task")`) and
-  `VerifierUpdated` (`("verifier", "task")`).
-- `VERSION` bumped from 2 to 3.
+- `split_reward`'s return type (`Result<(i128, i128), KeeperError>`) and its
+  three call sites, a missing closing brace in
+  `contracts/keeper-registry/src/test.rs`, and `docs/CI.md` had all been
+  silently reverted/deleted by an unrelated commit (`fee3b2d`, ostensibly a
+  keeper-bot lint fix), leaving `keeper-registry` unable to compile at all.
+  Restored to the state an earlier fix (`038f6c7`) had already established.
+
+### Added — batch claim/execute feasibility study
+
+- [docs/BATCH_OPERATIONS.md](docs/BATCH_OPERATIONS.md): naive all-or-nothing
+  batch claiming is strictly worse than independent claims under Soroban's
+  transaction atomicity; recommends `claim_first_available` instead
+  (backlog issue 0101, already scoped) and defers batch execute pending
+  epic E04 (backlog issue 0201, filed alongside this study).
+
+### Added — advisory CI: fuzz jobs, resource cost report
+
+- `fuzz-pr` (`ci.yml`): runs every registered `cargo-fuzz` target for 60s on
+  PRs touching `contracts/keeper-registry/` or `fuzz/`.
+- `fuzz-nightly` (`.github/workflows/fuzz-nightly.yml`): the same targets
+  for 15 minutes each, on a daily schedule, with a persistent cached corpus.
+- `resource-cost` (`ci.yml`): reports CPU instructions and memory bytes per
+  state-changing entry point via `soroban-sdk`'s budget testutils, diffed
+  against a checked-in baseline.
+- Both documented in [docs/CI.md](docs/CI.md) (restored — see Fixed above).
+
+### Added — partial verifier resource cost catalog
+
+- [docs/VERIFIERS.md](docs/VERIFIERS.md): baseline (no-verifier) measurement
+  methodology in place; per-verifier deltas blocked pending epic E04's
+  reference verifiers, which do not exist in this repo yet.
 
 ### Fixed — task parameter validation
 
