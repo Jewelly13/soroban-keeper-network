@@ -62,6 +62,20 @@ guidance: [docs/BATCH_OPERATIONS.md](docs/BATCH_OPERATIONS.md).
   helper, so a batch can never accept a task shape a single registration would
   reject.
 
+### Added — escrow-transfer batching study
+
+- [docs/BATCH_OPERATIONS.md](docs/BATCH_OPERATIONS.md) §9: can
+  `batch_register_tasks`' N escrow transfers be collapsed into one? Finds that
+  per-task escrow is already bookkeeping over a pooled balance, so the collapse
+  is accounting-neutral — per-task refunds and the I-1 solvency invariant are
+  untouched. Estimates a single token transfer at ~155k CPU instructions (by
+  differencing structurally identical entry points in the resource baseline),
+  making the transfers ~60% of a 50-entry batch's CPU cost. Recommends
+  implementing, gated on issue 0104's measurement, and flags the one real
+  hazard it introduces: the sum becomes the money, so a totalling bug becomes
+  a silent solvency violation rather than a wrong ceiling check. Filed as
+  backlog issue 0202.
+
 ### Fixed — restore work silently reverted by an unrelated merge
 
 - `split_reward`'s return type (`Result<(i128, i128), KeeperError>`) and its

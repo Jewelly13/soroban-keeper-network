@@ -297,3 +297,182 @@ two cases to reason about, not "how many of my 40 tasks actually landed":
    `MAX_BATCH_SIZE` guard in §4 is meant to prevent from ever surfacing this
    way): split the worklist into smaller batches at or under the documented
    ceiling and submit them as separate calls.
+
+---
+
+## 9. Can the N escrow transfers be collapsed into one?
+
+**Study, not a change.** `batch_register_tasks` as shipped does one
+`token.transfer` per entry — the same number of cross-contract calls that
+calling `register_task` N times would make, just inside one transaction. Each
+of those is a call into the reward token contract with its own resource cost.
+This section asks whether they can be collapsed into a single transfer of the
+total, and concludes with a recommendation.
+
+### 9.1 The accounting question, addressed first
+
+The complication worth reasoning through carefully: a collapsed transfer moves
+`sum(rewards)` from the owner to the registry in one call, but each task still
+needs its own reward amount recorded and refundable independently later, via
+`cancel_task` or `expire_task`. Is that an accounting change?
+
+**No — and this is the central finding.** Per-task escrow is already
+*bookkeeping*, not a separate token holding:
+
+- The registry holds **one pooled balance** of the reward token. There is no
+  per-task sub-account, no per-task token authorization, nothing on the token
+  side that distinguishes "the 1 XLM escrowed for task 41" from "the 1.5 XLM
+  escrowed for task 42". The only thing that distinguishes them is the
+  `reward` field on each `Task` in persistent storage.
+- Refunds already reflect that. `cancel_task` and `expire_task` read
+  `task.reward` and transfer that amount out of the pooled balance — they do
+  not "return the specific tokens task 41 brought in", because no such notion
+  exists.
+
+So a collapsed transfer changes *how much moves per call*, not *what is
+recorded*. Each `Task` is still written with its own `reward`, and every later
+refund path reads that field exactly as it does today. **No intermediate
+accounting step is needed**, and the per-task refund logic requires no change
+at all.
+
+**Solvency (I-1) is likewise unaffected.** The invariant is
+
+```text
+token_balance == open_escrow + keeper_balances + fees_accrued
+```
+
+where `open_escrow` is the sum of `Task.reward` over Pending and Claimed
+tasks (`contracts/keeper-registry/src/invariants.rs`, `assert_solvent`). Both
+sides of the equation are aggregates. Whether the registry received
+`sum(rewards)` as one transfer or as N transfers, `token_balance` increases by
+the same amount and `open_escrow` increases by the same amount. I-1 holds
+identically either way — it cannot distinguish the two, which is precisely why
+the collapse is accounting-neutral.
+
+### 9.2 The complication that *is* real
+
+Collapsing does introduce one genuine new hazard, and it is not the one the
+issue anticipated.
+
+Today the sum is used **only** for the `max_total_reward` ceiling check. The
+money that actually moves is each entry's own `reward`, transferred inside the
+loop. If the sum were computed wrongly — an entry skipped, an overflow
+mishandled — the consequence would be a wrong *ceiling check*, and every task
+would still be funded correctly.
+
+After collapsing, the sum **is** the money. A sum that disagrees with what the
+loop later records as `Task.reward` values produces a direct I-1 violation:
+the registry would hold less (or more) than the escrow it claims to owe, with
+no error raised anywhere. The two loops — the one that totals and the one that
+writes — must provably iterate the same entries with the same values.
+
+This is manageable, not disqualifying, but it is a real cost and any
+implementation must carry:
+
+- The total and the per-task writes derived from a single pass, or from two
+  passes over the same immutable `Vec` with no possibility of divergence.
+- An invariant test asserting I-1 immediately after a batch registration, over
+  a batch with heterogeneous rewards — the cheap check that would catch the
+  entire class of bug.
+
+Two lesser consequences, both documentable rather than blocking:
+
+- **Observability.** The reward token (a SAC) emits its own `transfer` event
+  per call. An off-chain indexer reconciling per-task escrow from *token*
+  events would see one lump-sum event instead of N. The registry's own
+  `TaskRegistered` events still carry per-task rewards, so anything
+  reconciling from the registry's event stream — including
+  `examples/keeper-bot` — is unaffected.
+- **Wallet review.** The owner's signed auth tree would contain one
+  `transfer(owner, registry, total)` sub-invocation instead of N itemized
+  ones. A wallet UI showing "transfer 45 XLM" conveys less than N line items.
+  `max_total_reward` already exists as the explicit ceiling covering exactly
+  this (§2), so the loss is small.
+
+Non-issues, checked: overflow of the sum is already `checked_add`-guarded for
+the ceiling; fee-on-transfer or rebasing tokens would break per-task escrow
+accounting equally in both designs (`register_task` already records `reward`
+rather than a measured received delta), so collapsing introduces no new
+exposure there.
+
+### 9.3 Resource-cost comparison — N transfers vs 1
+
+Estimated from `contracts/keeper-registry/resource-baseline.json`, by
+differencing entry points that are structurally identical **except** for a
+token transfer:
+
+| Pair | With transfer | Without transfer | Implied transfer cost |
+|---|---|---|---|
+| `cancel_task` vs `claim_task` | 262,257 CPU / 44,499 B | 104,711 CPU / 19,889 B | ~157,500 CPU / ~24,600 B |
+| `expire_task` vs `claim_task` | 252,526 CPU / 42,371 B | 104,711 CPU / 19,889 B | ~147,800 CPU / ~22,500 B |
+| `sweep_fees` vs `set_fee_bps` | 267,037 CPU / 50,539 B | 99,296 CPU / 20,174 B | ~167,700 CPU / ~30,400 B |
+
+Each pair does the same storage reads/writes, event, and instance TTL bump;
+the delta is one cross-contract call into the reward token. **A single token
+transfer costs roughly 150k–170k CPU instructions and ~25 KB of memory.** Call
+it ~155k CPU.
+
+`register_task` measures 251,855 CPU total, so its non-transfer work — the
+validation, the counter increment, the `Task` write, the event, the TTL bump —
+is roughly 97k CPU. That gives a per-entry model for a batch:
+
+| Batch size | N transfers (CPU) | 1 transfer (CPU) | Saving |
+|---|---|---|---|
+| 10 | ~1.55M + ~0.97M = **~2.5M** | ~0.16M + ~0.97M = **~1.1M** | ~55% |
+| 25 | ~3.88M + ~2.4M = **~6.3M** | ~0.16M + ~2.4M = **~2.6M** | ~59% |
+| 50 (`MAX_BATCH_SIZE`) | ~7.75M + ~4.85M = **~12.6M** | ~0.16M + ~4.85M = **~5.0M** | ~60% |
+
+So the saving is large in relative terms: **the transfers are the majority of
+a batch's CPU cost, and collapsing them removes about 60% of it at
+`MAX_BATCH_SIZE`.**
+
+### 9.4 …but the saving is in the resource that is not binding
+
+The number that decides whether this matters: Soroban's per-transaction CPU
+limit is on the order of 100M instructions. A 50-entry batch is estimated at
+~12.6M with N transfers — comfortably inside it, and ~5.0M collapsed. **CPU is
+not what caps `MAX_BATCH_SIZE` at 50.**
+
+What caps it is **ledger write bytes** (§4): 50 entries write 50 `Task`
+records, each carrying up to 1024 bytes of `calldata`, so ~50 KB of writes
+before anything else. A collapsed transfer does not remove a single one of
+those writes.
+
+The honest framing, therefore:
+
+- Collapsing is a **fee reduction**, not a capability increase. It makes a
+  batch cheaper; it does not let a batch be larger.
+- ~60% off the CPU term is still real money for a dApp registering batches
+  routinely, and CPU instructions are a priced resource in Soroban's fee model.
+- But it will not raise `MAX_BATCH_SIZE`, and anyone hoping it would should
+  read §4 instead.
+
+### 9.5 Recommendation
+
+**Implement it**, with the safeguards in §9.2 — but sequence it after issue
+0104's measurement, and treat that measurement as the gate.
+
+Reasoning:
+
+1. The accounting objection does not survive contact with the code (§9.1).
+   Escrow is already pooled and per-task refunds already read `Task.reward`;
+   there is nothing to restructure. The change is essentially: hoist the
+   `token.transfer` out of the registration loop, transferring `total_reward`
+   — a value already computed for the ceiling check — once before it.
+2. The complexity is genuinely small, and the one real hazard it introduces
+   (§9.2) is closed by an invariant test that should exist regardless.
+3. The saving is substantial in relative terms (~60% of batch CPU) even though
+   it does not relieve the binding constraint.
+
+Why gate on 0104 rather than doing it now: every number in §9.3 is *derived by
+differencing a baseline that does not yet contain `batch_register_tasks`*. The
+transfer cost estimate is sound — three independent pairs agree within ~13% —
+but the per-entry non-transfer cost inside a batch is extrapolated from
+`register_task`, and a batch amortizes some of that (one auth, one instance
+TTL bump, one ceiling check for the whole call) in ways this model does not
+capture. Once 0104 measures `batch_register_tasks` at several N, the saving
+becomes an observed number rather than an estimated one, and the change lands
+with a before/after to point at.
+
+Filed as its own implementation issue:
+[`.github/backlog/issues/0202-batch-register-collapse-escrow-transfers.md`](../.github/backlog/issues/0202-batch-register-collapse-escrow-transfers.md).
