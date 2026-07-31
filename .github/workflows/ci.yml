@@ -5,8 +5,9 @@ name: CI
 #
 # Job policy (see docs/CI.md for the rationale):
 #   REQUIRED  — format, test, build-wasm. These block the merge.
-#   ADVISORY  — clippy, audit, wasm-size, bot. These report findings as
-#               annotations or a job summary but never fail your PR.
+#   ADVISORY  — clippy, audit, wasm-size, fuzz-pr, resource-cost, bot. These
+#               report findings as annotations or a job summary but never
+#               fail your PR.
 #
 # The split is deliberate. A contributor should never be blocked by a new
 # upstream advisory or a subjective lint, but formatting, a green test suite,
@@ -264,6 +265,112 @@ jobs:
               echo "**:warning: WASM size grew by more than 5% relative to the baseline.** If this is intentional, update \`.github/wasm-size-baseline.txt\` per \`docs/CI.md\` before merging."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # ADVISORY — time-boxed fuzz run. Every registered target (fuzz/fuzz_targets/)
+  # gets a short, fixed-budget run so regressions are caught continuously
+  # instead of only when a contributor remembers to fuzz locally. Only runs
+  # when the PR touches contracts/keeper-registry/ or fuzz/. See
+  # fuzz-nightly.yml for the longer, corpus-persisting counterpart.
+  # ───────────────────────────────────────────────────────────────────────────
+  fuzz-pr:
+    name: Fuzz (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for relevant changes
+        id: changes
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+          elif git diff --name-only "$BASE_SHA" "$HEAD_SHA" | grep -qE '^(contracts/keeper-registry/|fuzz/)'; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "relevant=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Rust (nightly)
+        if: steps.changes.outputs.relevant == 'true'
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo
+        if: steps.changes.outputs.relevant == 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            fuzz/target
+          key: ${{ runner.os }}-cargo-fuzz-${{ hashFiles('fuzz/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-fuzz-
+
+      - name: Install cargo-fuzz
+        if: steps.changes.outputs.relevant == 'true'
+        run: cargo install cargo-fuzz --locked
+
+      - name: Run fuzz targets (60s each)
+        if: steps.changes.outputs.relevant == 'true'
+        run: ./scripts/run-fuzz-targets.sh 60 "Fuzz run (fuzz-pr)"
+
+      - name: Skip notice
+        if: steps.changes.outputs.relevant == 'false'
+        run: |
+          {
+            echo "### Fuzz run (fuzz-pr)"
+            echo
+            echo "Skipped — no changes under \`contracts/keeper-registry/\` or \`fuzz/\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload crash artifacts
+        if: always() && steps.changes.outputs.relevant == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-pr-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # ADVISORY — per-entry-point resource cost. Reports CPU instructions and
+  # memory bytes for one representative call to each state-changing entry
+  # point, compared against a checked-in baseline, in the same style as
+  # wasm-size's binary-size report.
+  # ───────────────────────────────────────────────────────────────────────────
+  resource-cost:
+    name: Resource cost report (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-test-
+
+      - name: Measure resource cost per entry point
+        run: |
+          cargo test -p keeper-registry --locked resource_report -- --ignored --nocapture
+
+      - name: Compare against baseline and report
+        run: ./scripts/report-resource-cost.sh
 
   # ───────────────────────────────────────────────────────────────────────────
   # ADVISORY — the example keeper bot. It is a reference implementation, so a
