@@ -126,19 +126,25 @@ worked example.
 
 ## CI vs. local expectations
 
-**Not wired up yet.** A time-boxed fuzz job in PR CI, with a longer
-nightly scheduled job, is tracked separately (backlog 0066) and hasn't
-landed — there is currently no automatic fuzzing in this repo's CI at all.
-`docs/CI.md` (backlog 0043, the general "what runs where" guide this
-section would otherwise cross-reference) also doesn't exist yet.
+**Wired up as of backlog 0066.** The `fuzz-pr` advisory job in `ci.yml` runs
+every registered target for 60 seconds on any PR touching
+`contracts/keeper-registry/` or `fuzz/`; `fuzz-nightly.yml` runs the same
+targets for 15 minutes each on a daily schedule with a persistent corpus.
+Neither blocks a merge — see [`docs/CI.md`](CI.md) for the full advisory-job
+policy and how a crash is surfaced.
 
-Until both land, treat fuzzing as an entirely manual, local step: if
-you're touching `execute_task` (the only currently-working target) or the
-shared `invariants` module, run `cargo +nightly fuzz run execute_task -- -max_total_time=120`
-locally before opening a PR. `cargo test -p keeper-registry` (which
-includes the `proptest!`-based property tests) *is* run in ordinary CI
-today, same as any other unit test — that part isn't optional or
-fuzzing-specific.
+A short local run is still worth doing before opening a PR that touches
+`execute_task` (the only currently-working target) or the shared
+`invariants` module — CI's 60-second PR budget is enough to catch an
+obvious regression, not to explore deeply:
+
+```bash
+cargo +nightly fuzz run execute_task -- -max_total_time=120
+```
+
+`cargo test -p keeper-registry` (which includes the `proptest!`-based
+property tests) *is* run in ordinary CI today, same as any other unit test —
+that part isn't optional or fuzzing-specific.
 
 ## What's not here yet
 
@@ -154,6 +160,5 @@ order:
   repo currently has one compact `proptest!` per invariant (see
   `test.rs`), not the exhaustive, sequence-driven exploration those
   issues call for.
-- **A CI fuzz job** (backlog 0066) and **`docs/CI.md`** (backlog 0043).
 - **A committed crash corpus** under `fuzz/corpus/*/regressions/` — none
   exists yet, since no crash has been found and minimized.
