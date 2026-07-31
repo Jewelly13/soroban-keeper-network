@@ -563,7 +563,15 @@ fn lock_expired(e: &Env, task: &Task) -> bool {
 
 /// Semantic version of the contract logic. Bumped on behavior changes so
 /// off-chain clients and indexers can detect which ABI they are talking to.
-pub const VERSION: u32 = 2;
+///
+/// - `1` — MVP lifecycle surface.
+/// - `2` — `calldata` bounded by [`MAX_CALLDATA_LEN`], adding the
+///   `CalldataTooLarge` error variant.
+/// - `3` — batch registration: the `batch_register_tasks` and
+///   `max_batch_size` entry points, the [`BatchTaskParams`] type, and the
+///   `BatchTooLarge` / `EmptyBatch` / `BatchRewardCeilingExceeded` error
+///   variants.
+pub const VERSION: u32 = 3;
 
 /// Maximum `calldata` length, in bytes. Sized to hold an encoded contract
 /// call — a target address, a function symbol, and a handful of scalar or

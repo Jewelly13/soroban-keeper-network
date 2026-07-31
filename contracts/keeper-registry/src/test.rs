@@ -189,10 +189,16 @@ fn test_split_reward_invariants() {
     }
 }
 
+/// `VERSION` is the only signal an off-chain client has that the ABI it
+/// compiled against is the ABI it is talking to, so this assertion is
+/// deliberately a hardcoded literal rather than a comparison against the
+/// `VERSION` constant — the point is that changing the constant without
+/// noticing the ABI change is what breaks integrators. Bump both together,
+/// and add a CHANGELOG entry saying what changed.
 #[test]
 fn test_version_is_exposed() {
     let s = setup();
-    assert_eq!(s.registry.version(), 2u32);
+    assert_eq!(s.registry.version(), 3u32);
 }
 
 #[test]
