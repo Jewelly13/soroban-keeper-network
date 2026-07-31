@@ -2845,6 +2845,8 @@ fn test_initialize_no_event_when_validation_fails() {
         }
     }
     assert!(!found_init_event, "no event should be emitted on validation failure");
+}
+
 // Property tests (issue #93 / backlog 0068): compact proptest coverage per
 // I-N invariant, using the shared `invariants` module so these and any
 // future fuzz target assert the exact same thing. This is intentionally a
@@ -2945,7 +2947,7 @@ proptest! {
             .execute_task(&keeper, &id, &Bytes::from_slice(&s.env, b"p"));
         let balance_after_first = s.registry.keeper_balance(&keeper);
 
-        let (expected_net, _fee) = split_reward(reward, s.registry.get_fee_bps());
+        let (expected_net, _fee) = split_reward(reward, s.registry.get_fee_bps()).unwrap();
         crate::invariants::assert_single_payout(balance_before, balance_after_first, expected_net)
             .expect("I-3: first execution must credit exactly the net reward once");
 
@@ -2967,7 +2969,7 @@ proptest! {
         reward in 1_i128..i128::from(u64::MAX),
         fee_bps in 0u32..=10_000u32,
     ) {
-        let (keeper_net, fee) = split_reward(reward, fee_bps);
+        let (keeper_net, fee) = split_reward(reward, fee_bps).unwrap();
         assert_fee_bounded(reward, fee_bps, keeper_net, fee)
             .expect("I-4 fee bounding must hold for every reward/fee_bps combination");
     }

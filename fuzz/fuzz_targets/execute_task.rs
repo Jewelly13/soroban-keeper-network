@@ -82,7 +82,8 @@ fuzz_target!(|data: &[u8]| {
                 proof.len()
             );
 
-            let (expected_keeper_net, expected_fee) = split_reward(reward, fee_bps);
+            let (expected_keeper_net, expected_fee) =
+                split_reward(reward, fee_bps).expect("split_reward must not overflow here");
 
             // I-4 — fee bounding, via the SAME assertion the property
             // tests use (not a parallel copy).
