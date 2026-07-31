@@ -5,6 +5,31 @@ invariants the `keeper-registry` contract enforces.
 
 ## Components
 
+### Keeper registry contract
+
+The registry owns the task lifecycle and stores:
+
+- the administrator and pause state;
+- the configured reward token;
+- the next task id;
+- fee configuration and the accrued-fee accumulator;
+- task records; and
+- credited keeper balances.
+
+Every state transition publishes an event, and events are the query primitive
+for off-chain indexers and keeper bots. This document deliberately does not
+restate the topic and data shapes: the single canonical table lives in the
+[README events section](../README.md#events) and is transcribed from the `emit_*`
+functions in `contracts/keeper-registry/src/lib.rs`. Keep it there rather than
+duplicating it here, so the two cannot drift apart.
+
+### Reward token
+
+The registry transfers the configured token when a task is registered, topped up, cancelled, expired, executed, or when a keeper withdraws rewards. The registry is therefore written against a token contract boundary and must preserve its safety properties even when token transfers are treated as external interactions.
+
+### Owners and keepers
+
+An owner creates and funds a task. A keeper may claim an eligible task, execute it with the required proof or calldata, and receive the net reward as a credited balance. A keeper withdraws that balance independently of the task lifecycle.
 | Component | Location | Role |
 |-----------|----------|------|
 | `KeeperRegistry` contract | `contracts/keeper-registry` | On-chain coordination: task registry, escrow, fee accounting, admin controls |
