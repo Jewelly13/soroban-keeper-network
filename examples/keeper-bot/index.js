@@ -186,8 +186,6 @@ async function validateAndLoadConfig() {
       parse: (v) => v.toLowerCase() === "true",
       fallback: true,
     }),
-<<<<<<< HEAD
-=======
     // Development only — see the EXECUTORS section below and .env.example
     // for the accompanying warning. Never the default: a keeper with this
     // unset and no real executor registered for a task type simply skips
@@ -196,7 +194,6 @@ async function validateAndLoadConfig() {
       parse: (v) => v.toLowerCase() === "true",
       fallback: false,
     }),
->>>>>>> f8df1c6e6e7091726aea7df87508515aa6c82b8b
   };
 }
 
@@ -404,30 +401,6 @@ async function fetchPendingTasks(server, contractId, startLedger) {
     return [];
   }
 }
-<<<<<<< HEAD
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Keeper logic — off-chain execution simulation
-// ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * Simulates off-chain execution of the task (liquidation, oracle push, etc.)
- * In a real keeper this would:
- *   - Call the target protocol contract
- *   - Verify the action succeeded
- *   - Return the tx hash or state proof
- */
-async function executeTaskOffChain(task) {
-  console.log(`  ⚙️  Executing task ${task.taskId} off-chain...`);
-  // Simulate network latency
-  await sleep(500);
-
-  // Return a fake "proof" — in production this is the target tx hash
-  const fakeTxHash = Buffer.from(
-    `keeper-proof:task:${task.taskId}:ts:${Date.now()}`
-  ).toString("hex");
-  return fakeTxHash;
-=======
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Executor interface — pluggable off-chain execution, dispatched by task_type
@@ -535,7 +508,6 @@ async function executeTaskOffChain(task, ctx, simulateExecution) {
     ctx.log(`  ⚠️  Executor for task ${task.taskId} threw: ${err.message}`);
     return null;
   }
->>>>>>> f8df1c6e6e7091726aea7df87508515aa6c82b8b
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -633,9 +605,6 @@ async function keeperLoop(
         );
         console.log(`  ✅  Task ${task.taskId} claimed!`);
 
-<<<<<<< HEAD
-        const proof = await executeTaskOffChain(task);
-=======
         // Fetch full task details — the TaskRegistered event decoded in
         // fetchPendingTasks carries only { taskId, reward, deadline }, but
         // an executor needs task_type and calldata to know what off-chain
@@ -669,7 +638,13 @@ async function keeperLoop(
           executorCtx,
           CONFIG.simulateExecution
         );
->>>>>>> f8df1c6e6e7091726aea7df87508515aa6c82b8b
+
+        if (proof === null || proof === undefined) {
+          console.log(
+            `  ⏭️  Task ${task.taskId} (${taskTypeName}) not executed — leaving claimed for expiry or another keeper.`
+          );
+          continue;
+        }
 
         if (proof === null || proof === undefined) {
           console.log(
@@ -862,14 +837,11 @@ module.exports = {
   validateAndLoadConfig,
   keeperLoop,
   sleep,
-<<<<<<< HEAD
-=======
   TASK_TYPE_NAMES,
   EXECUTORS,
   executeTaskOffChain,
   ttlExtensionExecutor,
   simulatedExecutor,
->>>>>>> f8df1c6e6e7091726aea7df87508515aa6c82b8b
 };
 
 // Only run main() when executed directly, not when imported for testing

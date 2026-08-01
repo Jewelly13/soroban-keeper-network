@@ -6,8 +6,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-<<<<<<< HEAD
-=======
 ### Added — batch task registration (VERSION bumped to 3)
 
 Epic E05's batch-registration slice. Full design rationale and integrator
@@ -126,7 +124,6 @@ guidance: [docs/BATCH_OPERATIONS.md](docs/BATCH_OPERATIONS.md).
   methodology in place; per-verifier deltas blocked pending epic E04's
   reference verifiers, which do not exist in this repo yet.
 
->>>>>>> f8df1c6e6e7091726aea7df87508515aa6c82b8b
 ### Fixed — task parameter validation
 
 - `register_task` now rejects `lock_ledgers` outside `[MIN_LOCK_LEDGERS,

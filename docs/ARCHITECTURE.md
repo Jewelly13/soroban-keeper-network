@@ -5,8 +5,6 @@ invariants the `keeper-registry` contract enforces.
 
 ## Components
 
-<<<<<<< HEAD
-=======
 ### Keeper registry contract
 
 The registry owns the task lifecycle and stores:
@@ -32,7 +30,7 @@ The registry transfers the configured token when a task is registered, topped up
 ### Owners and keepers
 
 An owner creates and funds a task. A keeper may claim an eligible task, execute it with the required proof or calldata, and receive the net reward as a credited balance. A keeper withdraws that balance independently of the task lifecycle.
->>>>>>> f8df1c6e6e7091726aea7df87508515aa6c82b8b
+
 | Component | Location | Role |
 |-----------|----------|------|
 | `KeeperRegistry` contract | `contracts/keeper-registry` | On-chain coordination: task registry, escrow, fee accounting, admin controls |
@@ -175,38 +173,6 @@ react without polling storage: `reg`, `claim`, `exec`, `exp`, `cancel`,
 (governance / settlement topics).
 
 ## Trust model
-
-<<<<<<< HEAD
-```
-ttl_ledgers >= (deadline - now) / SECONDS_PER_LEDGER + TTL_SAFETY_MARGIN_LEDGERS
-```
-
-- `SECONDS_PER_LEDGER = 5` — a conservative estimate of Stellar's ledger close
-  time, used only to convert the deadline into a ledger count. Over-estimating
-  the ledger rate over-provisions TTL, which is the safe direction to be wrong.
-- `TTL_SAFETY_MARGIN_LEDGERS = 17_280` (~1 day) — extra ledgers kept beyond the
-  deadline so `expire_task` remains callable for a while after the deadline
-  passes.
-
-`register_task` rejects a `ttl_ledgers` that doesn't satisfy this with
-`TtlTooShort`, and `extend_deadline` applies the same check against the task's
-existing `ttl_ledgers` before accepting a new, later deadline — so an owner
-cannot push the deadline out from under the TTL. `save_task` also re-extends
-the entry's TTL on every mutation (claim, execute, top-up, deadline change),
-so an active task's storage lifetime keeps moving forward rather than only
-being set once at registration.
-
-## Events
-
-Every state transition emits an event so off-chain keepers and indexers can
-react without polling storage: `reg`, `claim`, `exec`, `exp`, `cancel`,
-`topup`, `extend` (task topics) and `paused`, `fee`, `admin`, `wdraw`
-(governance / settlement topics).
-
-## Trust model
-
-=======
->>>>>>> f8df1c6e6e7091726aea7df87508515aa6c82b8b
 - **Keepers are permissionless** — anyone can claim and execute; correctness is
   enforced by the contract, not a whitelist.
 - **Admin** controls fee rate, pause, min-reward, upgrade, and fee sweeping —

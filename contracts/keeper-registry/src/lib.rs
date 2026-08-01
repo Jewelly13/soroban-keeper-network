@@ -31,7 +31,7 @@
 
 #![no_std]
 
-use soroban_sdk::{ contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Bytes, BytesN, Env, };
+use soroban_sdk::{ contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Bytes, BytesN, Env, log };
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Storage Keys
@@ -117,8 +117,6 @@ pub struct Task {
     pub lock_ledgers: u32,
 }
 
-<<<<<<< HEAD
-=======
 /// One entry in a [`KeeperRegistry::batch_register_tasks`] call — the same
 /// fields `register_task` takes, minus `owner`, which is shared across the
 /// whole batch (one auth for the batch, see `docs/BATCH_OPERATIONS.md` §2).
@@ -133,7 +131,6 @@ pub struct BatchTaskParams {
     pub lock_ledgers: u32,
 }
 
->>>>>>> f8df1c6e6e7091726aea7df87508515aa6c82b8b
 // ─────────────────────────────────────────────────────────────────────────────
 // Errors
 // ─────────────────────────────────────────────────────────────────────────────
@@ -159,16 +156,10 @@ pub enum KeeperError {
     /// A function requiring configured state (`initialize` must have been
     /// called) was invoked on a registry that isn't configured yet.
     NotInitialized = 15,
-<<<<<<< HEAD
     /// `ttl_ledgers` does not cover the task's `deadline` plus the safety
     /// margin — the storage entry could expire while the escrow is still
     /// live. See [`required_ttl_ledgers`].
     TtlTooShort = 16,
-=======
-    // 16 is reserved for `TtlTooShort`, added by a sibling in-flight PR (see
-    // #11 / register_task deadline-vs-TTL invariant). Left as a gap rather
-    // than reused so the two branches don't collide on the same discriminant.
->>>>>>> f8df1c6e6e7091726aea7df87508515aa6c82b8b
     /// `calldata` exceeds [`MAX_CALLDATA_LEN`].
     CalldataTooLarge = 17,
     /// `lock_ledgers` or `ttl_ledgers` passed to `register_task` fell outside
@@ -176,8 +167,6 @@ pub enum KeeperError {
     InvalidTaskParams = 18,
     /// Arithmetic operation would overflow or underflow.
     ArithmeticOverflow = 19,
-<<<<<<< HEAD
-=======
     /// `batch_register_tasks` was handed more entries than [`MAX_BATCH_SIZE`].
     /// Split the worklist into smaller batches and submit them as separate
     /// calls — see `docs/BATCH_OPERATIONS.md` §4.
@@ -190,7 +179,6 @@ pub enum KeeperError {
     /// The sum of a batch's rewards exceeded the caller-supplied
     /// `max_total_reward` ceiling. Zero transfers occurred.
     BatchRewardCeilingExceeded = 22,
->>>>>>> f8df1c6e6e7091726aea7df87508515aa6c82b8b
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -411,7 +399,6 @@ fn next_task_id(e: &Env) -> u64 {
     next
 }
 
-<<<<<<< HEAD
 /// Ledgers close roughly every 5 seconds on Stellar. Used only to sanity-check
 /// that a task's storage outlives its deadline; a conservative estimate is
 /// correct here because over-estimating the ledger rate over-provisions TTL.
@@ -434,8 +421,6 @@ fn required_ttl_ledgers(e: &Env, deadline: u64) -> u64 {
     ledgers_until_deadline + TTL_SAFETY_MARGIN_LEDGERS as u64
 }
 
-=======
->>>>>>> f8df1c6e6e7091726aea7df87508515aa6c82b8b
 fn load_task(e: &Env, task_id: u64) -> Result<Task, KeeperError> {
     e.storage()
         .persistent()
@@ -568,6 +553,9 @@ fn validate_task_params(
     if ttl_ledgers < MIN_TTL_LEDGERS {
         return Err(KeeperError::InvalidTaskParams);
     }
+    if (ttl_ledgers as u64) < required_ttl_ledgers(e, deadline) {
+        return Err(KeeperError::TtlTooShort);
+    }
     Ok(())
 }
 
@@ -605,9 +593,6 @@ fn lock_expired(e: &Env, task: &Task) -> bool {
 
 /// Semantic version of the contract logic. Bumped on behavior changes so
 /// off-chain clients and indexers can detect which ABI they are talking to.
-<<<<<<< HEAD
-pub const VERSION: u32 = 2;
-=======
 ///
 /// - `1` — MVP lifecycle surface.
 /// - `2` — `calldata` bounded by [`MAX_CALLDATA_LEN`], adding the
@@ -617,7 +602,6 @@ pub const VERSION: u32 = 2;
 ///   `BatchTooLarge` / `EmptyBatch` / `BatchRewardCeilingExceeded` error
 ///   variants.
 pub const VERSION: u32 = 3;
->>>>>>> f8df1c6e6e7091726aea7df87508515aa6c82b8b
 
 /// Maximum `calldata` length, in bytes. Sized to hold an encoded contract
 /// call — a target address, a function symbol, and a handful of scalar or
@@ -733,27 +717,6 @@ impl KeeperRegistry {
         require_not_paused(&e)?;
         owner.require_auth();
 
-<<<<<<< HEAD
-        if reward <= 0 {
-            return Err(KeeperError::InvalidReward);
-        }
-        let min_reward: i128 = e.storage().instance().get(&DataKey::MinReward).unwrap_or(0);
-        if reward < min_reward {
-            return Err(KeeperError::InvalidReward);
-        }
-        if deadline <= e.ledger().timestamp() {
-            return Err(KeeperError::DeadlinePassed);
-        }
-        if calldata.len() > MAX_CALLDATA_LEN {
-            return Err(KeeperError::CalldataTooLarge);
-        }
-        if !(MIN_LOCK_LEDGERS..=MAX_LOCK_LEDGERS).contains(&lock_ledgers) {
-            return Err(KeeperError::InvalidTaskParams);
-        }
-        if ttl_ledgers < MIN_TTL_LEDGERS {
-            return Err(KeeperError::InvalidTaskParams);
-        }
-=======
         validate_task_params(
             &e,
             reward,
@@ -763,20 +726,11 @@ impl KeeperRegistry {
             ttl_ledgers,
             lock_ledgers,
         )?;
->>>>>>> f8df1c6e6e7091726aea7df87508515aa6c82b8b
 
         bump_instance(&e);
 
         // Escrow the reward from the owner into this contract.
-<<<<<<< HEAD
-        let token = reward_token(&e)?;
-        if (ttl_ledgers as u64) < required_ttl_ledgers(&e, deadline) {
-            return Err(KeeperError::TtlTooShort);
-        }
-        token.transfer(&owner, &e.current_contract_address(), &reward);
-=======
         reward_token(&e)?.transfer(&owner, &e.current_contract_address(), &reward);
->>>>>>> f8df1c6e6e7091726aea7df87508515aa6c82b8b
 
         let task_id = next_task_id(&e);
         let task = Task {
@@ -797,8 +751,6 @@ impl KeeperRegistry {
         Ok(task_id)
     }
 
-<<<<<<< HEAD
-=======
     // ── batch_register_tasks ─────────────────────────────────────────────────
     //
     // Registers every entry in `tasks` under a single owner auth, amortizing
@@ -901,7 +853,6 @@ impl KeeperRegistry {
         Ok(task_ids)
     }
 
->>>>>>> f8df1c6e6e7091726aea7df87508515aa6c82b8b
     // ── increase_reward ──────────────────────────────────────────────────────
     //
     // The owner tops up the bounty on a task that hasn't finished yet (Pending
@@ -971,10 +922,7 @@ impl KeeperRegistry {
         save_task(&e, task_id, &task);
 
         emit_deadline_extended(&e, task_id, new_deadline);
-<<<<<<< HEAD
-=======
         log!(&e, "Task {} deadline extended to {}", task_id, new_deadline);
->>>>>>> f8df1c6e6e7091726aea7df87508515aa6c82b8b
         Ok(())
     }
 
@@ -1188,17 +1136,10 @@ impl KeeperRegistry {
     // | `claim_task`       | BLOCKED     | opens new keeper exposure              |
     // | `execute_task`     | BLOCKED     | pays out new rewards                   |
     // | `increase_reward`  | BLOCKED     | opens new escrow exposure              |
-<<<<<<< HEAD
     // | `extend_deadline`  | BLOCKED     | stops deadline from being moved on a   |
     // |                    |             | paused task, which could otherwise     |
     // |                    |             | re-open it to interaction when the     |
     // |                    |             | intent of pause is to freeze activity. |
-=======
-    // | `extend_deadline`  | BLOCKED     | keeps escrow locked in a contract the  |
-    // |                    |             | admin has declared unsafe; touches no  |
-    // |                    |             | funds directly but works against the   |
-    // |                    |             | point of a pause if left open          |
->>>>>>> f8df1c6e6e7091726aea7df87508515aa6c82b8b
     // | `cancel_task`      | allowed     | owner reclaiming pending-task escrow;  |
     // |                    |             | liveness, not new exposure             |
     // | `expire_task`      | allowed     | permissionless fund recovery           |
@@ -1282,9 +1223,6 @@ impl KeeperRegistry {
     pub fn upgrade(e: Env, admin: Address, new_wasm_hash: BytesN<32>) -> Result<(), KeeperError> {
         require_admin(&e, &admin)?;
         bump_instance(&e);
-<<<<<<< HEAD
-        e.deployer().update_current_contract_wasm(new_wasm_hash);
-=======
 
         // Emitted *before* the wasm swap: once `update_current_contract_wasm`
         // runs, the rest of this invocation continues under the new code's
@@ -1294,7 +1232,6 @@ impl KeeperRegistry {
 
         e.deployer().update_current_contract_wasm(new_wasm_hash.clone());
         log!(&e, "Contract upgraded by {} to {:?}", admin, new_wasm_hash);
->>>>>>> f8df1c6e6e7091726aea7df87508515aa6c82b8b
         Ok(())
     }
 

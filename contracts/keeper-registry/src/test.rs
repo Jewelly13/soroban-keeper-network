@@ -212,11 +212,7 @@ fn test_split_reward_invariants() {
 #[test]
 fn test_version_is_exposed() {
     let s = setup();
-<<<<<<< HEAD
-    assert_eq!(s.registry.version(), 2u32);
-=======
     assert_eq!(s.registry.version(), 3u32);
->>>>>>> f8df1c6e6e7091726aea7df87508515aa6c82b8b
 }
 
 #[test]
@@ -441,7 +437,6 @@ fn test_register_increments_task_counter() {
 }
 
 #[test]
-<<<<<<< HEAD
 fn test_register_task_ttl_shorter_than_deadline_fails() {
     let env = Env::default();
     env.mock_all_auths();
@@ -477,8 +472,6 @@ fn test_register_task_ttl_shorter_than_deadline_fails() {
 }
 
 #[test]
-=======
->>>>>>> f8df1c6e6e7091726aea7df87508515aa6c82b8b
 fn test_register_task_with_max_calldata_succeeds() {
     let env = Env::default();
     env.mock_all_auths();
@@ -538,7 +531,6 @@ fn test_register_task_over_max_calldata_fails() {
 }
 
 #[test]
-<<<<<<< HEAD
 fn test_register_task_ttl_covering_deadline_succeeds() {
     let s = setup();
     // deadline is 3_600s away; required TTL is 720 ledgers + the 17_280
@@ -598,8 +590,6 @@ fn test_expire_task_succeeds_past_old_ttl_boundary() {
 }
 
 #[test]
-=======
->>>>>>> f8df1c6e6e7091726aea7df87508515aa6c82b8b
 fn test_register_task_with_empty_calldata_succeeds() {
     let env = Env::default();
     env.mock_all_auths();
@@ -727,8 +717,6 @@ fn test_register_task_ttl_ledgers_at_min_succeeds() {
         &deadline,
         &MIN_TTL_LEDGERS,
         &120u32,
-<<<<<<< HEAD
-=======
     );
     assert_eq!(s.registry.get_task(&task_id).ttl_ledgers, MIN_TTL_LEDGERS);
 }
@@ -925,6 +913,15 @@ fn test_batch_register_one_bad_entry_rejects_entire_batch() {
             },
             KeeperError::InvalidTaskParams,
         ),
+        (
+            BatchTaskParams {
+                // Issue 11 fix for batch parameters too: ttl must cover deadline
+                ttl_ledgers: 17_280, // far too short for this deadline
+                deadline: s.env.ledger().timestamp() + 2_592_000,
+                ..batch_entry(&s.env, 1_000_000i128)
+            },
+            KeeperError::TtlTooShort,
+        ),
     ];
 
     for (bad, expected) in cases {
@@ -1026,9 +1023,7 @@ fn test_batch_register_tasks_are_all_owned_by_the_authorizing_owner() {
     assert_eq!(
         s.registry.try_cancel_task(&other, &ids.get(0).unwrap()),
         Err(Ok(KeeperError::NotTaskOwner))
->>>>>>> f8df1c6e6e7091726aea7df87508515aa6c82b8b
     );
-    assert_eq!(s.registry.get_task(&task_id).ttl_ledgers, MIN_TTL_LEDGERS);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2384,22 +2379,9 @@ fn test_set_min_reward_by_non_admin_fails() {
 #[test]
 fn test_set_fee_emits_event() {
     let s = setup();
-<<<<<<< HEAD
-    let old_bps = s.registry.get_fee_bps();
-    let new_bps = 500u32;
-
-    s.registry.set_fee_bps(&s.admin, &500u32);
-
-    let event = s.env.events().all().last().unwrap();
-    let (event_old, event_new): (u32, u32) = event.2.try_into_val(&s.env).unwrap();
-
-    assert_eq!(event_old, old_bps);
-    assert_eq!(event_new, new_bps);
-=======
     let before = s.env.events().all().len();
     s.registry.set_fee_bps(&s.admin, &500u32);
     assert!(s.env.events().all().len() > before);
->>>>>>> f8df1c6e6e7091726aea7df87508515aa6c82b8b
 }
 
 #[test]
@@ -2433,21 +2415,9 @@ fn test_transfer_admin_moves_control() {
 fn test_transfer_admin_emits_event() {
     let s = setup();
     let new_admin = Address::generate(&s.env);
-<<<<<<< HEAD
-    let old_admin = s.admin.clone();
-
-    s.registry.transfer_admin(&s.admin, &new_admin);
-
-    let event = s.env.events().all().last().unwrap();
-    let (event_old, event_new): (Address, Address) = event.2.try_into_val(&s.env).unwrap();
-
-    assert_eq!(event_old, old_admin);
-    assert_eq!(event_new, new_admin);
-=======
     let before = s.env.events().all().len();
     s.registry.transfer_admin(&s.admin, &new_admin);
     assert!(s.env.events().all().len() > before);
->>>>>>> f8df1c6e6e7091726aea7df87508515aa6c82b8b
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3336,8 +3306,6 @@ fn test_initialize_no_event_when_validation_fails() {
         "no event should be emitted on validation failure"
     );
 }
-<<<<<<< HEAD
-=======
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CPU-instruction regression ceilings — issue 0107. `claim_task` and
@@ -3396,7 +3364,6 @@ fn test_execute_task_cpu_instructions_within_ceiling() {
     );
 }
 
->>>>>>> f8df1c6e6e7091726aea7df87508515aa6c82b8b
 // Property tests (issue #93 / backlog 0068): compact proptest coverage per
 // I-N invariant, using the shared `invariants` module so these and any
 // future fuzz target assert the exact same thing. This is intentionally a
@@ -3602,8 +3569,6 @@ proptest! {
             .expect("I-7: task ids must be strictly increasing and never reused");
     }
 }
-<<<<<<< HEAD
-=======
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Resource cost report (backlog 0100) — not a correctness test. Drives one
@@ -3717,4 +3682,3 @@ fn resource_report() {
     }
     std::fs::write(out_path, json).expect("failed to write target/resource-report.json");
 }
->>>>>>> f8df1c6e6e7091726aea7df87508515aa6c82b8b

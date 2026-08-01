@@ -14,8 +14,6 @@ without blocking your PR.
 | `clippy` | Advisory (`continue-on-error: true`) | Lints are useful but subjective enough that a maintainer should decide case-by-case, not have every PR blocked by a new upstream lint. |
 | `audit` | Advisory (`continue-on-error: true`) | A new upstream dependency CVE should notify maintainers, not fail every open PR the moment it's published. |
 | `wasm-size` | Advisory (`continue-on-error: true`) | Reports binary size for visibility; see below. |
-| `fuzz-pr` | Advisory (`continue-on-error: true`) | Time-boxed fuzz run on PRs that touch contract or fuzz code. |
-| `resource-cost` | Advisory (`continue-on-error: true`) | Reports resource usage against a baseline for visibility. |
 
 `ci-required` is the single check branch protection should require — it
 passes only when `format`, `test`, `build-wasm`, and `bot` all succeed, and
@@ -70,12 +68,3 @@ Per-entry-point CPU-instruction ceilings for the hottest contract functions
 the "CPU-instruction regression ceilings" section of that file for the
 reasoning and the margin chosen. These run as part of the required `test`
 job like any other test.
-
-## Windows line endings
-
-The repository uses `.gitattributes` to enforce Unix-style line endings (`LF`)
-for all text files. If you are on Windows and `cargo fmt --check` fails with
-"Incorrect newline style" even though CI is green, your local git config may
-be overriding this (`core.autocrlf = true`). The fix is to run `git config
-core.autocrlf false` in the repository and re-clone or reset your working
-tree.

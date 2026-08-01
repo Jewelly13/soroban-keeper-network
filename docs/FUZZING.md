@@ -192,9 +192,6 @@ order:
   repo currently has one compact `proptest!` per invariant (see
   `test.rs`), not the exhaustive, sequence-driven exploration those
   issues call for.
-<<<<<<< HEAD
-- **A CI fuzz job** (backlog 0066) and **`docs/CI.md`** (backlog 0043).
-=======
->>>>>>> f8df1c6e6e7091726aea7df87508515aa6c82b8b
+
 - **A committed crash corpus** under `fuzz/corpus/*/regressions/` — none
   exists yet, since no crash has been found and minimized.

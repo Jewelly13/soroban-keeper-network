@@ -94,9 +94,9 @@ make ci
 make check
 ```
 
----
+We use **trunk-based development**. The `main` branch is the trunk, and it must always be stable and releasable.
 
-## Project Structure
+All work happens on short-lived branches prefixed with `feature/`, `fix/`, etc.
 
 ```
 soroban-keeper-network/
@@ -122,7 +122,14 @@ soroban-keeper-network/
 └── LICENSE
 ```
 
----
+| Branch | Purpose | Direct push? |
+|--------|---------|-------------|
+| `main` | The single source of truth. Always stable. | **Never** |
+| `feature/*` | New features | Your own branch — yes |
+| `fix/*` | Bug fixes | Your own branch — yes |
+| `chore/*` | Dependency updates, tooling, CI | Your own branch — yes |
+| `docs/*` | Documentation only changes | Your own branch — yes |
+| `refactor/*` | Code restructuring (no behaviour change) | Your own branch — yes |
 
 ## Git Workflow
 
@@ -276,14 +283,6 @@ not unix timestamp. Existing tasks with in-flight claims are unaffected.
 - **Style**: ES2022+, `"use strict"`, CommonJS (`require`).
 - **No TypeScript** in the example (to keep it beginner-friendly). A TypeScript version is welcome as a separate example.
 - **Linting**: ESLint with the config in `examples/keeper-bot/eslint.config.js`.
-
----
-
-## CI Checks
-
-When you open a pull request, a series of automated checks run to ensure code quality and correctness. These are split into **required** checks that must pass for a PR to be merged, and **advisory** checks that provide information but do not block a merge.
-
-See the full guide in **docs/CI.md** for a list of all checks, what they do, and how to fix them.
 
 ---
 

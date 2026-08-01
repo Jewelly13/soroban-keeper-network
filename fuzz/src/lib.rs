@@ -31,9 +31,6 @@
 #![cfg_attr(feature = "libfuzzer-sys", no_main)]
 
 // Re-export support module for fuzz targets
-<<<<<<< HEAD
-pub mod support;
-=======
 pub mod support;
 
 // Corpus seed generator (issue #92) — only compiled for `cargo test`, since
@@ -41,4 +38,3 @@ pub mod support;
 // fuzz targets themselves.
 #[cfg(test)]
 pub mod seed;
->>>>>>> f8df1c6e6e7091726aea7df87508515aa6c82b8b

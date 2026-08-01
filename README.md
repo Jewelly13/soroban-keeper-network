@@ -21,6 +21,9 @@
 | [Architecture](docs/ARCHITECTURE.md) | Components, task lifecycle, storage, money invariants, trust model |
 | [Fuzzing & property testing](docs/FUZZING.md) | Running/adding fuzz targets, the shared invariant module, crash-to-regression convention |
 | [Verifier design (E04)](docs/VERIFIER_DESIGN.md) | Proposed `IKeeperVerifier` interface for optional on-chain proof verification |
+| [Batch operations (E05)](docs/BATCH_OPERATIONS.md) | Proposed `batch_register_tasks` design + integration guide |
+| [Storage layout survey](docs/STORAGE_LAYOUT.md) | `Task` struct storage-cost findings and recommendations |
+| [CI](docs/CI.md) | What each CI job checks and which are advisory vs. required |
 | [Deploying & running](docs/DEPLOYING.md) | Testnet deploy walkthrough and keeper-bot operator guide |
 | [Deployments](DEPLOYMENTS.md) | Canonical record of on-chain addresses |
 | [Contributing](CONTRIBUTING.md) | How to pick up an issue and open your first PR |
@@ -110,7 +113,7 @@ A **shared, permissionless, on-chain coordination layer** where:
 ### Phase 2 (Roadmap)
 
 - [ ] **On-chain execution verifier interface** — target contracts implement `IKeeperVerifier` and the registry calls them to verify execution succeeded
-- [ ] **Batch task registration** — register multiple tasks in one transaction
+- [x] **Batch task registration** — `batch_register_tasks` registers up to `MAX_BATCH_SIZE` tasks in one transaction under a single owner auth, with a `max_total_reward` escrow ceiling (see [docs/BATCH_OPERATIONS.md](docs/BATCH_OPERATIONS.md))
 - [ ] **EIP-like task conditions** — on-chain `checkUpkeep` callback before claiming
 - [ ] **Keeper reputation scores** — slash stake for missed executions
 - [ ] **Keeper staking** — stake XLM or governance token for priority and dispute resolution
@@ -255,23 +258,42 @@ A **shared, permissionless, on-chain coordination layer** where:
 
 #### FR-7: Admin Controls
 - `pause`/`unpause` MUST gate `register_task`, `claim_task`, `execute_task`,
-  and `increase_reward` — all four open new escrow or reward exposure.
+  `increase_reward`, and `extend_deadline` — the first four open new escrow
+  or reward exposure, and `extend_deadline` can keep escrow locked in a
+  contract the admin has declared unsafe if left open.
 - `pause`/`unpause` MUST NOT gate `cancel_task`, `expire_task`, or
   `withdraw_rewards` — these only let already-escrowed value flow back to
   whoever already owns it, which must always stay available so an admin
   pause can never become a fund freeze. Read-only views are likewise never
   gated.
-- `extend_deadline` is currently **not** gated by pause in the deployed code
-  (own bug, tracked separately from this requirement) — it changes no funds
-  either way, but the intent was likely for it to follow
-  register/claim/execute. See the `pause`/`unpause` doc comment in
+  See the `pause`/`unpause` doc comment in
   `contracts/keeper-registry/src/lib.rs` and the
   `test_pause_policy_matrix_entry_point_by_entry_point` test in
   `contracts/keeper-registry/src/test.rs` for the authoritative, verified
   matrix.
 - `set_fee_bps` MUST reject values > 10 000.
 - `transfer_admin` MUST require auth from BOTH current admin AND new admin.
-- `upgrade` MUST use `deployer().update_current_contract_wasm`.
+- `upgrade` MUST use `deployer().update_current_contract_wasm`, and MUST
+  emit `Upgraded` (admin + new WASM hash) before doing so.
+
+#### FR-8 — Batch Task Registration
+
+`batch_register_tasks` is implemented; see
+[docs/BATCH_OPERATIONS.md](docs/BATCH_OPERATIONS.md) for the full design and
+integration guide.
+- `batch_register_tasks` MUST require the owner's auth once for the entire
+  batch, not per entry.
+- MUST reject the whole call, with zero transfers, if the sum of the
+  batch's rewards exceeds the caller-supplied `max_total_reward`.
+- MUST reject the whole call, with zero transfers, if any single entry fails
+  the same validation `register_task` applies.
+- MUST reject a batch larger than `MAX_BATCH_SIZE` with `BatchTooLarge`,
+  rather than letting it fail as opaque resource exhaustion.
+- MUST return task ids in the same order as the input entries.
+
+Note that `MAX_BATCH_SIZE` is currently a conservative guard rather than a
+measured ceiling — issue 0104 owns the empirical measurement. Read the live
+value from the `max_batch_size()` view instead of hardcoding it.
 
 ---
 
@@ -333,6 +355,59 @@ encoded parameters.
 
 All events use two-topic format `(verb_symbol, noun_symbol)` for efficient filtering.
 
+```text
+contracts/keeper-registry/  Soroban keeper registry contract
+examples/keeper-bot/         Example keeper bot (keeper side)
+examples/batch-register/     Batch registration helper (task-owner side)
+a fuzz/                        Fuzzing targets and shared support code
+docs/                        Architecture, deployment, and demo documentation
+```
+
+## Development
+### Events
+
+Events are the integration contract for off-chain consumers. The table below is
+transcribed from the `emit_*` functions in `contracts/keeper-registry/src/lib.rs`
+(all grouped under the `Events` banner) and lists every event the contract
+emits, and nothing it does not. Build event filters from the **Topics** column
+only — the `Event` names are documentation labels, not on-chain values.
+
+Every event publishes exactly two topic symbols. Both are `symbol_short!`
+literals, which Soroban limits to **9 characters**; that is why several topics
+are abbreviated (`wdraw`, not `withdraw`; `verfail`, not `verifailed`; `minrwd`,
+not `min_reward`). The abbreviations are part of the on-chain interface and
+cannot be "corrected" without breaking existing consumers.
+
+| Event | Emitted by | Topics | Data (in order, with type) |
+|-------|-----------|--------|----------------------------|
+| `Initialized` | `initialize` | `("init", "admin")` | `(admin: Address, reward_token: Address, fee_bps: u32)` — emitted at most once |
+| `TaskRegistered` | `register_task` | `("reg", "task")` | `(task_id: u64, owner: Address, reward: i128, deadline: u64)` |
+| `RewardIncreased` | `increase_reward` | `("topup", "task")` | `(task_id: u64, new_reward: i128)` — the new **total** reward, not the delta |
+| `DeadlineExtended` | `extend_deadline` | `("extend", "task")` | `(task_id: u64, new_deadline: u64)` |
+| `VerifierUpdated` | `update_verifier` | `("verifier", "task")` | `(task_id: u64, verifier: Option<Address>)` — `None` clears the verifier |
+| `TaskClaimed` | `claim_task` | `("claim", "task")` | `(task_id: u64, keeper: Address, ledger_seq: u32)` |
+| `TaskVerificationFailed` | `execute_task` | `("verfail", "task")` | `(task_id: u64, keeper: Address)` |
+| `TaskExecuted` | `execute_task` | `("exec", "task")` | `(task_id: u64, keeper: Address, net_reward: i128, proof: Bytes)` |
+| `TaskCancelled` | `cancel_task` | `("cancel", "task")` | `(task_id: u64, owner: Address)` |
+| `TaskExpired` | `expire_task` | `("exp", "task")` | `(task_id: u64,)` |
+| `RewardsWithdrawn` | `withdraw_rewards` | `("wdraw", "reward")` | `(keeper: Address, amount: i128)` |
+| `Paused` | `pause` / `unpause` | `("paused", "admin")` | `(paused: bool,)` — `true` from `pause`, `false` from `unpause` |
+| `FeeUpdated` | `set_fee_bps` | `("fee", "admin")` | `(old_bps: u32, new_bps: u32)` |
+| `MinRewardUpdated` | `set_min_reward` | `("minrwd", "admin")` | `(old_min: i128, new_min: i128)` |
+| `AdminTransferred` | `transfer_admin` | `("admin", "xfer")` | `(old_admin: Address, new_admin: Address)` |
+| `FeesSwept` | `sweep_fees` | `("sweep", "admin")` | `(treasury: Address, amount: i128, remaining: i128)` |
+| `Upgraded` | `upgrade` | `("upgrade", "admin")` | `(admin: Address, new_wasm_hash: BytesN<32>)` — emitted before the executable is swapped |
+
+Notes:
+
+- `net_reward` in `TaskExecuted` is the keeper's share **after** the protocol
+  fee, not the task's gross reward.
+- `TaskVerificationFailed` and `TaskExecuted` are both emitted from
+  `execute_task` and are mutually exclusive for a given call: a rejected proof
+  emits the former and returns an error, so no `TaskExecuted` follows.
+- `("admin", "xfer")` is the only event whose first topic is `"admin"`; every
+  other admin event uses `"admin"` as its *second* topic. Filter on both topics,
+  not just one.
 | Event | Topics | Data |
 |-------|--------|------|
 | `TaskRegistered` | `("reg", "task")` | `(task_id, owner, reward, deadline)` |
@@ -483,6 +558,62 @@ cp .env.example .env
 # Edit .env with your secret key and contract ID
 npm run start:testnet
 ```
+
+### Registering Tasks in Bulk
+
+The owner-side counterpart: reads a JSON or CSV task list and registers the
+whole list in one `batch_register_tasks` call. See
+[examples/batch-register/README.md](examples/batch-register/README.md) for the
+file format and the reasoning behind how it sets `max_total_reward`.
+
+```bash
+cd examples/batch-register
+npm install
+cp .env.example .env
+# Edit .env with your funded owner secret key and contract ID
+node index.js tasks.example.json --dry-run   # validate + preview
+node index.js tasks.example.json             # submit
+```
+
+#### Executor Interface
+
+The bot dispatches off-chain execution to a per-`task_type` executor rather
+than performing (or faking) the work inline. This exists because the
+registry's trust model (see "Known Design Decisions" #1 below) has no
+on-chain verification of a keeper's proof — the bot itself is the only
+thing standing between "did the work" and "claimed the reward for work it
+didn't do", so the reference implementation refuses unhandled task types
+instead of fabricating proof for them.
+
+An executor is an async function with this contract:
+
+```js
+/**
+ * @param {object} task
+ *   { taskId, taskType, taskTypeName, calldata (Buffer), reward, deadline }
+ * @param {object} ctx
+ *   { server, keypair, networkPassphrase, log }
+ * @returns {Promise<Buffer|null>}
+ *   Proof bytes on success; null if the work could not be completed.
+ *   Returning null (or throwing) means the bot will NOT call execute_task —
+ *   the task is left for another keeper or for expiry.
+ */
+async function myExecutor(task, ctx) { /* ... */ }
+```
+
+Register one per task type in `EXECUTORS` (`examples/keeper-bot/index.js`):
+
+```js
+const EXECUTORS = {
+  TtlExtension: ttlExtensionExecutor, // worked example, included
+  // Liquidation: myLiquidationExecutor,
+};
+```
+
+There is no default executor that fabricates a proof. A task type with
+nothing registered is skipped and logged, not faked — set
+`SIMULATE_EXECUTION=true` (development only, see `.env.example`) if you
+need the daemon loop to complete a round without a real executor in place.
 
 ---
 

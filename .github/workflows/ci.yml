@@ -5,14 +5,9 @@ name: CI
 #
 # Job policy (see docs/CI.md for the rationale):
 #   REQUIRED  — format, test, build-wasm. These block the merge.
-<<<<<<< HEAD
-#   ADVISORY  — clippy, audit, wasm-size, bot. These report findings as
-#               annotations or a job summary but never fail your PR.
-=======
 #   ADVISORY  — clippy, audit, wasm-size, fuzz-pr, resource-cost, bot. These
 #               report findings as annotations or a job summary but never
 #               fail your PR.
->>>>>>> f8df1c6e6e7091726aea7df87508515aa6c82b8b
 #
 # The split is deliberate. A contributor should never be blocked by a new
 # upstream advisory or a subjective lint, but formatting, a green test suite,
@@ -413,13 +408,8 @@ jobs:
   ci-required:
     name: CI required checks
     runs-on: ubuntu-latest
-<<<<<<< HEAD
-    if: always() # Run even if dependencies fail, to report the aggregate status.
-    needs: [format, test, build-wasm]
-=======
     if: always()
     needs: [format, test, build-wasm, bot]
->>>>>>> f8df1c6e6e7091726aea7df87508515aa6c82b8b
     steps:
       - name: Verify required jobs succeeded
         run: |
