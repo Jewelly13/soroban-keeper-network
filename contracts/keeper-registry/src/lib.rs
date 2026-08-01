@@ -7,6 +7,9 @@
 //! ## Implemented surface (MVP complete)
 //! - Full schema: storage keys, types, errors, and events
 //! - `initialize` / `register_task` — deploy, configure, and post funded tasks
+//! - `batch_register_tasks` — register up to [`MAX_BATCH_SIZE`] tasks under a
+//!   single owner auth, with a `max_total_reward` ceiling on the escrow the
+//!   call may pull (see `docs/BATCH_OPERATIONS.md`)
 //! - `claim_task` — first-come-first-served keeper locking with re-claim after
 //!   the lock window elapses
 //! - `execute_task` — proof submission, reward split, keeper crediting
@@ -30,7 +33,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, log, symbol_short, token, Address, Bytes,
-    BytesN, Env,
+    BytesN, Env, Vec,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -117,6 +120,20 @@ pub struct Task {
     pub lock_ledgers: u32,
 }
 
+/// One entry in a [`KeeperRegistry::batch_register_tasks`] call — the same
+/// fields `register_task` takes, minus `owner`, which is shared across the
+/// whole batch (one auth for the batch, see `docs/BATCH_OPERATIONS.md` §2).
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct BatchTaskParams {
+    pub task_type: TaskType,
+    pub calldata: Bytes,
+    pub reward: i128,
+    pub deadline: u64,
+    pub ttl_ledgers: u32,
+    pub lock_ledgers: u32,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Errors
 // ─────────────────────────────────────────────────────────────────────────────
@@ -152,6 +169,18 @@ pub enum KeeperError {
     InvalidTaskParams = 18,
     /// Arithmetic operation would overflow or underflow.
     ArithmeticOverflow = 19,
+    /// `batch_register_tasks` was handed more entries than [`MAX_BATCH_SIZE`].
+    /// Split the worklist into smaller batches and submit them as separate
+    /// calls — see `docs/BATCH_OPERATIONS.md` §4.
+    BatchTooLarge = 20,
+    /// `batch_register_tasks` was handed an empty `tasks` vector. Rejected
+    /// rather than treated as a no-op so a caller whose off-chain filter
+    /// produced nothing finds out, instead of paying for an auth and a
+    /// transaction that registered nothing.
+    EmptyBatch = 21,
+    /// The sum of a batch's rewards exceeded the caller-supplied
+    /// `max_total_reward` ceiling. Zero transfers occurred.
+    BatchRewardCeilingExceeded = 22,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -473,6 +502,45 @@ fn accrue_fee(e: &Env, amount: i128) -> Result<(), KeeperError> {
     Ok(())
 }
 
+/// Per-task parameter validation shared by `register_task` and every entry of
+/// `batch_register_tasks`, so the two paths can never drift into accepting
+/// different task shapes.
+///
+/// `min_reward` is passed in rather than read here: a batch validates N
+/// entries against the same floor, and re-reading instance storage per entry
+/// would charge the caller N times for one unchanging value.
+fn validate_task_params(
+    e: &Env,
+    reward: i128,
+    min_reward: i128,
+    deadline: u64,
+    calldata_len: u32,
+    ttl_ledgers: u32,
+    lock_ledgers: u32,
+) -> Result<(), KeeperError> {
+    if reward <= 0 || reward < min_reward {
+        return Err(KeeperError::InvalidReward);
+    }
+    if deadline <= e.ledger().timestamp() {
+        return Err(KeeperError::DeadlinePassed);
+    }
+    if calldata_len > MAX_CALLDATA_LEN {
+        return Err(KeeperError::CalldataTooLarge);
+    }
+    if !(MIN_LOCK_LEDGERS..=MAX_LOCK_LEDGERS).contains(&lock_ledgers) {
+        return Err(KeeperError::InvalidTaskParams);
+    }
+    if ttl_ledgers < MIN_TTL_LEDGERS {
+        return Err(KeeperError::InvalidTaskParams);
+    }
+    Ok(())
+}
+
+/// Reads the configured anti-dust reward floor (0 if never set).
+fn min_reward_floor(e: &Env) -> i128 {
+    e.storage().instance().get(&DataKey::MinReward).unwrap_or(0)
+}
+
 /// True once a claimed task's exclusive lock window has elapsed, meaning any
 /// keeper may re-claim it. This is what prevents a keeper from claiming and then
 /// never executing: after `lock_ledgers`, the task is fair game again.
@@ -502,7 +570,15 @@ fn lock_expired(e: &Env, task: &Task) -> bool {
 
 /// Semantic version of the contract logic. Bumped on behavior changes so
 /// off-chain clients and indexers can detect which ABI they are talking to.
-pub const VERSION: u32 = 2;
+///
+/// - `1` — MVP lifecycle surface.
+/// - `2` — `calldata` bounded by [`MAX_CALLDATA_LEN`], adding the
+///   `CalldataTooLarge` error variant.
+/// - `3` — batch registration: the `batch_register_tasks` and
+///   `max_batch_size` entry points, the [`BatchTaskParams`] type, and the
+///   `BatchTooLarge` / `EmptyBatch` / `BatchRewardCeilingExceeded` error
+///   variants.
+pub const VERSION: u32 = 3;
 
 /// Maximum `calldata` length, in bytes. Sized to hold an encoded contract
 /// call — a target address, a function symbol, and a handful of scalar or
@@ -520,6 +596,26 @@ pub const MAX_CALLDATA_LEN: u32 = 1024;
 /// the two shapes of proof this MVP expects — while keeping the emitted
 /// event's cost bounded and predictable.
 pub const MAX_PROOF_LEN: u32 = 256;
+
+/// Maximum number of entries accepted by
+/// [`KeeperRegistry::batch_register_tasks`].
+///
+/// **This is a conservative bound, not yet an empirically measured one** —
+/// measuring the real ceiling against Soroban's per-transaction CPU and
+/// ledger-write budgets is backlog issue 0104's job, and this constant should
+/// be revised (up or down) once that measurement lands. It exists now so an
+/// oversized batch fails with [`KeeperError::BatchTooLarge`] rather than an
+/// opaque host-level resource-exhaustion error the caller cannot act on.
+///
+/// Why 50: each entry writes one `Task`, whose `calldata` alone may be up to
+/// [`MAX_CALLDATA_LEN`] (1024) bytes. At 50 entries that is ~50 KB of ledger
+/// writes in a single transaction before the rest of the `Task` struct, the
+/// per-entry token transfer, and the per-entry event are counted. Entry count
+/// is therefore only half the story: a batch of small-`calldata` entries has
+/// far more headroom than a batch of maximum-sized ones, and a caller who
+/// packs both large payloads and many entries can still exhaust the budget
+/// below this cap. See `docs/BATCH_OPERATIONS.md` §4.
+pub const MAX_BATCH_SIZE: u32 = 50;
 
 #[contract]
 pub struct KeeperRegistry;
@@ -599,25 +695,15 @@ impl KeeperRegistry {
         require_not_paused(&e)?;
         owner.require_auth();
 
-        if reward <= 0 {
-            return Err(KeeperError::InvalidReward);
-        }
-        let min_reward: i128 = e.storage().instance().get(&DataKey::MinReward).unwrap_or(0);
-        if reward < min_reward {
-            return Err(KeeperError::InvalidReward);
-        }
-        if deadline <= e.ledger().timestamp() {
-            return Err(KeeperError::DeadlinePassed);
-        }
-        if calldata.len() > MAX_CALLDATA_LEN {
-            return Err(KeeperError::CalldataTooLarge);
-        }
-        if !(MIN_LOCK_LEDGERS..=MAX_LOCK_LEDGERS).contains(&lock_ledgers) {
-            return Err(KeeperError::InvalidTaskParams);
-        }
-        if ttl_ledgers < MIN_TTL_LEDGERS {
-            return Err(KeeperError::InvalidTaskParams);
-        }
+        validate_task_params(
+            &e,
+            reward,
+            min_reward_floor(&e),
+            deadline,
+            calldata.len(),
+            ttl_ledgers,
+            lock_ledgers,
+        )?;
 
         bump_instance(&e);
 
@@ -642,6 +728,108 @@ impl KeeperRegistry {
 
         log!(&e, "Task {} registered reward={}", task_id, reward);
         Ok(task_id)
+    }
+
+    // ── batch_register_tasks ─────────────────────────────────────────────────
+    //
+    // Registers every entry in `tasks` under a single owner auth, amortizing
+    // the fixed per-call overhead `register_task` pays N times over N separate
+    // transactions. The full design rationale — auth model, partial-failure
+    // semantics, the resource ceiling, and integrator guidance on sizing
+    // `max_total_reward` — lives in docs/BATCH_OPERATIONS.md.
+    //
+    // Arguments:
+    //   owner            — address funding every task in the batch (auths once)
+    //   tasks            — 1..=MAX_BATCH_SIZE entries, each validated exactly
+    //                      as `register_task` validates its arguments
+    //   max_total_reward — caller-reviewed ceiling on the escrow this call may
+    //                      pull. Set it to the exact sum of the batch; padding
+    //                      only widens the window in which the call could move
+    //                      more than was reviewed (docs §7).
+    //
+    // Returns the new task ids, in the same order as `tasks`.
+
+    pub fn batch_register_tasks(
+        e: Env,
+        owner: Address,
+        tasks: Vec<BatchTaskParams>,
+        max_total_reward: i128,
+    ) -> Result<Vec<u64>, KeeperError> {
+        require_not_paused(&e)?;
+        owner.require_auth();
+
+        if tasks.is_empty() {
+            return Err(KeeperError::EmptyBatch);
+        }
+        if tasks.len() > MAX_BATCH_SIZE {
+            return Err(KeeperError::BatchTooLarge);
+        }
+        if max_total_reward <= 0 {
+            return Err(KeeperError::InvalidReward);
+        }
+
+        // Validate every entry and total the rewards BEFORE moving any funds.
+        // Whole-batch atomicity (docs §3) means a rejection here leaves zero
+        // transfers and zero tasks behind — but doing the full sweep up front
+        // also means a batch that will be rejected never pays for a single
+        // cross-contract token transfer first.
+        let min_reward = min_reward_floor(&e);
+        let mut total_reward: i128 = 0;
+        for params in tasks.iter() {
+            validate_task_params(
+                &e,
+                params.reward,
+                min_reward,
+                params.deadline,
+                params.calldata.len(),
+                params.ttl_ledgers,
+                params.lock_ledgers,
+            )?;
+            total_reward = total_reward
+                .checked_add(params.reward)
+                .ok_or(KeeperError::ArithmeticOverflow)?;
+        }
+        if total_reward > max_total_reward {
+            return Err(KeeperError::BatchRewardCeilingExceeded);
+        }
+
+        bump_instance(&e);
+
+        // One transfer per entry, matching `register_task`'s escrow-per-task
+        // accounting: each task's reward must stay independently refundable by
+        // `cancel_task`/`expire_task` later. Whether these N transfers can be
+        // collapsed into one is analysed in docs/BATCH_OPERATIONS.md §9.
+        let token = reward_token(&e)?;
+        let registry = e.current_contract_address();
+        let mut task_ids = Vec::new(&e);
+        for params in tasks.iter() {
+            token.transfer(&owner, &registry, &params.reward);
+
+            let task_id = next_task_id(&e);
+            let task = Task {
+                owner: owner.clone(),
+                task_type: params.task_type,
+                calldata: params.calldata,
+                reward: params.reward,
+                deadline: params.deadline,
+                ttl_ledgers: params.ttl_ledgers,
+                status: TaskStatus::Pending,
+                claimer: None,
+                claim_ledger: None,
+                lock_ledgers: params.lock_ledgers,
+            };
+            save_task(&e, task_id, &task);
+            emit_task_registered(&e, task_id, &owner, params.reward, params.deadline);
+            task_ids.push_back(task_id);
+        }
+
+        log!(
+            &e,
+            "Batch registered {} tasks, total escrow {}",
+            tasks.len(),
+            total_reward
+        );
+        Ok(task_ids)
     }
 
     // ── increase_reward ──────────────────────────────────────────────────────
@@ -941,6 +1129,8 @@ impl KeeperRegistry {
     // | Entry point       | While paused | Why                                   |
     // |--------------------|-------------|----------------------------------------|
     // | `register_task`    | BLOCKED     | opens new escrow exposure              |
+    // | `batch_register_`  | BLOCKED     | same, N times over — follows           |
+    // | `tasks`            |             | `register_task` exactly                |
     // | `claim_task`       | BLOCKED     | opens new keeper exposure              |
     // | `execute_task`     | BLOCKED     | pays out new rewards                   |
     // | `increase_reward`  | BLOCKED     | opens new escrow exposure              |
@@ -1005,7 +1195,7 @@ impl KeeperRegistry {
             return Err(KeeperError::InvalidReward);
         }
         bump_instance(&e);
-        let old_min: i128 = e.storage().instance().get(&DataKey::MinReward).unwrap_or(0);
+        let old_min: i128 = min_reward_floor(&e);
         e.storage().instance().set(&DataKey::MinReward, &min_reward);
         emit_min_reward_updated(&e, old_min, min_reward);
         log!(&e, "Min reward set to {}", min_reward);
@@ -1179,7 +1369,14 @@ impl KeeperRegistry {
 
     /// Minimum reward required to register a task (0 if unset).
     pub fn min_reward(e: Env) -> i128 {
-        e.storage().instance().get(&DataKey::MinReward).unwrap_or(0)
+        min_reward_floor(&e)
+    }
+
+    /// Maximum number of entries `batch_register_tasks` accepts. See
+    /// [`MAX_BATCH_SIZE`] — exposed so integrators can chunk their worklists
+    /// against the deployed contract's real cap rather than a hardcoded guess.
+    pub fn max_batch_size(_e: Env) -> u32 {
+        MAX_BATCH_SIZE
     }
 
     /// Contract logic version. See [`VERSION`].
