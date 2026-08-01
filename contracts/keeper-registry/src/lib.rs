@@ -94,7 +94,7 @@ pub enum TaskStatus {
 
 /// Full task record stored in Persistent storage.
 #[contracttype]
-#[derive(Clone, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Task {
     /// Address that registered and funded this task.
     pub owner: Address,
@@ -166,6 +166,14 @@ pub enum KeeperError {
     /// their allowed bounds.
     InvalidTaskParams = 18,
     /// Arithmetic operation would overflow or underflow.
+    ArithmeticOverflow = 20,
+    /// The attached verifier reported an `interface_version` other than
+    /// [`KEEPER_VERIFIER_INTERFACE_VERSION`]. `verify` was not called.
+    IncompatibleVerifierInterface = 21,
+    /// A batch read (`get_tasks` / `get_tasks_range`) asked for more than
+    /// [`MAX_BATCH_READ`] task ids. Returned rather than silently truncating,
+    /// so a caller can never mistake a clipped page for the end of a range.
+    BatchTooLarge = 22,
     ArithmeticOverflow = 19,
     /// `batch_register_tasks` was handed more entries than [`MAX_BATCH_SIZE`].
     /// Split the worklist into smaller batches and submit them as separate
@@ -466,6 +474,45 @@ fn fee_bps(e: &Env) -> u32 {
 
 /// Returns (keeper_net, protocol_fee).
 ///
+/// # Rounding guarantee
+///
+/// The protocol fee is `floor(reward * fee_bps / 10_000)` and the keeper
+/// receives the entire remainder. Rounding is therefore **always down for the
+/// protocol and always in the keeper's favour**, and this is a guarantee, not
+/// an incidental property of integer division:
+///
+/// - The protocol can never collect **more** than the nominal `fee_bps` rate.
+///   It may collect very slightly less.
+/// - The shortfall is bounded by **one stroop per execution** — the discarded
+///   remainder is strictly less than the divisor.
+/// - `keeper_net + fee == reward` holds exactly, for every input. No value is
+///   created or destroyed by the split (invariant I-1; see
+///   `docs/ARCHITECTURE.md`, "I-4: Fees are bounded and rounded down").
+///
+/// Rust's integer division truncates toward zero, which coincides with `floor`
+/// here because `register_task` rejects a non-positive `reward`, so this
+/// function is only ever reached with `reward > 0`.
+///
+/// ## Dust threshold
+///
+/// A consequence worth stating explicitly: for small rewards the fee rounds to
+/// **zero** entirely. The fee is non-zero only once
+///
+/// ```text
+/// reward >= ceil(10_000 / fee_bps)
+/// ```
+///
+/// At the 300 bps (3%) default that threshold is 34 stroops: a reward of 33
+/// yields a fee of 0 and the keeper takes all of it, while a reward of 34
+/// yields a fee of 1. Setting `min_reward` below that threshold means the
+/// protocol earns nothing on such tasks while still bearing their storage
+/// cost, which is why `min_reward` and `fee_bps` should be chosen together
+/// rather than independently. See the README tokenomics section.
+///
+/// Anyone reconciling expected against actual protocol revenue should expect a
+/// deficit of up to one stroop per executed task. That is this rounding rule,
+/// not a bug.
+///
 /// `pub` (not crate-private) so the `invariants` module and fuzz targets in
 /// the separate `keeper-registry-fuzz` crate can call the exact same
 /// arithmetic the contract itself uses, rather than reimplementing the
@@ -620,6 +667,22 @@ pub const MAX_CALLDATA_LEN: u32 = 1024;
 /// event's cost bounded and predictable.
 pub const MAX_PROOF_LEN: u32 = 256;
 
+/// Maximum number of task ids a single [`KeeperRegistry::get_tasks`] or
+/// [`KeeperRegistry::get_tasks_range`] call will accept.
+///
+/// Each id costs exactly one Persistent storage read, and every read is
+/// charged against the transaction's read-entry and read-bytes resource
+/// limits. A `Task` is dominated by its `calldata`, capped at
+/// [`MAX_CALLDATA_LEN`] (1 KiB), so a worst-case batch of 50 reads moves on the
+/// order of 50 KiB plus 50 ledger entries — comfortably inside a single
+/// simulation on both counts, with room for the rest of a caller's footprint.
+///
+/// This is a deliberately conservative bound rather than the largest that
+/// would fit: a batch read that intermittently exceeds the resource budget is
+/// worse for a polling bot than one that is always cheap, because the failure
+/// depends on the *contents* of the range rather than on anything the caller
+/// controls. Callers needing more than 50 tasks issue several calls.
+pub const MAX_BATCH_READ: u32 = 50;
 /// Maximum number of entries accepted by
 /// [`KeeperRegistry::batch_register_tasks`].
 ///
@@ -1295,6 +1358,88 @@ impl KeeperRegistry {
 
     pub fn get_task(e: Env, task_id: u64) -> Result<Task, KeeperError> {
         load_task(&e, task_id)
+    }
+
+    /// Reads up to [`MAX_BATCH_READ`] tasks in one call, so an indexer or
+    /// keeper bot can inspect a set of tasks without one RPC round trip per
+    /// task.
+    ///
+    /// **Missing ids.** The result is *positionally aligned* with `ids`: it has
+    /// exactly `ids.len()` entries, and entry `i` is `Some(task)` if `ids[i]`
+    /// exists and `None` if it does not. A single absent id therefore does not
+    /// fail the whole call — a caller scanning a range does not need to know in
+    /// advance which ids are live.
+    ///
+    /// `Vec<Option<Task>>` is used rather than a compacted `Vec<Task>` because
+    /// [`Task`] does not carry its own `task_id`. Omitting missing ids from a
+    /// bare `Vec<Task>` would make the mapping from result back to requested id
+    /// unrecoverable — with two absent ids in a batch of ten, the caller cannot
+    /// tell which eight it got. `None` is a void XDR variant, so the alignment
+    /// costs almost nothing on the wire even for a sparse range.
+    ///
+    /// Returns [`KeeperError::BatchTooLarge`] if `ids` exceeds
+    /// [`MAX_BATCH_READ`], rather than truncating: a silently clipped page is
+    /// indistinguishable from the genuine end of a range.
+    ///
+    /// Duplicate ids are permitted and each is resolved independently; the
+    /// caller pays for the repeated read.
+    ///
+    /// This does not violate the "no unbounded iteration" rule in the README.
+    /// That rule is about *storage* — the contract keeps no growing
+    /// `Vec<task_id>` that some operation must walk. Every read here is still
+    /// O(1) by key against `DataKey::Task(id)`; the caller supplies the keys
+    /// and the count is bounded by a constant.
+    pub fn get_tasks(e: Env, ids: Vec<u64>) -> Result<Vec<Option<Task>>, KeeperError> {
+        if ids.len() > MAX_BATCH_READ {
+            return Err(KeeperError::BatchTooLarge);
+        }
+
+        let mut out = Vec::new(&e);
+        for id in ids.iter() {
+            out.push_back(load_task(&e, id).ok());
+        }
+        Ok(out)
+    }
+
+    /// Reads the `count` tasks with ids `from, from + 1, …, from + count - 1`.
+    ///
+    /// The convenience form of [`KeeperRegistry::get_tasks`] for the common
+    /// "scan recent tasks" case — a bot walking backwards from
+    /// [`KeeperRegistry::task_count`] does not have to build a `Vec<u64>` just
+    /// to describe a contiguous range. Same missing-id policy: the result has
+    /// exactly `count` entries, positionally aligned with the range, and ids
+    /// that were never allocated or have been archived come back as `None`.
+    ///
+    /// `count == 0` returns an empty vector. `count` above [`MAX_BATCH_READ`]
+    /// returns [`KeeperError::BatchTooLarge`], and a range whose end would
+    /// exceed `u64::MAX` returns [`KeeperError::ArithmeticOverflow`] rather
+    /// than wrapping around to low ids.
+    pub fn get_tasks_range(
+        e: Env,
+        from: u64,
+        count: u32,
+    ) -> Result<Vec<Option<Task>>, KeeperError> {
+        if count > MAX_BATCH_READ {
+            return Err(KeeperError::BatchTooLarge);
+        }
+
+        // Reject a wrapping range up front rather than letting `from + i`
+        // overflow mid-loop and silently return unrelated low-numbered tasks.
+        //
+        // The bound checked is the LAST id actually read (`from + count - 1`),
+        // not the exclusive end (`from + count`): a window ending exactly on
+        // `u64::MAX` is perfectly readable, and checking the exclusive end
+        // would reject it for an overflow that never happens.
+        if count > 0 {
+            from.checked_add(count as u64 - 1)
+                .ok_or(KeeperError::ArithmeticOverflow)?;
+        }
+
+        let mut out = Vec::new(&e);
+        for i in 0..count as u64 {
+            out.push_back(load_task(&e, from + i).ok());
+        }
+        Ok(out)
     }
 
     pub fn task_count(e: Env) -> u64 {

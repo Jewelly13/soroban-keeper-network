@@ -6,6 +6,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — bounded batch task reads (#25)
+
+- New read-only views `get_tasks(ids)` and `get_tasks_range(from, count)` let
+  an indexer or keeper bot inspect many tasks in one call instead of one RPC
+  round trip per task. Both are bounded by `MAX_BATCH_READ` (50) and return
+  the new `BatchTooLarge` error when exceeded, rather than silently truncating
+  a page — a clipped result is indistinguishable from the end of a range.
+- The result is positionally aligned with the request: entry `i` is
+  `Some(task)` if the id at position `i` exists and `None` if it does not, so
+  one missing id does not fail the whole call. `Vec<Option<Task>>` is used
+  rather than a compacted `Vec<Task>` because `Task` carries no `task_id`,
+  which would make the mapping from result back to requested id unrecoverable.
+- No storage iteration is introduced: every read is still O(1) by key against
+  `DataKey::Task(id)`, and the caller supplies the bounded key set.
+- `get_tasks_range` rejects a window whose last id would exceed `u64::MAX` with
+  `ArithmeticOverflow` rather than wrapping around to low-numbered tasks. A
+  window ending exactly on `u64::MAX` is still accepted.
+- `Task` now derives `PartialEq`/`Eq`, matching `TaskType` and `TaskStatus`, so
+  batched results can be compared. Additive only — no XDR or behaviour change.
+- `VERSION` is deliberately unchanged: these are purely additive read-only
+  views and no existing function's behaviour is affected.
+
+### Documented — protocol fee rounding guarantee (#26)
+
+- `split_reward`'s rounding direction is now a stated guarantee rather than an
+  undocumented artifact of integer division: the fee is
+  `floor(reward * fee_bps / 10_000)` and the keeper receives the remainder, so
+  the protocol can never collect more than the nominal rate and the error is
+  bounded by one stroop per execution, always in the keeper's favour.
+- The `min_reward` / `fee_bps` dust threshold is documented in the README
+  tokenomics section: the fee is non-zero only once
+  `min_reward >= ceil(10_000 / fee_bps)`. Below that the protocol earns
+  nothing on a task while still bearing its storage cost — a relationship
+  between two parameters that were previously set independently.
+- Boundary tests pin the behaviour at `reward = 1`, the first reward yielding a
+  non-zero fee, `fee_bps = 0`, and `fee_bps = 10_000`. No behaviour change.
+
+### Added — optional on-chain proof verifier (VERSION bumped to 3)
+
+- `register_task` now takes a required eighth parameter,
+  `verifier: Option<Address>`. `None` behaves exactly as before this change;
+  `Some(addr)` attaches an `IKeeperVerifier`-implementing contract that
+  `execute_task` calls before crediting the keeper, rejecting with the new
+  `VerificationFailed` error (and a `TaskVerificationFailed` event) if it
+  returns `false`. This is a breaking ABI change — every existing
+  `register_task` call site must add the new argument.
+- New `update_verifier` entry point lets the task owner change or clear a
+  task's verifier while it is still `Pending`.
+- New events: `TaskVerificationFailed` (`("verfail", "task")`) and
+  `VerifierUpdated` (`("verifier", "task")`).
+- `VERSION` bumped from 2 to 3.
 ### Added — batch task registration (VERSION bumped to 3)
 
 Epic E05's batch-registration slice. Full design rationale and integrator

@@ -295,6 +295,33 @@ Note that `MAX_BATCH_SIZE` is currently a conservative guard rather than a
 measured ceiling — issue 0104 owns the empirical measurement. Read the live
 value from the `max_batch_size()` view instead of hardcoding it.
 
+#### FR-8: Batch Task Reads
+- `get_tasks(ids: Vec<u64>) -> Vec<Option<Task>>` MUST read every requested id
+  in a single call, so an indexer or keeper bot does not need one RPC round
+  trip per task.
+- `get_tasks_range(from: u64, count: u32) -> Vec<Option<Task>>` MUST read the
+  contiguous ids `from … from + count - 1`. It is the convenience form for the
+  common "scan recent tasks" case, so a caller walking backwards from
+  `task_count` need not build a `Vec<u64>`.
+- Both MUST accept at most `MAX_BATCH_READ` (50) ids. The bound exists because
+  each id costs exactly one Persistent storage read charged against the
+  transaction's read-entry and read-bytes limits; at `MAX_CALLDATA_LEN` (1 KiB)
+  per task, 50 reads stay comfortably inside a single simulation.
+- Exceeding the bound MUST return `BatchTooLarge` rather than truncating — a
+  silently clipped page is indistinguishable from the genuine end of a range.
+- A range whose last id would exceed `u64::MAX` MUST return
+  `ArithmeticOverflow` rather than wrapping around to low ids.
+- **Missing ids** MUST be returned as `None` in place, not omitted: the result
+  is *positionally aligned* with the request (`out.len() == ids.len()`, and
+  `out[i]` corresponds to `ids[i]`). A single absent id MUST NOT fail the whole
+  call. `Vec<Option<Task>>` is used rather than a compacted `Vec<Task>` because
+  `Task` carries no `task_id` field — omitting missing ids would make the
+  mapping from result back to requested id unrecoverable. `None` is a void XDR
+  variant, so the alignment costs almost nothing on the wire.
+- `count == 0` and an empty `ids` MUST return an empty vector, not an error.
+- Duplicate ids are permitted and each is resolved independently.
+- Both are read-only views and are therefore never gated by `pause`.
+
 ---
 
 ### Non-Functional Requirements
@@ -310,6 +337,11 @@ value from the `max_batch_size()` view instead of hardcoding it.
 - Instance storage for hot/shared data (admin, counter, flags).
 - Persistent storage for per-task data with explicit TTL management.
 - No unbounded iteration — no `Vec<task_id>` scanned in O(n); queries are by key.
+  This is a constraint on *storage*: the contract keeps no growing list that any
+  operation has to walk. It does not forbid a read-only view over a bounded,
+  caller-supplied set of keys — `get_tasks` / `get_tasks_range` (FR-8) are still
+  O(1) per key against `DataKey::Task(id)`, the caller supplies the keys, and
+  the count is capped by the `MAX_BATCH_READ` constant.
 - Events are the query primitive for off-chain indexers.
 
 #### Scalability
@@ -492,6 +524,49 @@ pub trait IKeeperVerifiable {
 - Keepers earn `reward * (1 - fee_bps/10000)` per task.
 - Protocol fee (`fee_bps`) is configurable by admin (default 3%).
 - Fees accumulate in the contract; admin sweeps to a treasury address.
+
+##### Fee rounding and the dust threshold
+
+The fee is computed with integer division, so it always rounds **down**:
+
+```text
+fee        = floor(reward * fee_bps / 10_000)
+keeper_net = reward - fee
+```
+
+This is a guarantee, not an accident of the implementation. The protocol can
+never collect more than the nominal `fee_bps` rate; it may collect very
+slightly less, and the shortfall is bounded by **one stroop per execution**,
+always in the keeper's favour. `keeper_net + fee == reward` holds exactly for
+every input, so nothing is created or destroyed by the split.
+
+Anyone reconciling expected protocol revenue against actual accrued fees should
+expect a deficit of up to one stroop per executed task. That is this rule, not
+a bug.
+
+**The dust threshold.** For small rewards the fee rounds to zero entirely. The
+fee is non-zero only once:
+
+```text
+min_reward >= ceil(10_000 / fee_bps)
+```
+
+At the 300 bps (3%) default that threshold is **34 stroops**:
+
+| `reward` | `fee_bps` | `fee` | `keeper_net` | effective rate |
+|---------:|----------:|------:|-------------:|---------------:|
+| 1 | 300 | 0 | 1 | 0% |
+| 33 | 300 | 0 | 33 | 0% |
+| 34 | 300 | 1 | 33 | 2.9% |
+| 100 | 300 | 3 | 97 | 3% |
+| 10 000 000 | 300 | 300 000 | 9 700 000 | 3% |
+
+This connects two parameters that are otherwise set independently. Choosing a
+`min_reward` below the threshold means the protocol earns **nothing** on those
+tasks while still bearing their storage cost, so `min_reward` and `fee_bps`
+should be chosen together. Setting `fee_bps` to `0` is also legal and gives the
+keeper the whole reward; `10_000` (100%) is legal too, and is the one setting
+where a keeper executes a task for no reward at all.
 
 #### Phase 2 — Governance Token ($KPRS)
 
