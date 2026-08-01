@@ -32,3 +32,9 @@
 
 // Re-export support module for fuzz targets
 pub mod support;
+
+// Corpus seed generator (issue #92) — only compiled for `cargo test`, since
+// it needs `std` for file I/O and this crate is otherwise `no_std` for the
+// fuzz targets themselves.
+#[cfg(test)]
+pub mod seed;

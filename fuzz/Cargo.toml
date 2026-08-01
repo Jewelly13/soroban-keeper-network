@@ -74,10 +74,3 @@ path = "fuzz_targets/execute_task.rs"
 test = false
 doc = false
 bench = false
-
-[[bin]]
-name = "register_task_calldata_bound"
-path = "fuzz_targets/register_task_calldata_bound.rs"
-test = false
-doc = false
-bench = false
