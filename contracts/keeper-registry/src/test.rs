@@ -15,13 +15,13 @@
 use soroban_sdk::{
     symbol_short,
     testutils::{Address as _, Deployer as _, Events as _, Ledger, MockAuth, MockAuthInvoke},
-    token, Address, Bytes, Env, IntoVal, Symbol, TryIntoVal,
+    token, Address, Bytes, Env, IntoVal, Symbol, TryIntoVal, Vec,
 };
 
 use crate::{
-    split_reward, DataKey, KeeperError, KeeperRegistry, KeeperRegistryClient, TaskStatus, TaskType,
-    INSTANCE_BUMP_LEDGERS, INSTANCE_BUMP_THRESHOLD, MAX_CALLDATA_LEN, MAX_LOCK_LEDGERS,
-    MIN_LOCK_LEDGERS, MIN_TTL_LEDGERS,
+    split_reward, BatchTaskParams, DataKey, KeeperError, KeeperRegistry, KeeperRegistryClient,
+    TaskStatus, TaskType, INSTANCE_BUMP_LEDGERS, INSTANCE_BUMP_THRESHOLD, MAX_BATCH_SIZE,
+    MAX_CALLDATA_LEN, MAX_LOCK_LEDGERS, MIN_LOCK_LEDGERS, MIN_TTL_LEDGERS,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -99,7 +99,7 @@ fn register_reward_task(s: &TestSetup, reward: i128) -> u64 {
         &calldata(&s.env),
         &reward,
         &deadline,
-        &20_000u32,
+        &17_280u32,
         &120u32,
     )
 }
@@ -203,10 +203,20 @@ fn test_split_reward_invariants() {
     }
 }
 
+/// `VERSION` is the only signal an off-chain client has that the ABI it
+/// compiled against is the ABI it is talking to, so this assertion is
+/// deliberately a hardcoded literal rather than a comparison against the
+/// `VERSION` constant — the point is that changing the constant without
+/// noticing the ABI change is what breaks integrators. Bump both together,
+/// and add a CHANGELOG entry saying what changed.
 #[test]
 fn test_version_is_exposed() {
     let s = setup();
+<<<<<<< HEAD
     assert_eq!(s.registry.version(), 2u32);
+=======
+    assert_eq!(s.registry.version(), 3u32);
+>>>>>>> f8df1c6e6e7091726aea7df87508515aa6c82b8b
 }
 
 #[test]
@@ -293,7 +303,7 @@ fn test_register_task_success() {
         &calldata(&env),
         &1_000_000i128,
         &deadline,
-        &20_000u32,
+        &17_280u32,
         &120u32,
     );
 
@@ -333,7 +343,7 @@ fn test_register_task_escrows_reward() {
         &calldata(&env),
         &1_000_000i128,
         &(env.ledger().timestamp() + 3_600),
-        &20_000u32,
+        &17_280u32,
         &120u32,
     );
 
@@ -363,7 +373,7 @@ fn test_register_task_zero_reward_fails() {
             &calldata(&env),
             &0i128,
             &(env.ledger().timestamp() + 3_600),
-            &20_000u32,
+            &17_280u32,
             &120u32,
         ),
         Err(Ok(KeeperError::InvalidReward))
@@ -392,7 +402,7 @@ fn test_register_task_past_deadline_fails() {
             &calldata(&env),
             &1_000_000i128,
             &past,
-            &20_000u32,
+            &17_280u32,
             &120u32,
         ),
         Err(Ok(KeeperError::DeadlinePassed))
@@ -422,7 +432,7 @@ fn test_register_increments_task_counter() {
             &calldata(&env),
             &100_000i128,
             &deadline,
-            &20_000u32,
+            &17_280u32,
             &60u32,
         );
         assert_eq!(id, expected_id);
@@ -431,6 +441,7 @@ fn test_register_increments_task_counter() {
 }
 
 #[test]
+<<<<<<< HEAD
 fn test_register_task_ttl_shorter_than_deadline_fails() {
     let env = Env::default();
     env.mock_all_auths();
@@ -466,6 +477,8 @@ fn test_register_task_ttl_shorter_than_deadline_fails() {
 }
 
 #[test]
+=======
+>>>>>>> f8df1c6e6e7091726aea7df87508515aa6c82b8b
 fn test_register_task_with_max_calldata_succeeds() {
     let env = Env::default();
     env.mock_all_auths();
@@ -488,7 +501,7 @@ fn test_register_task_with_max_calldata_succeeds() {
         &max_calldata,
         &1_000_000i128,
         &(env.ledger().timestamp() + 3_600),
-        &20_000u32,
+        &17_280u32,
         &120u32,
     );
     assert_eq!(registry.get_task(&id).calldata.len(), MAX_CALLDATA_LEN);
@@ -525,6 +538,7 @@ fn test_register_task_over_max_calldata_fails() {
 }
 
 #[test]
+<<<<<<< HEAD
 fn test_register_task_ttl_covering_deadline_succeeds() {
     let s = setup();
     // deadline is 3_600s away; required TTL is 720 ledgers + the 17_280
@@ -584,6 +598,8 @@ fn test_expire_task_succeeds_past_old_ttl_boundary() {
 }
 
 #[test]
+=======
+>>>>>>> f8df1c6e6e7091726aea7df87508515aa6c82b8b
 fn test_register_task_with_empty_calldata_succeeds() {
     let env = Env::default();
     env.mock_all_auths();
@@ -607,7 +623,7 @@ fn test_register_task_with_empty_calldata_succeeds() {
         &empty,
         &1_000_000i128,
         &(env.ledger().timestamp() + 3_600),
-        &20_000u32,
+        &17_280u32,
         &120u32,
     );
     assert_eq!(registry.get_task(&id).calldata.len(), 0);
@@ -711,6 +727,306 @@ fn test_register_task_ttl_ledgers_at_min_succeeds() {
         &deadline,
         &MIN_TTL_LEDGERS,
         &120u32,
+<<<<<<< HEAD
+=======
+    );
+    assert_eq!(s.registry.get_task(&task_id).ttl_ledgers, MIN_TTL_LEDGERS);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// batch_register_tasks
+//
+// Semantics under test mirror docs/BATCH_OPERATIONS.md: one auth for the whole
+// batch (§2), whole-batch atomicity with zero partial success (§3), a
+// MAX_BATCH_SIZE ceiling (§4), ids returned in input order (§5), and the
+// max_total_reward ceiling (§7).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One well-formed batch entry with a caller-chosen reward.
+fn batch_entry(env: &Env, reward: i128) -> BatchTaskParams {
+    BatchTaskParams {
+        task_type: TaskType::Liquidation,
+        calldata: calldata(env),
+        reward,
+        deadline: env.ledger().timestamp() + 3_600,
+        ttl_ledgers: 17_280,
+        lock_ledgers: 120,
+    }
+}
+
+/// A batch of `n` entries, each worth `reward`.
+fn batch_of(env: &Env, n: u32, reward: i128) -> Vec<BatchTaskParams> {
+    let mut v = Vec::new(env);
+    for _ in 0..n {
+        v.push_back(batch_entry(env, reward));
+    }
+    v
+}
+
+#[test]
+fn test_batch_register_registers_all_and_returns_ids_in_order() {
+    let s = setup();
+    let token = token::Client::new(&s.env, &s.token_id);
+
+    let tasks = batch_of(&s.env, 3, 1_000_000i128);
+    let ids = s
+        .registry
+        .batch_register_tasks(&s.admin, &tasks, &3_000_000i128);
+
+    assert_eq!(ids.len(), 3);
+    // Ids are the contract's own monotonic sequence, in input order.
+    assert_eq!(ids.get(1).unwrap(), ids.get(0).unwrap() + 1);
+    assert_eq!(ids.get(2).unwrap(), ids.get(1).unwrap() + 1);
+
+    for id in ids.iter() {
+        let task = s.registry.get_task(&id);
+        assert_eq!(task.owner, s.admin);
+        assert_eq!(task.status, TaskStatus::Pending);
+        assert_eq!(task.reward, 1_000_000i128);
+    }
+
+    // Escrow for the whole batch is held by the registry.
+    assert_eq!(token.balance(&s.registry.address), 3_000_000i128);
+    assert_eq!(s.registry.task_count(), 3);
+}
+
+#[test]
+fn test_batch_register_max_total_reward_ceiling_rejects_whole_batch() {
+    let s = setup();
+    let token = token::Client::new(&s.env, &s.token_id);
+
+    // Sum is 3_000_000; the ceiling is one stroop short of it.
+    let tasks = batch_of(&s.env, 3, 1_000_000i128);
+    assert_eq!(
+        s.registry
+            .try_batch_register_tasks(&s.admin, &tasks, &2_999_999i128),
+        Err(Ok(KeeperError::BatchRewardCeilingExceeded))
+    );
+
+    // §3: zero transfers, zero tasks — not "the first two landed".
+    assert_eq!(token.balance(&s.registry.address), 0i128);
+    assert_eq!(s.registry.task_count(), 0);
+}
+
+#[test]
+fn test_batch_register_accepts_ceiling_set_to_exact_sum() {
+    let s = setup();
+    // The guidance in docs §7 is to set max_total_reward to the exact sum, so
+    // the boundary itself must not be off-by-one.
+    let tasks = batch_of(&s.env, 2, 1_000_000i128);
+    let ids = s
+        .registry
+        .batch_register_tasks(&s.admin, &tasks, &2_000_000i128);
+    assert_eq!(ids.len(), 2);
+}
+
+#[test]
+fn test_batch_register_rejects_batch_over_max_size() {
+    let s = setup();
+    let token = token::Client::new(&s.env, &s.token_id);
+
+    let tasks = batch_of(&s.env, MAX_BATCH_SIZE + 1, 1i128);
+    assert_eq!(
+        s.registry
+            .try_batch_register_tasks(&s.admin, &tasks, &i128::MAX),
+        Err(Ok(KeeperError::BatchTooLarge))
+    );
+    assert_eq!(token.balance(&s.registry.address), 0i128);
+    assert_eq!(s.registry.task_count(), 0);
+}
+
+#[test]
+fn test_batch_register_accepts_exactly_max_batch_size() {
+    let s = setup();
+    let tasks = batch_of(&s.env, MAX_BATCH_SIZE, 1i128);
+    let ids = s
+        .registry
+        .batch_register_tasks(&s.admin, &tasks, &(MAX_BATCH_SIZE as i128));
+    assert_eq!(ids.len(), MAX_BATCH_SIZE);
+}
+
+#[test]
+fn test_batch_register_max_batch_size_view_matches_constant() {
+    let s = setup();
+    assert_eq!(s.registry.max_batch_size(), MAX_BATCH_SIZE);
+}
+
+#[test]
+fn test_batch_register_rejects_empty_batch() {
+    let s = setup();
+    let tasks: Vec<BatchTaskParams> = Vec::new(&s.env);
+    assert_eq!(
+        s.registry
+            .try_batch_register_tasks(&s.admin, &tasks, &1_000_000i128),
+        Err(Ok(KeeperError::EmptyBatch))
+    );
+}
+
+#[test]
+fn test_batch_register_rejects_non_positive_ceiling() {
+    let s = setup();
+    let tasks = batch_of(&s.env, 1, 1_000_000i128);
+    assert_eq!(
+        s.registry.try_batch_register_tasks(&s.admin, &tasks, &0i128),
+        Err(Ok(KeeperError::InvalidReward))
+    );
+}
+
+/// A single bad entry rejects the batch and rolls back the good entries with
+/// it — the "no partial success" guarantee integrators are told to rely on.
+#[test]
+fn test_batch_register_one_bad_entry_rejects_entire_batch() {
+    let s = setup();
+    let token = token::Client::new(&s.env, &s.token_id);
+
+    let cases: std::vec::Vec<(BatchTaskParams, KeeperError)> = std::vec![
+        (
+            BatchTaskParams {
+                reward: 0,
+                ..batch_entry(&s.env, 1_000_000i128)
+            },
+            KeeperError::InvalidReward,
+        ),
+        (
+            BatchTaskParams {
+                deadline: s.env.ledger().timestamp(),
+                ..batch_entry(&s.env, 1_000_000i128)
+            },
+            KeeperError::DeadlinePassed,
+        ),
+        (
+            BatchTaskParams {
+                calldata: Bytes::from_slice(
+                    &s.env,
+                    &[0u8; (MAX_CALLDATA_LEN + 1) as usize]
+                ),
+                ..batch_entry(&s.env, 1_000_000i128)
+            },
+            KeeperError::CalldataTooLarge,
+        ),
+        (
+            BatchTaskParams {
+                lock_ledgers: MIN_LOCK_LEDGERS - 1,
+                ..batch_entry(&s.env, 1_000_000i128)
+            },
+            KeeperError::InvalidTaskParams,
+        ),
+        (
+            BatchTaskParams {
+                lock_ledgers: MAX_LOCK_LEDGERS + 1,
+                ..batch_entry(&s.env, 1_000_000i128)
+            },
+            KeeperError::InvalidTaskParams,
+        ),
+        (
+            BatchTaskParams {
+                ttl_ledgers: MIN_TTL_LEDGERS - 1,
+                ..batch_entry(&s.env, 1_000_000i128)
+            },
+            KeeperError::InvalidTaskParams,
+        ),
+    ];
+
+    for (bad, expected) in cases {
+        // Good entry first, so a rejection proves the whole batch rolled back
+        // rather than stopping before it had done anything.
+        let mut tasks = Vec::new(&s.env);
+        tasks.push_back(batch_entry(&s.env, 1_000_000i128));
+        tasks.push_back(bad);
+
+        assert_eq!(
+            s.registry
+                .try_batch_register_tasks(&s.admin, &tasks, &i128::MAX),
+            Err(Ok(expected)),
+        );
+        assert_eq!(token.balance(&s.registry.address), 0i128);
+        assert_eq!(s.registry.task_count(), 0);
+    }
+}
+
+#[test]
+fn test_batch_register_respects_min_reward_floor() {
+    let s = setup();
+    s.registry.set_min_reward(&s.admin, &500_000i128);
+
+    let mut tasks = Vec::new(&s.env);
+    tasks.push_back(batch_entry(&s.env, 500_000i128)); // exactly at the floor
+    tasks.push_back(batch_entry(&s.env, 499_999i128)); // one below
+
+    assert_eq!(
+        s.registry
+            .try_batch_register_tasks(&s.admin, &tasks, &i128::MAX),
+        Err(Ok(KeeperError::InvalidReward))
+    );
+    assert_eq!(s.registry.task_count(), 0);
+}
+
+#[test]
+fn test_batch_register_blocked_while_paused() {
+    let s = setup();
+    s.registry.pause(&s.admin);
+
+    let tasks = batch_of(&s.env, 2, 1_000_000i128);
+    assert_eq!(
+        s.registry
+            .try_batch_register_tasks(&s.admin, &tasks, &2_000_000i128),
+        Err(Ok(KeeperError::ContractPaused))
+    );
+}
+
+/// Batch-registered tasks are ordinary tasks: nothing about how they were
+/// created changes claim/execute or the refund paths.
+#[test]
+fn test_batch_registered_task_completes_normal_lifecycle() {
+    let s = setup();
+    let token = token::Client::new(&s.env, &s.token_id);
+    let keeper = Address::generate(&s.env);
+
+    let tasks = batch_of(&s.env, 2, 1_000_000i128);
+    let ids = s
+        .registry
+        .batch_register_tasks(&s.admin, &tasks, &2_000_000i128);
+    let (executed_id, cancelled_id) = (ids.get(0).unwrap(), ids.get(1).unwrap());
+
+    s.registry.claim_task(&keeper, &executed_id);
+    s.registry
+        .execute_task(&keeper, &executed_id, &Bytes::from_slice(&s.env, b"proof"));
+    let (net, fee) = split_reward(1_000_000i128, 300).unwrap();
+    assert_eq!(s.registry.keeper_balance(&keeper), net);
+    assert_eq!(s.registry.fees_accrued(), fee);
+
+    // Each entry's escrow is refundable independently of the rest of its batch.
+    s.registry.cancel_task(&s.admin, &cancelled_id);
+    assert_eq!(
+        s.registry.get_task(&cancelled_id).status,
+        TaskStatus::Cancelled
+    );
+    // Only the executed task's reward (net + fee) is still held.
+    assert_eq!(token.balance(&s.registry.address), 1_000_000i128);
+}
+
+/// A batch may only pull escrow from the address that authorized it: entries
+/// carry no per-entry owner, so every task in the batch is owned by the single
+/// authorizing `owner` (§2) and nobody else's funds are reachable.
+#[test]
+fn test_batch_register_tasks_are_all_owned_by_the_authorizing_owner() {
+    let s = setup();
+    let other = Address::generate(&s.env);
+
+    let tasks = batch_of(&s.env, 3, 1_000_000i128);
+    let ids = s
+        .registry
+        .batch_register_tasks(&s.admin, &tasks, &3_000_000i128);
+
+    for id in ids.iter() {
+        assert_eq!(s.registry.get_task(&id).owner, s.admin);
+    }
+
+    // A non-owner cannot cancel any of them.
+    assert_eq!(
+        s.registry.try_cancel_task(&other, &ids.get(0).unwrap()),
+        Err(Ok(KeeperError::NotTaskOwner))
+>>>>>>> f8df1c6e6e7091726aea7df87508515aa6c82b8b
     );
     assert_eq!(s.registry.get_task(&task_id).ttl_ledgers, MIN_TTL_LEDGERS);
 }
@@ -769,6 +1085,42 @@ fn test_extend_deadline_backwards_fails() {
         s.registry.try_extend_deadline(&s.admin, &id, &old),
         Err(Ok(KeeperError::DeadlinePassed))
     );
+}
+
+// Regression test for issue #20: `extend_deadline` did not call
+// `require_not_paused`, so an owner could keep escrow locked in a paused
+// contract by pushing the deadline out indefinitely. Mirrors the style of
+// `test_pause_blocks_registration_but_allows_withdraw`.
+#[test]
+fn test_extend_deadline_blocked_while_paused() {
+    let s = setup();
+    let id = register_default_task(&s);
+    let old_deadline = s.registry.get_task(&id).deadline;
+
+    s.registry.pause(&s.admin);
+    assert!(s.registry.is_paused());
+
+    assert_eq!(
+        s.registry
+            .try_extend_deadline(&s.admin, &id, &(old_deadline + 7_200)),
+        Err(Ok(KeeperError::ContractPaused))
+    );
+    assert_eq!(s.registry.get_task(&id).deadline, old_deadline); // untouched
+}
+
+#[test]
+fn test_extend_deadline_succeeds_after_unpause() {
+    let s = setup();
+    let id = register_default_task(&s);
+    let old_deadline = s.registry.get_task(&id).deadline;
+
+    s.registry.pause(&s.admin);
+    s.registry.unpause(&s.admin);
+    assert!(!s.registry.is_paused());
+
+    s.registry
+        .extend_deadline(&s.admin, &id, &(old_deadline + 7_200));
+    assert_eq!(s.registry.get_task(&id).deadline, old_deadline + 7_200);
 }
 
 #[test]
@@ -850,7 +1202,7 @@ fn claim_with_lock(s: &TestSetup, keeper: &Address, lock_ledgers: u32) -> (u64, 
         &calldata(&s.env),
         &1_000_000i128,
         &deadline,
-        &20_000u32,
+        &17_280u32,
         &lock_ledgers,
     );
     s.registry.claim_task(keeper, &id);
@@ -926,7 +1278,7 @@ fn test_lock_window_extending_past_deadline_is_blocked_by_deadline_first() {
         &calldata(&s.env),
         &1_000_000i128,
         &deadline,
-        &20_000u32,
+        &17_280u32,
         &1_000u32,
     );
     s.registry.claim_task(&first, &id);
@@ -1377,7 +1729,7 @@ fn test_expire_task_reentrancy_pays_refund_exactly_once() {
         &calldata(&env),
         &1_000_000i128,
         &deadline,
-        &20_000u32,
+        &17_280u32,
         &120u32,
     );
     assert_eq!(token.balance(&admin), 4_000_000i128); // escrowed
@@ -1728,7 +2080,7 @@ fn test_pause_blocks_registration_but_allows_withdraw() {
             &calldata(&s.env),
             &100_000i128,
             &(s.env.ledger().timestamp() + 3_600),
-            &20_000u32,
+            &17_280u32,
             &60u32,
         ),
         Err(Ok(KeeperError::ContractPaused))
@@ -1778,17 +2130,12 @@ fn test_pause_by_non_admin_fails() {
 /// said nothing about increase_reward, extend_deadline, or cancel_task):
 ///
 ///   - BLOCKED while paused (asserted via `try_*` -> `ContractPaused`):
-///     `register_task`, `claim_task`, `execute_task`, `increase_reward`.
+///     `register_task`, `claim_task`, `execute_task`, `increase_reward`,
+///     `extend_deadline`.
 ///   - Allowed while paused, and asserted to have their full intended
 ///     effect (not just "didn't error"): `cancel_task` (refund + status),
 ///     `expire_task` (refund + status), `withdraw_rewards` (balance
 ///     transferred + zeroed).
-///   - `extend_deadline` is asserted to match its *current* (buggy)
-///     behavior — it has no `require_not_paused` call at all, so it
-///     currently succeeds while paused. That is almost certainly wrong
-///     (it was likely meant to follow register/claim/execute) but fixing it
-///     is out of scope here; seeing this assertion start failing is the
-///     signal that someone fixed the gap without updating this test.
 ///   - Read-only views are asserted to keep working throughout.
 ///   - Finally, unpause restores every previously-blocked entry point —
 ///     a one-way pause would itself be a serious bug.
@@ -1878,18 +2225,23 @@ fn test_pause_policy_matrix_entry_point_by_entry_point() {
         1_000_000i128
     ); // untouched
 
-    // ── extend_deadline: NOT gated in the current code — this is a known
-    // gap, tracked as a separate bug (see the doc comment above `pause` in
-    // lib.rs). Asserting current behavior, not desired behavior.
-    // TODO: once extend_deadline gains a `require_not_paused(&e)?` check,
-    // flip this to `try_extend_deadline` -> `Err(Ok(KeeperError::ContractPaused))`.
+    // ── BLOCKED: extend_deadline — gated as of the fix for issue #20. It
+    // touches no funds directly, but leaving it open while paused would let
+    // an owner keep escrow locked in a contract the admin has declared
+    // unsafe, working against the point of the pause.
     let old_deadline = s.registry.get_task(&extend_target_id).deadline;
-    s.registry
-        .extend_deadline(&s.admin, &extend_target_id, &(old_deadline + 3_600));
+    assert_eq!(
+        s.registry.try_extend_deadline(
+            &s.admin,
+            &extend_target_id,
+            &(old_deadline + 3_600)
+        ),
+        Err(Ok(KeeperError::ContractPaused))
+    );
     assert_eq!(
         s.registry.get_task(&extend_target_id).deadline,
-        old_deadline + 3_600
-    );
+        old_deadline
+    ); // untouched
 
     // ── ALLOWED: cancel_task — must actually refund and flip status, not
     // just "not error".
@@ -2001,7 +2353,7 @@ fn test_set_min_reward_rejects_below_floor() {
             &calldata(&s.env),
             &499_999i128,
             &(s.env.ledger().timestamp() + 3_600),
-            &20_000u32,
+            &17_280u32,
             &60u32,
         ),
         Err(Ok(KeeperError::InvalidReward))
@@ -2013,7 +2365,7 @@ fn test_set_min_reward_rejects_below_floor() {
         &calldata(&s.env),
         &500_000i128,
         &(s.env.ledger().timestamp() + 3_600),
-        &20_000u32,
+        &17_280u32,
         &60u32,
     );
     assert_eq!(id, 1u64);
@@ -2032,6 +2384,7 @@ fn test_set_min_reward_by_non_admin_fails() {
 #[test]
 fn test_set_fee_emits_event() {
     let s = setup();
+<<<<<<< HEAD
     let old_bps = s.registry.get_fee_bps();
     let new_bps = 500u32;
 
@@ -2042,6 +2395,11 @@ fn test_set_fee_emits_event() {
 
     assert_eq!(event_old, old_bps);
     assert_eq!(event_new, new_bps);
+=======
+    let before = s.env.events().all().len();
+    s.registry.set_fee_bps(&s.admin, &500u32);
+    assert!(s.env.events().all().len() > before);
+>>>>>>> f8df1c6e6e7091726aea7df87508515aa6c82b8b
 }
 
 #[test]
@@ -2075,6 +2433,7 @@ fn test_transfer_admin_moves_control() {
 fn test_transfer_admin_emits_event() {
     let s = setup();
     let new_admin = Address::generate(&s.env);
+<<<<<<< HEAD
     let old_admin = s.admin.clone();
 
     s.registry.transfer_admin(&s.admin, &new_admin);
@@ -2084,6 +2443,11 @@ fn test_transfer_admin_emits_event() {
 
     assert_eq!(event_old, old_admin);
     assert_eq!(event_new, new_admin);
+=======
+    let before = s.env.events().all().len();
+    s.registry.transfer_admin(&s.admin, &new_admin);
+    assert!(s.env.events().all().len() > before);
+>>>>>>> f8df1c6e6e7091726aea7df87508515aa6c82b8b
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2242,14 +2606,38 @@ fn test_instance_ttl_renewed_by_mutation_stays_alive_past_initial_window() {
     assert_eq!(s.registry.get_fee_bps(), 500u32);
 }
 
+// Regression test for issue #18: `upgrade` previously emitted no event at
+// all, so there was no on-chain, indexable record of who authorised an
+// upgrade or which WASM hash it moved to. This asserts the rejection path
+// specifically emits nothing — a non-admin's rejected attempt must not
+// produce an `Upgraded` event, since `require_admin` fails before
+// `emit_upgraded` is ever reached.
+//
+// The success path (`emit_upgraded` fires with the correct hash before
+// `update_current_contract_wasm` swaps the executable) is not covered here
+// for the same reason `resource_report` above excludes `upgrade`: exercising
+// it for real needs a separately-deployed WASM hash already present on the
+// ledger, and `update_current_contract_wasm` only takes effect — success or
+// failure — once the whole invocation completes, so a bogus hash can't be
+// used to observe the event in isolation without also rolling it back.
 #[test]
 fn test_upgrade_by_non_admin_fails() {
     let s = setup();
     let stranger = Address::generate(&s.env);
     let bogus = soroban_sdk::BytesN::from_array(&s.env, &[0u8; 32]);
+
     assert_eq!(
         s.registry.try_upgrade(&stranger, &bogus),
         Err(Ok(KeeperError::Unauthorized))
+    );
+
+    // `events().all()` reflects only the most recent top-level invocation
+    // (see the note in `test_withdraw_transfers_balance_and_zeroes_it`), so
+    // this is checked immediately after the single `try_upgrade` call above
+    // rather than via a before/after count.
+    assert!(
+        s.env.events().all().is_empty(),
+        "a rejected non-admin upgrade must not emit an Upgraded event"
     );
 }
 
@@ -2948,6 +3336,67 @@ fn test_initialize_no_event_when_validation_fails() {
         "no event should be emitted on validation failure"
     );
 }
+<<<<<<< HEAD
+=======
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CPU-instruction regression ceilings — issue 0107. `claim_task` and
+// `execute_task` are the two entry points most likely to be called under real
+// load (every keeper bot calls them once per task), so a silent cost
+// regression there is the one most likely to surprise a keeper's transaction
+// budget in production.
+//
+// Measured via `env.cost_estimate().budget().cpu_instruction_cost()` (the
+// same budget-tracking API issue 0100's CI job uses) at the time these tests
+// were written: `claim_task` costs ~100,555 instructions, `execute_task`
+// costs ~158,338. The ceilings below are set at roughly 3x each measured
+// value — loose enough that an ordinary change (one extra storage read, a
+// slightly bigger event) won't trip it, but tight enough to catch an
+// accidental order-of-magnitude regression, such as a refactor that starts
+// calling `bump_instance` twice by mistake, or a verifier integration that
+// reruns the whole load/save path per call. (Confirmed these have teeth: a
+// temporary ceiling of 1 during development made both fail with the exact
+// measured instruction count in the message, not an opaque error.)
+const CLAIM_TASK_CPU_INSN_CEILING: u64 = 350_000;
+const EXECUTE_TASK_CPU_INSN_CEILING: u64 = 500_000;
+
+#[test]
+fn test_claim_task_cpu_instructions_within_ceiling() {
+    let s = setup();
+    let keeper = Address::generate(&s.env);
+    let id = register_default_task(&s);
+
+    s.env.cost_estimate().budget().reset_default();
+    s.registry.claim_task(&keeper, &id);
+    let consumed = s.env.cost_estimate().budget().cpu_instruction_cost();
+
+    assert!(
+        consumed < CLAIM_TASK_CPU_INSN_CEILING,
+        "claim_task consumed {consumed} CPU instructions, exceeding the regression \
+         ceiling of {CLAIM_TASK_CPU_INSN_CEILING}"
+    );
+}
+
+#[test]
+fn test_execute_task_cpu_instructions_within_ceiling() {
+    let s = setup();
+    let keeper = Address::generate(&s.env);
+    let id = register_default_task(&s);
+    s.registry.claim_task(&keeper, &id);
+
+    s.env.cost_estimate().budget().reset_default();
+    s.registry
+        .execute_task(&keeper, &id, &Bytes::from_slice(&s.env, b"proof"));
+    let consumed = s.env.cost_estimate().budget().cpu_instruction_cost();
+
+    assert!(
+        consumed < EXECUTE_TASK_CPU_INSN_CEILING,
+        "execute_task consumed {consumed} CPU instructions, exceeding the regression \
+         ceiling of {EXECUTE_TASK_CPU_INSN_CEILING}"
+    );
+}
+
+>>>>>>> f8df1c6e6e7091726aea7df87508515aa6c82b8b
 // Property tests (issue #93 / backlog 0068): compact proptest coverage per
 // I-N invariant, using the shared `invariants` module so these and any
 // future fuzz target assert the exact same thing. This is intentionally a
@@ -3153,3 +3602,119 @@ proptest! {
             .expect("I-7: task ids must be strictly increasing and never reused");
     }
 }
+<<<<<<< HEAD
+=======
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Resource cost report (backlog 0100) — not a correctness test. Drives one
+// representative call through every state-changing entry point and prints
+// its CPU instruction / memory cost, plus a machine-readable JSON file the
+// `resource-cost` advisory CI job diffs against a checked-in baseline (see
+// scripts/report-resource-cost.sh and docs/CI.md).
+//
+// `#[ignore]` keeps this out of the default `cargo test` run; CI invokes it
+// explicitly with `-- --ignored --nocapture`.
+//
+// `upgrade` is not covered — it needs a real, separately-deployed WASM hash
+// to upgrade to, which is out of scope for a single-entry-point call. Pure
+// read-only views (`get_task`, `task_count`, `admin`, etc.) are also not
+// covered — they are single storage reads with no interesting cost profile
+// to track for regressions.
+#[test]
+#[ignore]
+fn resource_report() {
+    let s = setup();
+    // `initialize` was the last top-level call `setup()` made; the budget
+    // reflects it until the next call resets it (see soroban-sdk's
+    // `cost_estimate().budget()` docs: "resets before every top-level
+    // contract level invocation").
+    let mut rows: std::vec::Vec<(&str, u64, u64)> = std::vec::Vec::new();
+    let record = |name: &'static str, env: &Env, rows: &mut std::vec::Vec<(&str, u64, u64)>| {
+        let budget = env.cost_estimate().budget();
+        rows.push((
+            name,
+            budget.cpu_instruction_cost(),
+            budget.memory_bytes_cost(),
+        ));
+    };
+    record("initialize", &s.env, &mut rows);
+
+    let task_a = register_default_task(&s);
+    record("register_task", &s.env, &mut rows);
+
+    s.registry.increase_reward(&s.admin, &task_a, &500_000i128);
+    record("increase_reward", &s.env, &mut rows);
+
+    let deadline = s.registry.get_task(&task_a).deadline;
+    s.registry
+        .extend_deadline(&s.admin, &task_a, &(deadline + 7_200));
+    record("extend_deadline", &s.env, &mut rows);
+
+    let keeper1 = Address::generate(&s.env);
+    let task_b = register_default_task(&s);
+    s.registry.claim_task(&keeper1, &task_b);
+    record("claim_task", &s.env, &mut rows);
+
+    s.registry
+        .execute_task(&keeper1, &task_b, &Bytes::from_slice(&s.env, b"proof"));
+    record("execute_task", &s.env, &mut rows);
+
+    s.registry.withdraw_rewards(&keeper1);
+    record("withdraw_rewards", &s.env, &mut rows);
+
+    let task_c = register_default_task(&s);
+    s.registry.cancel_task(&s.admin, &task_c);
+    record("cancel_task", &s.env, &mut rows);
+
+    let task_d = register_default_task(&s);
+    advance(&s.env, 200, 3_601);
+    s.registry.expire_task(&task_d);
+    record("expire_task", &s.env, &mut rows);
+
+    s.registry.pause(&s.admin);
+    record("pause", &s.env, &mut rows);
+
+    s.registry.unpause(&s.admin);
+    record("unpause", &s.env, &mut rows);
+
+    s.registry.set_fee_bps(&s.admin, &500u32);
+    record("set_fee_bps", &s.env, &mut rows);
+
+    s.registry.set_min_reward(&s.admin, &0i128);
+    record("set_min_reward", &s.env, &mut rows);
+
+    let treasury = Address::generate(&s.env);
+    let accrued = s.registry.fees_accrued();
+    s.registry.sweep_fees(&s.admin, &treasury, &accrued);
+    record("sweep_fees", &s.env, &mut rows);
+
+    let new_admin = Address::generate(&s.env);
+    s.registry.transfer_admin(&s.admin, &new_admin);
+    record("transfer_admin", &s.env, &mut rows);
+
+    std::println!("### Resource cost per entry point");
+    std::println!();
+    std::println!("| Entry point | CPU instructions | Memory bytes |");
+    std::println!("|---|---|---|");
+    for (name, cpu, mem) in &rows {
+        std::println!("| `{name}` | {cpu} | {mem} |");
+    }
+
+    let mut json = std::string::String::from("{\"entry_points\":[");
+    for (i, (name, cpu, mem)) in rows.iter().enumerate() {
+        if i > 0 {
+            json.push(',');
+        }
+        json.push_str(&std::format!(
+            "{{\"name\":\"{name}\",\"cpu_instructions\":{cpu},\"memory_bytes\":{mem}}}"
+        ));
+    }
+    json.push_str("]}");
+
+    let out_path = std::path::Path::new("target/resource-report.json");
+    if let Some(parent) = out_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(out_path, json).expect("failed to write target/resource-report.json");
+}
+>>>>>>> f8df1c6e6e7091726aea7df87508515aa6c82b8b

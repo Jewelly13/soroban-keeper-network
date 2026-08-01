@@ -28,6 +28,10 @@
  *   - Read-only views (`keeper_balance`, etc.) are evaluated via simulation
  *     through `readContract`, not submitted as signed transactions — see
  *     that function's doc comment for why this matters
+ *   - A pluggable executor interface (see EXECUTORS below) — off-chain
+ *     execution is dispatched per task_type to a registered executor, and
+ *     execute_task is never submitted for a task type with no executor or
+ *     whose executor could not complete the work
  *
  * Production keepers should additionally add:
  *   - Persistent task state DB (SQLite / Redis) to avoid double-claiming
@@ -182,6 +186,17 @@ async function validateAndLoadConfig() {
       parse: (v) => v.toLowerCase() === "true",
       fallback: true,
     }),
+<<<<<<< HEAD
+=======
+    // Development only — see the EXECUTORS section below and .env.example
+    // for the accompanying warning. Never the default: a keeper with this
+    // unset and no real executor registered for a task type simply skips
+    // that task rather than fabricating a proof.
+    simulateExecution: requireEnv("SIMULATE_EXECUTION", {
+      parse: (v) => v.toLowerCase() === "true",
+      fallback: false,
+    }),
+>>>>>>> f8df1c6e6e7091726aea7df87508515aa6c82b8b
   };
 }
 
@@ -389,6 +404,7 @@ async function fetchPendingTasks(server, contractId, startLedger) {
     return [];
   }
 }
+<<<<<<< HEAD
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Keeper logic — off-chain execution simulation
@@ -411,6 +427,115 @@ async function executeTaskOffChain(task) {
     `keeper-proof:task:${task.taskId}:ts:${Date.now()}`
   ).toString("hex");
   return fakeTxHash;
+=======
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Executor interface — pluggable off-chain execution, dispatched by task_type
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// A task executor performs the off-chain work a task describes and returns
+// evidence that it happened.
+//
+//   @param {object} task
+//     { taskId, taskType, taskTypeName, calldata (Buffer), reward, deadline }
+//   @param {object} ctx
+//     { server, keypair, networkPassphrase, log }
+//   @returns {Promise<Buffer|null>}
+//     Proof bytes on success; `null` if the work could not be completed.
+//     Returning `null` means the bot will NOT call execute_task — the task
+//     is left for another keeper or for expiry. Throwing is treated the
+//     same way, with the error logged.
+//
+// Register executors by task_type below. There is deliberately no default
+// executor that fabricates a proof: a keeper that submits proof for work it
+// did not do is exactly the failure mode the registry's trust model warns
+// about (see README.md, "Known Design Decisions" #1), so an unhandled task
+// type is skipped, not faked.
+
+/**
+ * Maps the contract's `TaskType` enum (see `contracts/keeper-registry/src/lib.rs`)
+ * to readable names, for logging and executor lookup.
+ */
+const TASK_TYPE_NAMES = {
+  0: "Liquidation",
+  1: "OraclePricePush",
+  2: "FundingRateUpdate",
+  3: "LiquidityRebalance",
+  4: "TtlExtension",
+  5: "Custom",
+};
+
+/**
+ * Worked example: an executor for TaskType::TtlExtension. This task type's
+ * calldata is expected to be empty (see the contract's TaskType doc) — the
+ * "work" is simply confirming the task is still within its own deadline,
+ * which is the kind of no-op-but-verifiable action this task type exists
+ * for. A real executor for Liquidation/OraclePricePush/etc. would instead
+ * decode `task.calldata` into a target contract call and submit it.
+ */
+async function ttlExtensionExecutor(task, ctx) {
+  ctx.log(`  ⚙️  Executing TtlExtension task ${task.taskId}...`);
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  if (task.deadline <= nowSeconds) {
+    ctx.log(`  ⚠️  Task ${task.taskId} deadline already passed — refusing to fabricate proof.`);
+    return null;
+  }
+  return Buffer.from(`ttl-extension:task:${task.taskId}:confirmed-live`);
+}
+
+/**
+ * Development-only synthetic executor. Returns a proof without doing any
+ * real off-chain work. Enabled only via SIMULATE_EXECUTION=true so it can
+ * never be the accidental default for a real deployment — see
+ * `.env.example` for the accompanying warning.
+ */
+async function simulatedExecutor(task, ctx) {
+  ctx.log(`  🧪  [SIMULATE_EXECUTION] Fabricating proof for task ${task.taskId} — NOT real execution.`);
+  await sleep(500);
+  return Buffer.from(`keeper-proof:task:${task.taskId}:ts:${Date.now()}`);
+}
+
+/**
+ * Executors registered per task_type. No default: an unhandled task type is
+ * refused, not faked.
+ */
+const EXECUTORS = {
+  TtlExtension: ttlExtensionExecutor,
+};
+
+/**
+ * Dispatches a task to its registered executor. Returns `null` (never
+ * throws) when there is no executor for the task's type, when
+ * `simulateExecution` is false and no real executor is registered, or when
+ * the executor itself throws — in every case the caller must not submit
+ * execute_task.
+ *
+ * `simulateExecution` is threaded through explicitly (rather than read from
+ * the module-level CONFIG) so this function has no dependency on CONFIG
+ * having been initialized — CONFIG is only populated by
+ * validateAndLoadConfig() inside main(), which unit tests importing this
+ * function directly do not run.
+ */
+async function executeTaskOffChain(task, ctx, simulateExecution) {
+  const executor = EXECUTORS[task.taskTypeName];
+
+  if (!executor) {
+    if (simulateExecution) {
+      return simulatedExecutor(task, ctx);
+    }
+    ctx.log(
+      `  ⏭️  No executor registered for task type ${task.taskTypeName} (task ${task.taskId}) — skipping.`
+    );
+    return null;
+  }
+
+  try {
+    return await executor(task, ctx);
+  } catch (err) {
+    ctx.log(`  ⚠️  Executor for task ${task.taskId} threw: ${err.message}`);
+    return null;
+  }
+>>>>>>> f8df1c6e6e7091726aea7df87508515aa6c82b8b
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -462,8 +587,6 @@ async function keeperLoop(
     for (const task of pendingTasks) {
       if (summary.processed >= CONFIG.maxTasksPerRound) break;
 
-      // The event-derived deadline is potentially stale, but it's a cheap
-      // client-side filter. is_claimable will check the true current deadline.
       if (task.deadline <= nowSeconds) {
         if (CONFIG.expireStaleTasks) {
           try {
@@ -492,29 +615,6 @@ async function keeperLoop(
       }
 
       try {
-        // Pre-flight check: is the task actually claimable right now? This
-        // is a read-only simulation, so it costs nothing. It confirms the
-        // task is still pending and not locked by another keeper.
-        const claimable = await readContract(
-          server,
-          keypair.publicKey(),
-          networkPassphrase,
-          contractId,
-          "is_claimable",
-          [nativeToScVal(task.taskId, { type: "u64" })]
-        );
-
-        if (!claimable) {
-          console.log(
-            `  ⏩  Skipping task ${task.taskId} — not claimable (already claimed or finished)`
-          );
-          continue;
-        }
-
-        // The pre-check is advisory, not a lock. A competitor can still
-        // claim the task in the interval between our simulation and our
-        // submission. The `claim_task` call can still fail, which is
-        // normal and expected.
         console.log(
           `  📌  Attempting to claim task ${task.taskId} (reward: ${task.reward})...`
         );
@@ -533,7 +633,50 @@ async function keeperLoop(
         );
         console.log(`  ✅  Task ${task.taskId} claimed!`);
 
+<<<<<<< HEAD
         const proof = await executeTaskOffChain(task);
+=======
+        // Fetch full task details — the TaskRegistered event decoded in
+        // fetchPendingTasks carries only { taskId, reward, deadline }, but
+        // an executor needs task_type and calldata to know what off-chain
+        // work to perform.
+        const fullTask = await readContract(
+          server,
+          keypair.publicKey(),
+          networkPassphrase,
+          contractId,
+          "get_task",
+          [nativeToScVal(task.taskId, { type: "u64" })]
+        );
+        const taskType = fullTask.task_type;
+        const taskTypeName = TASK_TYPE_NAMES[taskType] || `Unknown(${taskType})`;
+
+        const executorCtx = {
+          server,
+          keypair,
+          networkPassphrase,
+          log: (msg) => console.log(msg),
+        };
+        const proof = await executeTaskOffChain(
+          {
+            taskId: task.taskId,
+            taskType,
+            taskTypeName,
+            calldata: fullTask.calldata,
+            reward: task.reward,
+            deadline: task.deadline,
+          },
+          executorCtx,
+          CONFIG.simulateExecution
+        );
+>>>>>>> f8df1c6e6e7091726aea7df87508515aa6c82b8b
+
+        if (proof === null || proof === undefined) {
+          console.log(
+            `  ⏭️  Task ${task.taskId} (${taskTypeName}) not executed — leaving claimed for expiry or another keeper.`
+          );
+          continue;
+        }
 
         await withRetry(`execute_task ${task.taskId}`, () =>
           invokeContract(
@@ -545,12 +688,12 @@ async function keeperLoop(
             [
               nativeToScVal(keypair.publicKey(), { type: "address" }),
               nativeToScVal(task.taskId, { type: "u64" }),
-              nativeToScVal(Buffer.from(proof, "hex"), { type: "bytes" }),
+              nativeToScVal(proof, { type: "bytes" }),
             ]
           )
         );
         console.log(
-          `  💰  Task ${task.taskId} executed! Proof: ${proof.slice(0, 20)}...`
+          `  💰  Task ${task.taskId} executed! Proof: ${proof.toString("hex").slice(0, 20)}...`
         );
         summary.processed++;
       } catch (err) {
@@ -719,6 +862,14 @@ module.exports = {
   validateAndLoadConfig,
   keeperLoop,
   sleep,
+<<<<<<< HEAD
+=======
+  TASK_TYPE_NAMES,
+  EXECUTORS,
+  executeTaskOffChain,
+  ttlExtensionExecutor,
+  simulatedExecutor,
+>>>>>>> f8df1c6e6e7091726aea7df87508515aa6c82b8b
 };
 
 // Only run main() when executed directly, not when imported for testing

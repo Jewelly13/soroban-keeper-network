@@ -89,6 +89,38 @@ nightly or an actual fuzzing run.
    variant, which is exactly the class of bug this document's "Target
    status" table above is full of.
 
+## Seeding the corpus with boundary values
+
+`fuzz/corpus/` is gitignored (see `.gitignore`'s comment — corpus is
+regenerated locally and by CI, not committed, aside from crash
+regressions), so a fresh checkout starts every target's corpus empty. That
+means a fuzzer's early runs spend time rediscovering inputs the unit tests
+already know are interesting — a proof at exactly `MAX_PROOF_LEN`, a
+`fee_bps` at exactly `10_000` — before it starts exploring anything new.
+
+`fuzz/src/seed.rs` generates a handful of hand-picked seeds for
+`execute_task` from the contract's real boundary constants (`MAX_PROOF_LEN`,
+the `10_000` bps fee cap), so they can't silently drift from the actual
+values as the contract evolves. Regenerate before a local fuzzing session,
+or after any of those constants change:
+
+```bash
+cd fuzz
+cargo test --features arbitrary -- --ignored generate_execute_task_corpus --nocapture
+```
+
+A second ignored test, `generated_corpus_decodes_to_intended_boundaries`,
+round-trips each generated seed through the real `arbitrary` crate and
+asserts it decodes to the boundary value it's named for — this is the
+closest stand-in available on stable Rust for `cargo fuzz run execute_task
+-- -runs=0` (which needs the nightly ASan toolchain `cargo-fuzz` requires
+and so isn't runnable in every environment) validating that the corpus
+actually loads and parses.
+
+Only `execute_task` is seeded. `register_task` and `smoke` don't currently
+compile (see the "Target status" table above) — add seeding for them once
+they're fixed.
+
 ## Using the shared invariant module
 
 `contracts/keeper-registry/src/invariants.rs` exposes one `assert_*`
@@ -126,19 +158,25 @@ worked example.
 
 ## CI vs. local expectations
 
-**Not wired up yet.** A time-boxed fuzz job in PR CI, with a longer
-nightly scheduled job, is tracked separately (backlog 0066) and hasn't
-landed — there is currently no automatic fuzzing in this repo's CI at all.
-`docs/CI.md` (backlog 0043, the general "what runs where" guide this
-section would otherwise cross-reference) also doesn't exist yet.
+**Wired up as of backlog 0066.** The `fuzz-pr` advisory job in `ci.yml` runs
+every registered target for 60 seconds on any PR touching
+`contracts/keeper-registry/` or `fuzz/`; `fuzz-nightly.yml` runs the same
+targets for 15 minutes each on a daily schedule with a persistent corpus.
+Neither blocks a merge — see [`docs/CI.md`](CI.md) for the full advisory-job
+policy and how a crash is surfaced.
 
-Until both land, treat fuzzing as an entirely manual, local step: if
-you're touching `execute_task` (the only currently-working target) or the
-shared `invariants` module, run `cargo +nightly fuzz run execute_task -- -max_total_time=120`
-locally before opening a PR. `cargo test -p keeper-registry` (which
-includes the `proptest!`-based property tests) *is* run in ordinary CI
-today, same as any other unit test — that part isn't optional or
-fuzzing-specific.
+A short local run is still worth doing before opening a PR that touches
+`execute_task` (the only currently-working target) or the shared
+`invariants` module — CI's 60-second PR budget is enough to catch an
+obvious regression, not to explore deeply:
+
+```bash
+cargo +nightly fuzz run execute_task -- -max_total_time=120
+```
+
+`cargo test -p keeper-registry` (which includes the `proptest!`-based
+property tests) *is* run in ordinary CI today, same as any other unit test —
+that part isn't optional or fuzzing-specific.
 
 ## What's not here yet
 
@@ -154,6 +192,9 @@ order:
   repo currently has one compact `proptest!` per invariant (see
   `test.rs`), not the exhaustive, sequence-driven exploration those
   issues call for.
+<<<<<<< HEAD
 - **A CI fuzz job** (backlog 0066) and **`docs/CI.md`** (backlog 0043).
+=======
+>>>>>>> f8df1c6e6e7091726aea7df87508515aa6c82b8b
 - **A committed crash corpus** under `fuzz/corpus/*/regressions/` — none
   exists yet, since no crash has been found and minimized.

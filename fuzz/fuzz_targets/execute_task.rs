@@ -82,7 +82,12 @@ fuzz_target!(|data: &[u8]| {
                 proof.len()
             );
 
+<<<<<<< HEAD
             let (expected_keeper_net, expected_fee) = split_reward(reward, fee_bps);
+=======
+            let (expected_keeper_net, expected_fee) = split_reward(reward, fee_bps)
+                .expect("execute_task already succeeded, so split_reward must too");
+>>>>>>> f8df1c6e6e7091726aea7df87508515aa6c82b8b
 
             // I-4 — fee bounding, via the SAME assertion the property
             // tests use (not a parallel copy).

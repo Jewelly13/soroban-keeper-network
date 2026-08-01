@@ -6,6 +6,127 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+<<<<<<< HEAD
+=======
+### Added — batch task registration (VERSION bumped to 3)
+
+Epic E05's batch-registration slice. Full design rationale and integrator
+guidance: [docs/BATCH_OPERATIONS.md](docs/BATCH_OPERATIONS.md).
+
+- **`batch_register_tasks(owner, tasks, max_total_reward) -> Vec<u64>`** —
+  registers many tasks in one transaction under a **single** owner auth,
+  amortizing the per-call overhead (auth, instance TTL bump) `register_task`
+  otherwise pays once per task across N separate transactions. Task ids are
+  returned in the same order as the input entries, so a caller can zip its own
+  worklist against the result.
+- **`BatchTaskParams`** — one batch entry: the same fields `register_task`
+  takes, minus `owner` (shared across the batch).
+- **`max_total_reward` ceiling** — an explicit, human-readable cap on the total
+  escrow a batch may pull from the owner, checked against the sum of the
+  batch's rewards *before* any transfer occurs. Set it to the exact sum of the
+  batch you are submitting; padding it only widens the window in which the call
+  could move more escrow than was reviewed
+  ([docs/BATCH_OPERATIONS.md](docs/BATCH_OPERATIONS.md) §7).
+- **No partial success** — if any entry fails validation, or the batch exceeds
+  either ceiling, the entire call is rejected: zero tasks registered, zero
+  escrow moved. Integrators never have to reconcile "how many of my N tasks
+  actually landed" (§3).
+- **`MAX_BATCH_SIZE` = 50, and a `max_batch_size()` view** — a batch larger
+  than this is rejected with a typed `BatchTooLarge` error rather than failing
+  as opaque host-level resource exhaustion.
+
+  ⚠️ **Practical limit for integrators.** 50 is a **conservative guard, not an
+  empirically measured ceiling** — measuring the real limit against Soroban's
+  per-transaction CPU and ledger-write budgets is still open as backlog issue
+  0104, and this constant should be revised once that lands. Two things follow
+  for anyone integrating today: (1) read the cap from the contract via
+  `max_batch_size()` rather than hardcoding 50, so a later revision does not
+  silently break your chunking; and (2) **entry count is only half the story** —
+  each entry writes a `Task` whose `calldata` may be up to `MAX_CALLDATA_LEN`
+  (1024) bytes, so 50 maximum-sized entries is already ~50 KB of ledger writes
+  before the per-entry token transfer and event are counted. A batch that
+  combines large payloads *and* many entries can exhaust the transaction budget
+  below the 50-entry cap; size against your own payloads, not just the count.
+- **New error variants** (these are the ABI change `VERSION` exists to signal):
+  - `BatchTooLarge` (20) — more than `MAX_BATCH_SIZE` entries.
+  - `EmptyBatch` (21) — empty `tasks` vector; rejected rather than treated as a
+    silent no-op, so a caller whose off-chain filter produced nothing finds out
+    instead of paying for a transaction that registered nothing.
+  - `BatchRewardCeilingExceeded` (22) — the batch's reward sum exceeded
+    `max_total_reward`.
+- A new public entry point plus three new error variants change the contract's
+  ABI — `VERSION` bumped from 2 to 3.
+- **Unchanged by design:** batch-registered tasks are ordinary tasks. Each
+  entry's escrow is transferred and recorded per task, so `cancel_task` and
+  `expire_task` refund each one independently of the rest of its batch; nothing
+  about how a task was created affects claim, execution, or refund.
+- Per-entry validation is shared with `register_task` through one internal
+  helper, so a batch can never accept a task shape a single registration would
+  reject.
+
+### Added — escrow-transfer batching study
+
+- [docs/BATCH_OPERATIONS.md](docs/BATCH_OPERATIONS.md) §9: can
+  `batch_register_tasks`' N escrow transfers be collapsed into one? Finds that
+  per-task escrow is already bookkeeping over a pooled balance, so the collapse
+  is accounting-neutral — per-task refunds and the I-1 solvency invariant are
+  untouched. Estimates a single token transfer at ~155k CPU instructions (by
+  differencing structurally identical entry points in the resource baseline),
+  making the transfers ~60% of a 50-entry batch's CPU cost. Recommends
+  implementing, gated on issue 0104's measurement, and flags the one real
+  hazard it introduces: the sum becomes the money, so a totalling bug becomes
+  a silent solvency violation rather than a wrong ceiling check. Filed as
+  backlog issue 0202.
+
+### Added — batch cancel feasibility study
+
+- [docs/BATCH_OPERATIONS.md](docs/BATCH_OPERATIONS.md) §10: is a
+  `batch_cancel_tasks` worth building, given that issue 0099's cross-keeper
+  race objections do not apply to a single-owner, single-auth operation?
+  Recommends building it, ranked below issues 0104 and 0202, and filed as
+  backlog issue 0203. The reentrancy question is answered rather than assumed
+  away: batching turns one re-entry window into N, and a "gather, then refund"
+  structure copied from `batch_register_tasks` is a **double-spend** — a
+  re-entrant cancel of a not-yet-reached task refunds it, and the outer loop
+  then refunds its stale cached copy again. Each task must be loaded fresh
+  inside the loop; collapsing the refunds into one transfer after all effects
+  removes the window class entirely.
+
+### Fixed — restore work silently reverted by an unrelated merge
+
+- `split_reward`'s return type (`Result<(i128, i128), KeeperError>`) and its
+  three call sites, a missing closing brace in
+  `contracts/keeper-registry/src/test.rs`, and `docs/CI.md` had all been
+  silently reverted/deleted by an unrelated commit (`fee3b2d`, ostensibly a
+  keeper-bot lint fix), leaving `keeper-registry` unable to compile at all.
+  Restored to the state an earlier fix (`038f6c7`) had already established.
+
+### Added — batch claim/execute feasibility study
+
+- [docs/BATCH_OPERATIONS.md](docs/BATCH_OPERATIONS.md): naive all-or-nothing
+  batch claiming is strictly worse than independent claims under Soroban's
+  transaction atomicity; recommends `claim_first_available` instead
+  (backlog issue 0101, already scoped) and defers batch execute pending
+  epic E04 (backlog issue 0201, filed alongside this study).
+
+### Added — advisory CI: fuzz jobs, resource cost report
+
+- `fuzz-pr` (`ci.yml`): runs every registered `cargo-fuzz` target for 60s on
+  PRs touching `contracts/keeper-registry/` or `fuzz/`.
+- `fuzz-nightly` (`.github/workflows/fuzz-nightly.yml`): the same targets
+  for 15 minutes each, on a daily schedule, with a persistent cached corpus.
+- `resource-cost` (`ci.yml`): reports CPU instructions and memory bytes per
+  state-changing entry point via `soroban-sdk`'s budget testutils, diffed
+  against a checked-in baseline.
+- Both documented in [docs/CI.md](docs/CI.md) (restored — see Fixed above).
+
+### Added — partial verifier resource cost catalog
+
+- [docs/VERIFIERS.md](docs/VERIFIERS.md): baseline (no-verifier) measurement
+  methodology in place; per-verifier deltas blocked pending epic E04's
+  reference verifiers, which do not exist in this repo yet.
+
+>>>>>>> f8df1c6e6e7091726aea7df87508515aa6c82b8b
 ### Fixed — task parameter validation
 
 - `register_task` now rejects `lock_ledgers` outside `[MIN_LOCK_LEDGERS,

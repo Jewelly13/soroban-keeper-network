@@ -5,6 +5,34 @@ invariants the `keeper-registry` contract enforces.
 
 ## Components
 
+<<<<<<< HEAD
+=======
+### Keeper registry contract
+
+The registry owns the task lifecycle and stores:
+
+- the administrator and pause state;
+- the configured reward token;
+- the next task id;
+- fee configuration and the accrued-fee accumulator;
+- task records; and
+- credited keeper balances.
+
+Every state transition publishes an event, and events are the query primitive
+for off-chain indexers and keeper bots. This document deliberately does not
+restate the topic and data shapes: the single canonical table lives in the
+[README events section](../README.md#events) and is transcribed from the `emit_*`
+functions in `contracts/keeper-registry/src/lib.rs`. Keep it there rather than
+duplicating it here, so the two cannot drift apart.
+
+### Reward token
+
+The registry transfers the configured token when a task is registered, topped up, cancelled, expired, executed, or when a keeper withdraws rewards. The registry is therefore written against a token contract boundary and must preserve its safety properties even when token transfers are treated as external interactions.
+
+### Owners and keepers
+
+An owner creates and funds a task. A keeper may claim an eligible task, execute it with the required proof or calldata, and receive the net reward as a credited balance. A keeper withdraws that balance independently of the task lifecycle.
+>>>>>>> f8df1c6e6e7091726aea7df87508515aa6c82b8b
 | Component | Location | Role |
 |-----------|----------|------|
 | `KeeperRegistry` contract | `contracts/keeper-registry` | On-chain coordination: task registry, escrow, fee accounting, admin controls |
@@ -139,18 +167,16 @@ property tests in `test.rs` and the fuzz targets under `fuzz/fuzz_targets/`,
 so both call the same assertion logic instead of maintaining parallel
 copies that can drift apart.
 
-## TTL / deadline invariant
+## Events
 
-`Task.deadline` (a unix timestamp, seconds) and `Task.ttl_ledgers` (a Persistent
-storage TTL, ledgers) are different units with no fixed conversion. If a task's
-storage entry could expire before its deadline, the entry — and the escrow
-functions that depend on `load_task` (`cancel_task`, `expire_task`,
-`execute_task`) — become permanently unreachable once the entry is evicted,
-stranding the escrowed reward with no recovery path.
+Every state transition emits an event so off-chain keepers and indexers can
+react without polling storage: `reg`, `claim`, `exec`, `exp`, `cancel`,
+`topup`, `extend` (task topics) and `paused`, `fee`, `admin`, `wdraw`
+(governance / settlement topics).
 
-The contract enforces, by construction, that a task's storage always outlives
-its deadline:
+## Trust model
 
+<<<<<<< HEAD
 ```
 ttl_ledgers >= (deadline - now) / SECONDS_PER_LEDGER + TTL_SAFETY_MARGIN_LEDGERS
 ```
@@ -179,6 +205,8 @@ react without polling storage: `reg`, `claim`, `exec`, `exp`, `cancel`,
 
 ## Trust model
 
+=======
+>>>>>>> f8df1c6e6e7091726aea7df87508515aa6c82b8b
 - **Keepers are permissionless** — anyone can claim and execute; correctness is
   enforced by the contract, not a whitelist.
 - **Admin** controls fee rate, pause, min-reward, upgrade, and fee sweeping —

@@ -5,6 +5,7 @@
 
 [![CI](https://github.com/soroban-tooling/soroban-keeper-network/actions/workflows/ci.yml/badge.svg)](https://github.com/soroban-tooling/soroban-keeper-network/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![CI docs](https://img.shields.io/badge/CI-docs-informational)](docs/CI.md)
 [![Built on Soroban](https://img.shields.io/badge/built%20on-Soroban-blueviolet)](https://soroban.stellar.org)
 [![Live on Testnet](https://img.shields.io/badge/testnet-live-brightgreen.svg)](https://stellar.expert/explorer/testnet/contract/CDJOYHBS7C2PVJS47BTRDLGBNG2YOE43VX6Y3EWIZPPPKOPRNYQQ54U4)
 
@@ -20,7 +21,6 @@
 | [Architecture](docs/ARCHITECTURE.md) | Components, task lifecycle, storage, money invariants, trust model |
 | [Fuzzing & property testing](docs/FUZZING.md) | Running/adding fuzz targets, the shared invariant module, crash-to-regression convention |
 | [Verifier design (E04)](docs/VERIFIER_DESIGN.md) | Proposed `IKeeperVerifier` interface for optional on-chain proof verification |
-| CI checks | Which checks block a PR and which are advisory |
 | [Deploying & running](docs/DEPLOYING.md) | Testnet deploy walkthrough and keeper-bot operator guide |
 | [Deployments](DEPLOYMENTS.md) | Canonical record of on-chain addresses |
 | [Contributing](CONTRIBUTING.md) | How to pick up an issue and open your first PR |
@@ -214,9 +214,6 @@ A **shared, permissionless, on-chain coordination layer** where:
 - `register_task` MUST escrow the full reward amount from the caller.
 - Task ID MUST be monotonically increasing and globally unique.
 - `deadline` MUST be strictly in the future at registration time.
-- `ttl_ledgers` MUST cover `deadline` plus a safety margin (rejected with
-  `TtlTooShort` otherwise) so the storage entry cannot expire before the
-  escrow it guards is resolved.
 - `calldata` MUST NOT exceed `MAX_CALLDATA_LEN` (1024 bytes), rejected with
   `CalldataTooLarge` otherwise. Empty `calldata` is accepted.
 - `reward` MUST be greater than zero.
@@ -240,7 +237,7 @@ A **shared, permissionless, on-chain coordination layer** where:
 
 #### FR-4: Task Cancellation
 - `cancel_task` MUST only be callable by the task owner.
-- MUST only be callable when task is in `Pending` state, or `Claimed` state with an expired lock.
+- MUST only be callable when task is in `Pending` state.
 - MUST refund the full reward to the owner.
 - MUST emit `TaskCancelled`.
 
@@ -264,9 +261,14 @@ A **shared, permissionless, on-chain coordination layer** where:
   whoever already owns it, which must always stay available so an admin
   pause can never become a fund freeze. Read-only views are likewise never
   gated.
-- `extend_deadline` is gated by pause. This prevents the deadline from being
-  moved on a paused task, which could otherwise re-open it to interaction when
-  the intent of pause is to freeze activity.
+- `extend_deadline` is currently **not** gated by pause in the deployed code
+  (own bug, tracked separately from this requirement) — it changes no funds
+  either way, but the intent was likely for it to follow
+  register/claim/execute. See the `pause`/`unpause` doc comment in
+  `contracts/keeper-registry/src/lib.rs` and the
+  `test_pause_policy_matrix_entry_point_by_entry_point` test in
+  `contracts/keeper-registry/src/test.rs` for the authoritative, verified
+  matrix.
 - `set_fee_bps` MUST reject values > 10 000.
 - `transfer_admin` MUST require auth from BOTH current admin AND new admin.
 - `upgrade` MUST use `deployer().update_current_contract_wasm`.
@@ -314,14 +316,6 @@ A **shared, permissionless, on-chain coordination layer** where:
 | `Task(u64)` | `Task` struct | Persistent | `task.ttl_ledgers` | — |
 | `KeeperReward(Address)` | `i128` | Persistent | ~1 year (6.3M ledgers) | `0` |
 
-`Task.deadline` is a unix timestamp **in seconds**; `Task.ttl_ledgers` is a
-Persistent storage TTL **in ledgers** — the two are different units with no
-fixed conversion. `register_task` and `extend_deadline` require
-`ttl_ledgers >= (deadline - now) / SECONDS_PER_LEDGER + TTL_SAFETY_MARGIN_LEDGERS`
-(5 seconds/ledger, ~1 day margin), rejecting the call with `TtlTooShort`
-otherwise. This guarantees a task's storage entry can never be evicted while
-its escrowed reward is still held — see
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#ttl--deadline-invariant).
 `Task.calldata` is capped at `MAX_CALLDATA_LEN` = 1024 bytes, enforced at
 `register_task`. `save_task` re-writes the whole `Task` struct (including
 `calldata`) on every lifecycle mutation — `claim_task`, `execute_task`, the
@@ -398,11 +392,8 @@ let task_id = registry.register_task(
     &TaskType::Liquidation,
     &calldata,                        // encoded liquidation params
     &reward_amount,                   // XLM in stroops
-    &(env.ledger().timestamp() + 3600), // deadline: 1 hour from now (seconds)
-    &18_000u32,                       // TTL: ledgers, must cover the deadline
-                                       // plus a ~1-day safety margin — see
-                                       // "Storage Model" above — or this call
-                                       // fails with TtlTooShort
+    &(env.ledger().timestamp() + 3600), // deadline: 1 hour from now
+    &17_280u32,                       // TTL: ~1 day
     &120u32,                          // lock: ~10 minutes
 );
 ```
