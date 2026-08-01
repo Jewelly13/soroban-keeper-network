@@ -257,23 +257,23 @@ A **shared, permissionless, on-chain coordination layer** where:
 
 #### FR-7: Admin Controls
 - `pause`/`unpause` MUST gate `register_task`, `claim_task`, `execute_task`,
-  and `increase_reward` — all four open new escrow or reward exposure.
+  `increase_reward`, and `extend_deadline` — the first four open new escrow
+  or reward exposure, and `extend_deadline` can keep escrow locked in a
+  contract the admin has declared unsafe if left open.
 - `pause`/`unpause` MUST NOT gate `cancel_task`, `expire_task`, or
   `withdraw_rewards` — these only let already-escrowed value flow back to
   whoever already owns it, which must always stay available so an admin
   pause can never become a fund freeze. Read-only views are likewise never
   gated.
-- `extend_deadline` is currently **not** gated by pause in the deployed code
-  (own bug, tracked separately from this requirement) — it changes no funds
-  either way, but the intent was likely for it to follow
-  register/claim/execute. See the `pause`/`unpause` doc comment in
+  See the `pause`/`unpause` doc comment in
   `contracts/keeper-registry/src/lib.rs` and the
   `test_pause_policy_matrix_entry_point_by_entry_point` test in
   `contracts/keeper-registry/src/test.rs` for the authoritative, verified
   matrix.
 - `set_fee_bps` MUST reject values > 10 000.
 - `transfer_admin` MUST require auth from BOTH current admin AND new admin.
-- `upgrade` MUST use `deployer().update_current_contract_wasm`.
+- `upgrade` MUST use `deployer().update_current_contract_wasm`, and MUST
+  emit `Upgraded` (admin + new WASM hash) before doing so.
 
 #### Planned: FR-8 — Batch Task Registration (not yet implemented)
 
@@ -391,6 +391,7 @@ cannot be "corrected" without breaking existing consumers.
 | `MinRewardUpdated` | `set_min_reward` | `("minrwd", "admin")` | `(old_min: i128, new_min: i128)` |
 | `AdminTransferred` | `transfer_admin` | `("admin", "xfer")` | `(old_admin: Address, new_admin: Address)` |
 | `FeesSwept` | `sweep_fees` | `("sweep", "admin")` | `(treasury: Address, amount: i128, remaining: i128)` |
+| `Upgraded` | `upgrade` | `("upgrade", "admin")` | `(admin: Address, new_wasm_hash: BytesN<32>)` — emitted before the executable is swapped |
 
 Notes:
 
@@ -552,6 +553,46 @@ cp .env.example .env
 # Edit .env with your secret key and contract ID
 npm run start:testnet
 ```
+
+#### Executor Interface
+
+The bot dispatches off-chain execution to a per-`task_type` executor rather
+than performing (or faking) the work inline. This exists because the
+registry's trust model (see "Known Design Decisions" #1 below) has no
+on-chain verification of a keeper's proof — the bot itself is the only
+thing standing between "did the work" and "claimed the reward for work it
+didn't do", so the reference implementation refuses unhandled task types
+instead of fabricating proof for them.
+
+An executor is an async function with this contract:
+
+```js
+/**
+ * @param {object} task
+ *   { taskId, taskType, taskTypeName, calldata (Buffer), reward, deadline }
+ * @param {object} ctx
+ *   { server, keypair, networkPassphrase, log }
+ * @returns {Promise<Buffer|null>}
+ *   Proof bytes on success; null if the work could not be completed.
+ *   Returning null (or throwing) means the bot will NOT call execute_task —
+ *   the task is left for another keeper or for expiry.
+ */
+async function myExecutor(task, ctx) { /* ... */ }
+```
+
+Register one per task type in `EXECUTORS` (`examples/keeper-bot/index.js`):
+
+```js
+const EXECUTORS = {
+  TtlExtension: ttlExtensionExecutor, // worked example, included
+  // Liquidation: myLiquidationExecutor,
+};
+```
+
+There is no default executor that fabricates a proof. A task type with
+nothing registered is skipped and logged, not faked — set
+`SIMULATE_EXECUTION=true` (development only, see `.env.example`) if you
+need the daemon loop to complete a round without a real executor in place.
 
 ---
 
