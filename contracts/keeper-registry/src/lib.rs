@@ -308,6 +308,13 @@ pub fn emit_initialized(e: &Env, admin: &Address, reward_token: &Address, fee_bp
     );
 }
 
+pub fn emit_upgraded(e: &Env, admin: &Address, new_wasm_hash: &BytesN<32>) {
+    e.events().publish(
+        (symbol_short!("upgrade"), symbol_short!("admin")),
+        (admin.clone(), new_wasm_hash.clone()),
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // TTL constants
 // ─────────────────────────────────────────────────────────────────────────────
@@ -875,6 +882,7 @@ impl KeeperRegistry {
         task_id: u64,
         new_deadline: u64,
     ) -> Result<(), KeeperError> {
+        require_not_paused(&e)?;
         owner.require_auth();
 
         let mut task = load_task(&e, task_id)?;
@@ -1126,11 +1134,10 @@ impl KeeperRegistry {
     // | `claim_task`       | BLOCKED     | opens new keeper exposure              |
     // | `execute_task`     | BLOCKED     | pays out new rewards                   |
     // | `increase_reward`  | BLOCKED     | opens new escrow exposure              |
-    // | `extend_deadline`  | NOT gated   | **known bug**, tracked separately — see|
-    // |                    | (allowed)   | TODO next to the test below. Should    |
-    // |                    |             | arguably be blocked (it doesn't touch  |
-    // |                    |             | funds either way, but was likely meant |
-    // |                    |             | to follow register/claim/execute).     |
+    // | `extend_deadline`  | BLOCKED     | keeps escrow locked in a contract the  |
+    // |                    |             | admin has declared unsafe; touches no  |
+    // |                    |             | funds directly but works against the   |
+    // |                    |             | point of a pause if left open          |
     // | `cancel_task`      | allowed     | owner reclaiming pending-task escrow;  |
     // |                    |             | liveness, not new exposure             |
     // | `expire_task`      | allowed     | permissionless fund recovery           |
@@ -1219,8 +1226,15 @@ impl KeeperRegistry {
     pub fn upgrade(e: Env, admin: Address, new_wasm_hash: BytesN<32>) -> Result<(), KeeperError> {
         require_admin(&e, &admin)?;
         bump_instance(&e);
-        e.deployer().update_current_contract_wasm(new_wasm_hash);
-        log!(&e, "Contract upgraded by {}", admin);
+
+        // Emitted *before* the wasm swap: once `update_current_contract_wasm`
+        // runs, the rest of this invocation continues under the new code's
+        // semantics, which we should not assume anything about. Emitting the
+        // record first keeps it independent of whatever the new code does.
+        emit_upgraded(&e, &admin, &new_wasm_hash);
+
+        e.deployer().update_current_contract_wasm(new_wasm_hash.clone());
+        log!(&e, "Contract upgraded by {} to {:?}", admin, new_wasm_hash);
         Ok(())
     }
 

@@ -965,6 +965,42 @@ fn test_extend_deadline_backwards_fails() {
     );
 }
 
+// Regression test for issue #20: `extend_deadline` did not call
+// `require_not_paused`, so an owner could keep escrow locked in a paused
+// contract by pushing the deadline out indefinitely. Mirrors the style of
+// `test_pause_blocks_registration_but_allows_withdraw`.
+#[test]
+fn test_extend_deadline_blocked_while_paused() {
+    let s = setup();
+    let id = register_default_task(&s);
+    let old_deadline = s.registry.get_task(&id).deadline;
+
+    s.registry.pause(&s.admin);
+    assert!(s.registry.is_paused());
+
+    assert_eq!(
+        s.registry
+            .try_extend_deadline(&s.admin, &id, &(old_deadline + 7_200)),
+        Err(Ok(KeeperError::ContractPaused))
+    );
+    assert_eq!(s.registry.get_task(&id).deadline, old_deadline); // untouched
+}
+
+#[test]
+fn test_extend_deadline_succeeds_after_unpause() {
+    let s = setup();
+    let id = register_default_task(&s);
+    let old_deadline = s.registry.get_task(&id).deadline;
+
+    s.registry.pause(&s.admin);
+    s.registry.unpause(&s.admin);
+    assert!(!s.registry.is_paused());
+
+    s.registry
+        .extend_deadline(&s.admin, &id, &(old_deadline + 7_200));
+    assert_eq!(s.registry.get_task(&id).deadline, old_deadline + 7_200);
+}
+
 #[test]
 fn test_is_claimable_lifecycle() {
     let s = setup();
@@ -1977,17 +2013,12 @@ fn test_pause_by_non_admin_fails() {
 /// said nothing about increase_reward, extend_deadline, or cancel_task):
 ///
 ///   - BLOCKED while paused (asserted via `try_*` -> `ContractPaused`):
-///     `register_task`, `claim_task`, `execute_task`, `increase_reward`.
+///     `register_task`, `claim_task`, `execute_task`, `increase_reward`,
+///     `extend_deadline`.
 ///   - Allowed while paused, and asserted to have their full intended
 ///     effect (not just "didn't error"): `cancel_task` (refund + status),
 ///     `expire_task` (refund + status), `withdraw_rewards` (balance
 ///     transferred + zeroed).
-///   - `extend_deadline` is asserted to match its *current* (buggy)
-///     behavior — it has no `require_not_paused` call at all, so it
-///     currently succeeds while paused. That is almost certainly wrong
-///     (it was likely meant to follow register/claim/execute) but fixing it
-///     is out of scope here; seeing this assertion start failing is the
-///     signal that someone fixed the gap without updating this test.
 ///   - Read-only views are asserted to keep working throughout.
 ///   - Finally, unpause restores every previously-blocked entry point —
 ///     a one-way pause would itself be a serious bug.
@@ -2077,18 +2108,23 @@ fn test_pause_policy_matrix_entry_point_by_entry_point() {
         1_000_000i128
     ); // untouched
 
-    // ── extend_deadline: NOT gated in the current code — this is a known
-    // gap, tracked as a separate bug (see the doc comment above `pause` in
-    // lib.rs). Asserting current behavior, not desired behavior.
-    // TODO: once extend_deadline gains a `require_not_paused(&e)?` check,
-    // flip this to `try_extend_deadline` -> `Err(Ok(KeeperError::ContractPaused))`.
+    // ── BLOCKED: extend_deadline — gated as of the fix for issue #20. It
+    // touches no funds directly, but leaving it open while paused would let
+    // an owner keep escrow locked in a contract the admin has declared
+    // unsafe, working against the point of the pause.
     let old_deadline = s.registry.get_task(&extend_target_id).deadline;
-    s.registry
-        .extend_deadline(&s.admin, &extend_target_id, &(old_deadline + 3_600));
+    assert_eq!(
+        s.registry.try_extend_deadline(
+            &s.admin,
+            &extend_target_id,
+            &(old_deadline + 3_600)
+        ),
+        Err(Ok(KeeperError::ContractPaused))
+    );
     assert_eq!(
         s.registry.get_task(&extend_target_id).deadline,
-        old_deadline + 3_600
-    );
+        old_deadline
+    ); // untouched
 
     // ── ALLOWED: cancel_task — must actually refund and flip status, not
     // just "not error".
@@ -2428,14 +2464,38 @@ fn test_instance_ttl_renewed_by_mutation_stays_alive_past_initial_window() {
     assert_eq!(s.registry.get_fee_bps(), 500u32);
 }
 
+// Regression test for issue #18: `upgrade` previously emitted no event at
+// all, so there was no on-chain, indexable record of who authorised an
+// upgrade or which WASM hash it moved to. This asserts the rejection path
+// specifically emits nothing — a non-admin's rejected attempt must not
+// produce an `Upgraded` event, since `require_admin` fails before
+// `emit_upgraded` is ever reached.
+//
+// The success path (`emit_upgraded` fires with the correct hash before
+// `update_current_contract_wasm` swaps the executable) is not covered here
+// for the same reason `resource_report` above excludes `upgrade`: exercising
+// it for real needs a separately-deployed WASM hash already present on the
+// ledger, and `update_current_contract_wasm` only takes effect — success or
+// failure — once the whole invocation completes, so a bogus hash can't be
+// used to observe the event in isolation without also rolling it back.
 #[test]
 fn test_upgrade_by_non_admin_fails() {
     let s = setup();
     let stranger = Address::generate(&s.env);
     let bogus = soroban_sdk::BytesN::from_array(&s.env, &[0u8; 32]);
+
     assert_eq!(
         s.registry.try_upgrade(&stranger, &bogus),
         Err(Ok(KeeperError::Unauthorized))
+    );
+
+    // `events().all()` reflects only the most recent top-level invocation
+    // (see the note in `test_withdraw_transfers_balance_and_zeroes_it`), so
+    // this is checked immediately after the single `try_upgrade` call above
+    // rather than via a before/after count.
+    assert!(
+        s.env.events().all().is_empty(),
+        "a rejected non-admin upgrade must not emit an Upgraded event"
     );
 }
 

@@ -89,6 +89,38 @@ nightly or an actual fuzzing run.
    variant, which is exactly the class of bug this document's "Target
    status" table above is full of.
 
+## Seeding the corpus with boundary values
+
+`fuzz/corpus/` is gitignored (see `.gitignore`'s comment — corpus is
+regenerated locally and by CI, not committed, aside from crash
+regressions), so a fresh checkout starts every target's corpus empty. That
+means a fuzzer's early runs spend time rediscovering inputs the unit tests
+already know are interesting — a proof at exactly `MAX_PROOF_LEN`, a
+`fee_bps` at exactly `10_000` — before it starts exploring anything new.
+
+`fuzz/src/seed.rs` generates a handful of hand-picked seeds for
+`execute_task` from the contract's real boundary constants (`MAX_PROOF_LEN`,
+the `10_000` bps fee cap), so they can't silently drift from the actual
+values as the contract evolves. Regenerate before a local fuzzing session,
+or after any of those constants change:
+
+```bash
+cd fuzz
+cargo test --features arbitrary -- --ignored generate_execute_task_corpus --nocapture
+```
+
+A second ignored test, `generated_corpus_decodes_to_intended_boundaries`,
+round-trips each generated seed through the real `arbitrary` crate and
+asserts it decodes to the boundary value it's named for — this is the
+closest stand-in available on stable Rust for `cargo fuzz run execute_task
+-- -runs=0` (which needs the nightly ASan toolchain `cargo-fuzz` requires
+and so isn't runnable in every environment) validating that the corpus
+actually loads and parses.
+
+Only `execute_task` is seeded. `register_task` and `smoke` don't currently
+compile (see the "Target status" table above) — add seeding for them once
+they're fixed.
+
 ## Using the shared invariant module
 
 `contracts/keeper-registry/src/invariants.rs` exposes one `assert_*`
