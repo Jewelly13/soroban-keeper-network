@@ -32,7 +32,7 @@ class FakeRpcServer {
     this.events = events;
   }
 
-  async getEvents({ startLedger, filters, limit }) {
+  async getEvents({ startLedger: _startLedger, filters: _filters, limit: _limit }) {
     // Simulate RPC response structure
     return {
       events: this.events,
@@ -55,7 +55,7 @@ class FakeRpcServer {
     };
   }
 
-  async simulateTransaction(tx) {
+  async simulateTransaction(_tx) {
     return {
       results: [],
       cost: { cpuInsns: "1000", memBytes: "1000" },

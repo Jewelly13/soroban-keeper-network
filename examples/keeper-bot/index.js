@@ -53,7 +53,6 @@ const {
   nativeToScVal,
   scValToNative,
   Contract,
-  StrKey,
 } = require("@stellar/stellar-sdk");
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -110,6 +109,7 @@ function requireEnv(name, { parse, validate, secret = false, fallback }) {
 }
 
 async function validateAndLoadConfig() {
+  const { StrKey } = require("@stellar/stellar-sdk"); // Moved inside to be used only here
   const network = requireEnv("NETWORK", {
     validate: {
       fn: (v) => Object.keys(NETWORK_CONFIG).includes(v),
@@ -638,6 +638,13 @@ async function keeperLoop(
           executorCtx,
           CONFIG.simulateExecution
         );
+
+        if (proof === null || proof === undefined) {
+          console.log(
+            `  ⏭️  Task ${task.taskId} (${taskTypeName}) not executed — leaving claimed for expiry or another keeper.`
+          );
+          continue;
+        }
 
         if (proof === null || proof === undefined) {
           console.log(

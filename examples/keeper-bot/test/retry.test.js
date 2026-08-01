@@ -17,16 +17,16 @@ const assert = require("node:assert");
 
 // We need to test withRetry, but it depends on CONFIG which is set during
 // validateAndLoadConfig(). For testing, we'll set up a minimal CONFIG.
+
 let originalConfig;
 
 beforeEach(() => {
   // Save original CONFIG if it exists
-  originalConfig = global.CONFIG;
+  
   
   // Set up test CONFIG
   delete require.cache[require.resolve("../index.js")];
-  const keeper = require("../index.js");
-  
+  require("../index.js");
   // Mock CONFIG for testing
   global.CONFIG = {
     maxRetries: 3,

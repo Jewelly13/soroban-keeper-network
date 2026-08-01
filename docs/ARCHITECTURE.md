@@ -30,6 +30,7 @@ The registry transfers the configured token when a task is registered, topped up
 ### Owners and keepers
 
 An owner creates and funds a task. A keeper may claim an eligible task, execute it with the required proof or calldata, and receive the net reward as a credited balance. A keeper withdraws that balance independently of the task lifecycle.
+
 | Component | Location | Role |
 |-----------|----------|------|
 | `KeeperRegistry` contract | `contracts/keeper-registry` | On-chain coordination: task registry, escrow, fee accounting, admin controls |
@@ -172,7 +173,6 @@ react without polling storage: `reg`, `claim`, `exec`, `exp`, `cancel`,
 (governance / settlement topics).
 
 ## Trust model
-
 - **Keepers are permissionless** — anyone can claim and execute; correctness is
   enforced by the contract, not a whitelist.
 - **Admin** controls fee rate, pause, min-reward, upgrade, and fee sweeping —
