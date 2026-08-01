@@ -27,11 +27,14 @@
 //! - `corpus/`: Discovered inputs that trigger interesting behavior
 //! - `artifacts/`: Crash artifacts for debugging
 
-#![cfg_attr(feature = "libfuzzer", no_main)]
+#![no_std]
+#![cfg_attr(feature = "libfuzzer-sys", no_main)]
 
 // Re-export support module for fuzz targets
 pub mod support;
 
-// Shared body of the batch_register_tasks target, kept in the library so it can
-// be exercised by `cargo test` over the seed corpus as well as by libFuzzer.
-pub mod batch;
+// Corpus seed generator (issue #92) — only compiled for `cargo test`, since
+// it needs `std` for file I/O and this crate is otherwise `no_std` for the
+// fuzz targets themselves.
+#[cfg(test)]
+pub mod seed;

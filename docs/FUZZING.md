@@ -51,39 +51,14 @@ run the real, longer sessions (see "CI vs. local expectations" below).
 | Target | Status |
 |---|---|
 | `execute_task` | Compiles and runs cleanly. Exercises `execute_task`'s proof handling and, via the shared `invariants` module, I-1 (solvency, restricted to the executed task) and I-4 (fee bounding). |
-| `register_task` | Compiles and runs. Its `try_register_task` result-nesting and `usize`/`u32` comparisons were brought back in line with this `soroban-sdk` version's generated client, and the call updated for `register_task`'s `verifier` argument. |
-| `smoke` | Compiles and runs. `get_admin()`/`get_reward_token()` were replaced with the real accessors `admin()`/`reward_token_address()`, and the `Env::address_is_contract` assertions (no such method in this SDK) with direct equality against the harness's configured addresses. |
-| `batch_register_tasks` | Compiles and runs. Fuzzes batch shape (0 entries up to `MAX_BATCH_ENTRIES * 2`) and the per-entry parameter mix, asserting the contract never traps, every rejection is a typed `KeeperError` and the *correct* one, and that all-or-nothing holds — no token movement on any rejection. Seeded corpus under `fuzz/corpus/batch_register_tasks/`. |
+| `register_task` | **Currently does not compile** (pre-existing, not introduced by this change) — its `try_register_task` result-nesting doesn't match this `soroban-sdk` version's generated client, and it uses a `usize`/`u32` comparison that doesn't type-check. Needs a fix pass before it can be run; left as-is here since fixing the *content* of a different target is outside this document's scope. |
+| `smoke` | **Currently does not compile** (pre-existing) — calls `client.get_admin()` / `client.get_reward_token()`, which don't exist on the generated client (the real accessors are `admin()` / `reward_token_address()`, both returning `Option<Address>`), and `Env::address_is_contract`, which doesn't exist in this SDK version's `testutils` at all. |
 
-To type-check a target without nightly or an actual fuzzing run:
-
-```bash
-cd fuzz
-RUSTFLAGS="--cfg fuzzing" cargo check --bins --features arbitrary,libfuzzer
-```
-
-`RUSTFLAGS="--cfg fuzzing"` is needed because `cfg(fuzzing)`-gated items like
-`keeper_registry::invariants` are otherwise configured out. The `libfuzzer`
-feature exists because `libfuzzer-sys` is declared as an optional dependency
-that no feature previously enabled, so targets could not resolve it at all
-under a plain `cargo check`. Every `[[bin]]` declares
-`required-features = ["libfuzzer"]`, so omitting the feature skips the fuzz
-targets entirely — which is what lets `cargo test -p keeper-registry-fuzz`
-run on platforms whose toolchain cannot link a libFuzzer runtime (MSVC
-stable, for one).
-
-### Verifying a target without libFuzzer
-
-`fuzz_target!` itself can only be exercised by `cargo +nightly fuzz run`. To
-keep targets verifiable everywhere, put the body in the fuzz *library* and
-leave the target as a thin wrapper — `batch_register_tasks` does this, with
-its logic in `keeper_registry_fuzz::batch`. `fuzz/tests/corpus_seeds.rs` then
-drives every committed seed through that same logic under an ordinary
-`cargo test`, so a broken assertion surfaces without a fuzzing run:
-
-```bash
-cargo test -p keeper-registry-fuzz --test corpus_seeds --features arbitrary
-```
+If you're picking up `register_task` or `smoke` as a fix: `cargo check
+--features arbitrary,libfuzzer-sys --bin <name>` from `fuzz/` (with `RUSTFLAGS="--cfg
+fuzzing"` set, since `cfg(fuzzing)`-gated items like `keeper_registry::invariants`
+are otherwise configured out) reproduces the compile errors without needing
+nightly or an actual fuzzing run.
 
 ## Adding a new fuzz target
 
@@ -114,6 +89,38 @@ cargo test -p keeper-registry-fuzz --test corpus_seeds --features arbitrary
    variant, which is exactly the class of bug this document's "Target
    status" table above is full of.
 
+## Seeding the corpus with boundary values
+
+`fuzz/corpus/` is gitignored (see `.gitignore`'s comment — corpus is
+regenerated locally and by CI, not committed, aside from crash
+regressions), so a fresh checkout starts every target's corpus empty. That
+means a fuzzer's early runs spend time rediscovering inputs the unit tests
+already know are interesting — a proof at exactly `MAX_PROOF_LEN`, a
+`fee_bps` at exactly `10_000` — before it starts exploring anything new.
+
+`fuzz/src/seed.rs` generates a handful of hand-picked seeds for
+`execute_task` from the contract's real boundary constants (`MAX_PROOF_LEN`,
+the `10_000` bps fee cap), so they can't silently drift from the actual
+values as the contract evolves. Regenerate before a local fuzzing session,
+or after any of those constants change:
+
+```bash
+cd fuzz
+cargo test --features arbitrary -- --ignored generate_execute_task_corpus --nocapture
+```
+
+A second ignored test, `generated_corpus_decodes_to_intended_boundaries`,
+round-trips each generated seed through the real `arbitrary` crate and
+asserts it decodes to the boundary value it's named for — this is the
+closest stand-in available on stable Rust for `cargo fuzz run execute_task
+-- -runs=0` (which needs the nightly ASan toolchain `cargo-fuzz` requires
+and so isn't runnable in every environment) validating that the corpus
+actually loads and parses.
+
+Only `execute_task` is seeded. `register_task` and `smoke` don't currently
+compile (see the "Target status" table above) — add seeding for them once
+they're fixed.
+
 ## Using the shared invariant module
 
 `contracts/keeper-registry/src/invariants.rs` exposes one `assert_*`
@@ -124,35 +131,19 @@ duplicate the assertion logic inline in a new test or target. See
 the property tests in `test.rs` (search for `proptest!`) for how they're
 used from the test side.
 
-**Adding a new property.** There are now two shapes, and which one you want
-depends on whether your invariant is about a *single input* or a *sequence
-of calls*.
-
-*Input-shaped properties* are written directly with `proptest!`, generating
-the inputs to a short, fixed sequence of calls (see any `property_i*` test
-in `test.rs` for the pattern: generate a reward and/or a small `Vec` of
-them, apply a fixed handful of calls, then assert one of the
-`invariants.rs` functions holds). Use this when the invariant is "this
-holds for every input," and extend the existing `property_i*` tests in
-place, in the same style.
-
-*Sequence-shaped properties* build on the stateful model-checking harness
-in `contracts/keeper-registry/tests/model.rs` (backlog 0087). It generates
-randomized, mostly-valid sequences of calls across multiple tasks and
-keepers, keeps a plain-Rust `Model` of the expected state, and diffs the
-contract's observable state (`get_task`, `keeper_balance`, `fees_accrued`,
-`task_count`) against that model after **every** step. Use this when the
-invariant is "no arbitrary sequence of N calls breaks this" — it catches
-per-task bookkeeping bugs that a single aggregate assertion nets out to
-zero, and it tells you which call in the sequence broke things.
-
-To add one, hook into the harness rather than reimplementing the loop:
-pass a per-step check as the `after_each` closure to `Harness::run_with`,
-or assert against `Harness::model` once `Harness::run` returns.
-`Harness::assert_solvent` is the worked example. That file's module doc is
-the authoritative guide, including how to model an entry point the harness
-doesn't cover yet (`increase_reward`, `extend_deadline`,
-`update_verifier`, and the admin functions are all still unmodeled).
+**Adding a new property.** The stateful, multi-task/multi-keeper
+model-checking harness (backlog 0061) that would let you generate and
+replay arbitrary *sequences* of contract calls doesn't exist yet — it's
+still open, separately-scoped work. Until it lands, new properties in this
+repo are written directly with `proptest!`, generating the *inputs* to a
+short, fixed sequence of calls (see any `property_i*` test in `test.rs`
+for the pattern: generate a reward and/or a small `Vec` of them, apply a
+fixed handful of calls, then assert one of the `invariants.rs` functions
+holds). This is deliberately narrower than full sequence-shrinking model
+checking — it catches "this specific invariant breaks for this input,"
+not "this arbitrary sequence of N calls breaks something." Extend the
+existing `property_i*` tests in place, in the same style, until the
+stateful harness exists and a wider rewrite becomes worthwhile.
 
 ## Crash-to-regression convention
 
@@ -167,19 +158,25 @@ worked example.
 
 ## CI vs. local expectations
 
-**Not wired up yet.** A time-boxed fuzz job in PR CI, with a longer
-nightly scheduled job, is tracked separately (backlog 0066) and hasn't
-landed — there is currently no automatic fuzzing in this repo's CI at all.
-`docs/CI.md` (backlog 0043, the general "what runs where" guide this
-section would otherwise cross-reference) also doesn't exist yet.
+**Wired up as of backlog 0066.** The `fuzz-pr` advisory job in `ci.yml` runs
+every registered target for 60 seconds on any PR touching
+`contracts/keeper-registry/` or `fuzz/`; `fuzz-nightly.yml` runs the same
+targets for 15 minutes each on a daily schedule with a persistent corpus.
+Neither blocks a merge — see [`docs/CI.md`](CI.md) for the full advisory-job
+policy and how a crash is surfaced.
 
-Until both land, treat fuzzing as an entirely manual, local step: if
-you're touching `execute_task` (the only currently-working target) or the
-shared `invariants` module, run `cargo +nightly fuzz run execute_task -- -max_total_time=120`
-locally before opening a PR. `cargo test -p keeper-registry` (which
-includes the `proptest!`-based property tests) *is* run in ordinary CI
-today, same as any other unit test — that part isn't optional or
-fuzzing-specific.
+A short local run is still worth doing before opening a PR that touches
+`execute_task` (the only currently-working target) or the shared
+`invariants` module — CI's 60-second PR budget is enough to catch an
+obvious regression, not to explore deeply:
+
+```bash
+cargo +nightly fuzz run execute_task -- -max_total_time=120
+```
+
+`cargo test -p keeper-registry` (which includes the `proptest!`-based
+property tests) *is* run in ordinary CI today, same as any other unit test —
+that part isn't optional or fuzzing-specific.
 
 ## What's not here yet
 
@@ -188,16 +185,12 @@ order:
 
 - **`register_task` and `smoke` fuzz targets don't currently compile** (see
   the table above) — fixing these is real, scoped work of its own.
-- **The full I-1..I-7 property test suite** (backlog 0054–0060) — beyond
-  solvency, which is ported onto the model harness, this repo has one
-  compact `proptest!` per invariant (see `test.rs`), not the exhaustive,
-  sequence-driven exploration those issues call for. The harness they
-  should be built on now exists (see "Adding a new property" above);
-  porting each remaining invariant onto it is the outstanding work.
-- **Entry points the model harness doesn't model yet** —
-  `increase_reward`, `extend_deadline`, `update_verifier`, and the admin
-  functions, plus verifier-attached tasks. See `tests/model.rs`'s module
-  doc for what adding one involves.
-- **A CI fuzz job** (backlog 0066) and **`docs/CI.md`** (backlog 0043).
+- **The stateful model-checking harness** (backlog 0061) for generating
+  and replaying arbitrary multi-call sequences, rather than fixed
+  sequences with fuzzed inputs.
+- **The full I-1..I-7 property test suite** (backlog 0054–0060) — this
+  repo currently has one compact `proptest!` per invariant (see
+  `test.rs`), not the exhaustive, sequence-driven exploration those
+  issues call for.
 - **A committed crash corpus** under `fuzz/corpus/*/regressions/` — none
   exists yet, since no crash has been found and minimized.

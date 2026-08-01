@@ -44,7 +44,8 @@ fuzz_target!(|data: &[u8]| {
     // fee_bps <= 10_000 elsewhere, and initialize takes the same bound) so
     // this target spends its entropy budget on the proof, not on
     // rediscovering the already-covered fee_bps validation boundary.
-    let reward = i128::from_le_bytes(input.reward_bytes).unsigned_abs() as i128 % 1_000_000_000 + 1;
+    let reward = i128::from_le_bytes(input.reward_bytes).unsigned_abs() as i128 % 1_000_000_000
+        + 1;
     let fee_bps = u32::from_le_bytes(input.fee_bps_bytes) % 10_001;
 
     let harness = RegistryHarness::new();
@@ -63,7 +64,6 @@ fuzz_target!(|data: &[u8]| {
         &deadline,
         &1_000u32,
         &100u32,
-        &None,
     );
 
     client.claim_task(&harness.keeper, &task_id);
@@ -82,8 +82,8 @@ fuzz_target!(|data: &[u8]| {
                 proof.len()
             );
 
-            let (expected_keeper_net, expected_fee) =
-                split_reward(reward, fee_bps).expect("split_reward must not overflow here");
+            let (expected_keeper_net, expected_fee) = split_reward(reward, fee_bps)
+                .expect("execute_task already succeeded, so split_reward must too");
 
             // I-4 — fee bounding, via the SAME assertion the property
             // tests use (not a parallel copy).

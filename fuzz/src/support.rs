@@ -87,9 +87,8 @@ impl RegistryHarness {
             &Bytes::from_slice(&self.env, b""),
             &reward,
             &(self.env.ledger().timestamp() + 1000), // Far future deadline
-            &18_000, // ttl_ledgers — sufficient for required_ttl_ledgers at this deadline
-            &100,    // lock_ledgers
-            &None,   // verifier
+            &1000, // ttl_ledgers
+            &100,  // lock_ledgers
         )
     }
 
