@@ -94,9 +94,9 @@ make ci
 make check
 ```
 
----
+We use **trunk-based development**. The `main` branch is the trunk, and it must always be stable and releasable.
 
-## Project Structure
+All work happens on short-lived branches prefixed with `feature/`, `fix/`, etc.
 
 ```
 soroban-keeper-network/
@@ -122,7 +122,14 @@ soroban-keeper-network/
 └── LICENSE
 ```
 
----
+| Branch | Purpose | Direct push? |
+|--------|---------|-------------|
+| `main` | The single source of truth. Always stable. | **Never** |
+| `feature/*` | New features | Your own branch — yes |
+| `fix/*` | Bug fixes | Your own branch — yes |
+| `chore/*` | Dependency updates, tooling, CI | Your own branch — yes |
+| `docs/*` | Documentation only changes | Your own branch — yes |
+| `refactor/*` | Code restructuring (no behaviour change) | Your own branch — yes |
 
 ## Git Workflow
 

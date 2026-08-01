@@ -5,6 +5,7 @@
 
 [![CI](https://github.com/soroban-tooling/soroban-keeper-network/actions/workflows/ci.yml/badge.svg)](https://github.com/soroban-tooling/soroban-keeper-network/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![CI docs](https://img.shields.io/badge/CI-docs-informational)](docs/CI.md)
 [![Built on Soroban](https://img.shields.io/badge/built%20on-Soroban-blueviolet)](https://soroban.stellar.org)
 [![Live on Testnet](https://img.shields.io/badge/testnet-live-brightgreen.svg)](https://stellar.expert/explorer/testnet/contract/CDJOYHBS7C2PVJS47BTRDLGBNG2YOE43VX6Y3EWIZPPPKOPRNYQQ54U4)
 

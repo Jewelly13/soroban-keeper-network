@@ -28,39 +28,53 @@ use crate::{
 // Shared test setup
 // ─────────────────────────────────────────────────────────────────────────────
 
-struct Setup {
+struct TestSetup {
     env: Env,
     admin: Address,
     registry: KeeperRegistryClient<'static>,
     token_id: Address,
 }
 
+/// Deploys a SAC-wrapped token, mints 10M units to the admin, and returns the token's address.
+fn deploy_token(env: &Env, admin: &Address) -> Address {
+    let token_admin = Address::generate(env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    token::StellarAssetClient::new(env, &token_id).mint(admin, &10_000_000i128);
+    token_id
+}
+
+/// Deploys and initializes the KeeperRegistry contract.
+fn deploy_registry<'a>(
+    env: &'a Env,
+    admin: &Address,
+    token_id: &Address,
+) -> KeeperRegistryClient<'a> {
+    let registry_id = env.register(KeeperRegistry, ());
+    let registry_client = KeeperRegistryClient::new(env, &registry_id);
+    registry_client.initialize(admin, token_id, &300u32); // Default 3% fee
+    registry_client
+}
+
 // The transmutes below intentionally re-bind the env/client to a 'static
 // lifetime — the standard Soroban test-harness pattern for a shared Setup.
 #[allow(clippy::useless_transmute, clippy::missing_transmute_annotations)]
-fn setup() -> Setup {
+fn setup() -> TestSetup {
     let env = Env::default();
     env.mock_all_auths();
 
     let admin = Address::generate(&env);
-
-    // Deploy a SAC-wrapped token to use as the reward currency.
-    let token_admin = Address::generate(&env);
-    let token_id = env
-        .register_stellar_asset_contract_v2(token_admin.clone())
-        .address();
-    token::StellarAssetClient::new(&env, &token_id).mint(&admin, &10_000_000i128);
-
-    let registry_id = env.register(KeeperRegistry, ());
-    let registry = KeeperRegistryClient::new(&env, &registry_id);
-    registry.initialize(&admin, &token_id, &300u32);
+    let token_id = deploy_token(&env, &admin);
+    // The client is bound to the lifetime of `env_for_registry`.
+    let env_for_registry = env.clone();
+    let registry = deploy_registry(&env_for_registry, &admin, &token_id);
 
     // Leak env to get a 'static lifetime — standard soroban test pattern.
-    let env = unsafe { core::mem::transmute::<Env, Env>(env) };
-    Setup {
-        env,
+    TestSetup {
+        env: unsafe { core::mem::transmute(env) },
         admin,
-        registry: unsafe { core::mem::transmute(registry) },
+        registry: unsafe { core::mem::transmute(registry) }, // Now transmutes a client with a 'static lifetime.
         token_id,
     }
 }
@@ -70,14 +84,14 @@ fn calldata(env: &Env) -> Bytes {
 }
 
 /// Registers a standard 1-hour task funded by `admin` and returns its id.
-fn register_default_task(s: &Setup) -> u64 {
+fn register_default_task(s: &TestSetup) -> u64 {
     register_reward_task(s, 1_000_000i128)
 }
 
 /// Same as `register_default_task` but with a caller-chosen reward, so tests
 /// can exercise several distinct amounts (e.g. non-round fee splits) without
 /// duplicating the register_task call boilerplate.
-fn register_reward_task(s: &Setup, reward: i128) -> u64 {
+fn register_reward_task(s: &TestSetup, reward: i128) -> u64 {
     let deadline = s.env.ledger().timestamp() + 3_600;
     s.registry.register_task(
         &s.admin,
@@ -423,6 +437,41 @@ fn test_register_increments_task_counter() {
 }
 
 #[test]
+fn test_register_task_ttl_shorter_than_deadline_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    token::StellarAssetClient::new(&env, &token_id).mint(&admin, &5_000_000i128);
+
+    let registry_id = env.register(KeeperRegistry, ());
+    let registry = KeeperRegistryClient::new(&env, &registry_id);
+    registry.initialize(&admin, &token_id, &300u32);
+
+    // 30-day deadline, but only ~1 day of TTL — the exact scenario from the
+    // issue: the storage entry would die long before the deadline, stranding
+    // the escrow. Must be rejected outright.
+    let deadline = env.ledger().timestamp() + 2_592_000; // 30 days
+    assert_eq!(
+        registry.try_register_task(
+            &admin,
+            &TaskType::Liquidation,
+            &calldata(&env),
+            &1_000_000i128,
+            &deadline,
+            &17_280u32, // ~1 day of ledgers — nowhere near enough
+            &120u32,
+        ),
+        Err(Ok(KeeperError::TtlTooShort))
+    );
+    // Nothing was escrowed and no task was created.
+    assert_eq!(registry.task_count(), 0u64);
+}
+
+#[test]
 fn test_register_task_with_max_calldata_succeeds() {
     let env = Env::default();
     env.mock_all_auths();
@@ -479,6 +528,65 @@ fn test_register_task_over_max_calldata_fails() {
         Err(Ok(KeeperError::CalldataTooLarge))
     );
     assert_eq!(registry.task_count(), 0u64);
+}
+
+#[test]
+fn test_register_task_ttl_covering_deadline_succeeds() {
+    let s = setup();
+    // deadline is 3_600s away; required TTL is 720 ledgers + the 17_280
+    // safety margin = 18_000. 20_000 comfortably covers it.
+    let id = register_default_task(&s);
+    assert_eq!(s.registry.get_task(&id).status, TaskStatus::Pending);
+}
+
+#[test]
+fn test_extend_deadline_ttl_too_short_fails() {
+    let s = setup();
+    let id = register_default_task(&s); // ttl_ledgers = 20_000
+    let old = s.registry.get_task(&id).deadline;
+
+    // Push the deadline out far enough that the existing TTL (20_000 ledgers)
+    // no longer covers it plus the safety margin.
+    let far_future = old + 1_000_000;
+    assert_eq!(
+        s.registry.try_extend_deadline(&s.admin, &id, &far_future),
+        Err(Ok(KeeperError::TtlTooShort))
+    );
+    // The deadline was not mutated.
+    assert_eq!(s.registry.get_task(&id).deadline, old);
+}
+
+#[test]
+fn test_expire_task_succeeds_past_old_ttl_boundary() {
+    let s = setup();
+    let keeper = Address::generate(&s.env);
+    let token = token::Client::new(&s.env, &s.token_id);
+    let before = token.balance(&s.admin);
+
+    // Register with a deadline far enough out that a naive ttl_ledgers of
+    // ~1 day (17_280, as in the old README example) would have expired the
+    // storage entry long before the deadline. The TTL invariant forces a
+    // larger value here, so the entry must still be alive at expiry time.
+    let deadline = s.env.ledger().timestamp() + 172_800; // 2 days
+    let required = 172_800 / 5 + 17_280; // matches required_ttl_ledgers
+    let id = s.registry.register_task(
+        &s.admin,
+        &TaskType::Liquidation,
+        &calldata(&s.env),
+        &1_000_000i128,
+        &deadline,
+        &(required as u32),
+        &120u32,
+    );
+    s.registry.claim_task(&keeper, &id); // claimed but never executed
+
+    // Advance well past where a 17_280-ledger TTL (the old unsafe default)
+    // would have evicted the entry, and past the deadline itself.
+    advance(&s.env, 40_000, 172_801);
+    s.registry.expire_task(&id); // must still succeed and refund the owner
+
+    assert_eq!(token.balance(&s.admin), before);
+    assert_eq!(s.registry.get_task(&id).status, TaskStatus::Expired);
 }
 
 #[test]
@@ -805,6 +913,15 @@ fn test_batch_register_one_bad_entry_rejects_entire_batch() {
             },
             KeeperError::InvalidTaskParams,
         ),
+        (
+            BatchTaskParams {
+                // Issue 11 fix for batch parameters too: ttl must cover deadline
+                ttl_ledgers: 17_280, // far too short for this deadline
+                deadline: s.env.ledger().timestamp() + 2_592_000,
+                ..batch_entry(&s.env, 1_000_000i128)
+            },
+            KeeperError::TtlTooShort,
+        ),
     ];
 
     for (bad, expected) in cases {
@@ -1072,7 +1189,7 @@ fn test_reclaim_after_lock_window_elapses() {
 /// Registers a task with the given `lock_ledgers`, claims it as `keeper`, and
 /// returns `(task_id, unlock_at)` where `unlock_at = claim_ledger + lock_ledgers`
 /// — the first ledger sequence at which the lock is considered expired.
-fn claim_with_lock(s: &Setup, keeper: &Address, lock_ledgers: u32) -> (u64, u32) {
+fn claim_with_lock(s: &TestSetup, keeper: &Address, lock_ledgers: u32) -> (u64, u32) {
     let deadline = s.env.ledger().timestamp() + 3_600;
     let id = s.registry.register_task(
         &s.admin,
@@ -1663,7 +1780,7 @@ fn test_expire_twice_fails_with_invalid_status_and_pays_refund_once() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Drives a full register → claim → execute cycle and returns the keeper.
-fn executed_task_keeper(s: &Setup) -> Address {
+fn executed_task_keeper(s: &TestSetup) -> Address {
     let keeper = Address::generate(&s.env);
     let id = register_default_task(s);
     s.registry.claim_task(&keeper, &id);
@@ -1757,11 +1874,6 @@ fn test_keeper_balance_accumulates_across_tasks_and_withdraws_as_one_sum() {
     assert_eq!(token.balance(&keeper1), 0i128);
     let withdrawn = s.registry.withdraw_rewards(&keeper1);
 
-    // Inspect events from this call *before* making any further contract
-    // calls — `events().all()` reflects only the most recent top-level
-    // invocation, and even read-only views (like the balance checks below)
-    // would reset it.
-    //
     // Exactly one RewardsWithdrawn event was emitted, carrying the total —
     // not one per credited task, and not the token contract's own transfer
     // event (which carries a different topic pair).
@@ -2955,7 +3067,7 @@ fn test_split_reward_extreme_value_returns_overflow_error() {
     // typed error rather than panicking.
     let extreme_reward = i128::MAX / 9_999; // Will overflow when multiplied by 10_000
     let fee_bps = 10_000u32; // Max fee rate
-    
+
     let result = split_reward(extreme_reward, fee_bps);
     assert_eq!(result, Err(KeeperError::ArithmeticOverflow));
 }
@@ -2965,7 +3077,7 @@ fn test_split_reward_max_safe_value_succeeds() {
     // The largest reward that can be safely multiplied by 10_000
     let safe_reward = i128::MAX / 10_000;
     let fee_bps = 300u32;
-    
+
     let result = split_reward(safe_reward, fee_bps);
     assert!(result.is_ok());
     let (keeper_net, fee) = result.unwrap();
@@ -2992,9 +3104,7 @@ fn test_set_min_reward_emits_event() {
     let s = setup();
     let old_min = s.registry.min_reward(); // initially 0
     let new_min = 500_000i128;
-    
     s.registry.set_min_reward(&s.admin, &new_min);
-    
     // Find the minrwd event - it should be emitted
     let events = s.env.events().all();
     let mut found = false;
@@ -3014,10 +3124,8 @@ fn test_set_min_reward_emits_event() {
 fn test_set_min_reward_no_event_when_validation_fails() {
     let s = setup();
     let events_before = s.env.events().all();
-    
     // Negative reward fails validation
     let _ = s.registry.try_set_min_reward(&s.admin, &-1i128);
-    
     let events_after = s.env.events().all();
     // No new min reward event should be added
     let mut found_new_min_reward_event = false;
@@ -3029,24 +3137,23 @@ fn test_set_min_reward_no_event_when_validation_fails() {
             found_new_min_reward_event = true;
         }
     }
-    assert!(!found_new_min_reward_event, "no event should be emitted on validation failure");
+    assert!(
+        !found_new_min_reward_event,
+        "no event should be emitted on validation failure"
+    );
 }
 
 #[test]
 fn test_set_min_reward_event_captures_old_and_new() {
     let s = setup();
-    
     // Set initial value
     s.registry.set_min_reward(&s.admin, &100_000i128);
-    
     // Change it again
     s.registry.set_min_reward(&s.admin, &200_000i128);
-    
     let events = s.env.events().all();
     let event = events.last().unwrap();
     let data: (i128, i128) = event.2.try_into_val(&s.env).unwrap();
     let (event_old, event_new) = data;
-    
     assert_eq!(event_old, 100_000i128);
     assert_eq!(event_new, 200_000i128);
 }
@@ -3060,13 +3167,10 @@ fn test_sweep_fees_emits_event() {
     let s = setup();
     let _ = executed_task_keeper(&s); // accrues 30_000 fee
     let treasury = Address::generate(&s.env);
-    
     s.registry.sweep_fees(&s.admin, &treasury, &30_000i128);
-    
     // Verify event data - last event should be the sweep
     let events = s.env.events().all();
     let event = events.last().unwrap();
-    
     let data: (Address, i128, i128) = event.2.try_into_val(&s.env).unwrap();
     let (event_treasury, event_amount, event_remaining) = data;
     assert_eq!(event_treasury, treasury);
@@ -3079,17 +3183,13 @@ fn test_sweep_fees_partial_amount_shows_remaining() {
     let s = setup();
     let _ = executed_task_keeper(&s); // accrues 30_000 fee
     let treasury = Address::generate(&s.env);
-    
     s.registry.sweep_fees(&s.admin, &treasury, &12_000i128);
-    
     let events = s.env.events().all();
     let event = events.last().unwrap();
     let data: (Address, i128, i128) = event.2.try_into_val(&s.env).unwrap();
     let (_event_treasury, event_amount, event_remaining) = data;
-    
     assert_eq!(event_amount, 12_000i128);
     assert_eq!(event_remaining, 18_000i128);
-    
     // Verify remaining matches actual state
     assert_eq!(s.registry.fees_accrued(), 18_000i128);
 }
@@ -3100,10 +3200,8 @@ fn test_sweep_fees_no_event_when_validation_fails() {
     let _ = executed_task_keeper(&s); // accrues 30_000
     let treasury = Address::generate(&s.env);
     let events_before = s.env.events().all();
-    
     // Try to sweep more than accrued
     let _ = s.registry.try_sweep_fees(&s.admin, &treasury, &30_001i128);
-    
     let events_after = s.env.events().all();
     // Check that no sweep event was added (events may include diagnostic events)
     // The sweep event has 3 fields: (Address, i128, i128)
@@ -3115,7 +3213,10 @@ fn test_sweep_fees_no_event_when_validation_fails() {
             found_sweep_event = true;
         }
     }
-    assert!(!found_sweep_event, "no sweep event should be emitted on validation failure");
+    assert!(
+        !found_sweep_event,
+        "no sweep event should be emitted on validation failure"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3126,20 +3227,16 @@ fn test_sweep_fees_no_event_when_validation_fails() {
 fn test_initialize_emits_event() {
     let env = Env::default();
     env.mock_all_auths();
-    
     let admin = Address::generate(&env);
     let token_id = env
         .register_stellar_asset_contract_v2(admin.clone())
         .address();
     let registry_id = env.register(KeeperRegistry, ());
     let registry = KeeperRegistryClient::new(&env, &registry_id);
-    
     registry.initialize(&admin, &token_id, &300u32);
-    
     // Verify event data - last event should be the init event
     let events = env.events().all();
     let event = events.last().unwrap();
-    
     // Data contains (admin, reward_token, fee_bps)
     let data: (Address, Address, u32) = event.2.try_into_val(&env).unwrap();
     let (event_admin, event_token, event_fee_bps) = data;
@@ -3152,20 +3249,16 @@ fn test_initialize_emits_event() {
 fn test_initialize_no_event_on_second_call() {
     let env = Env::default();
     env.mock_all_auths();
-    
     let admin = Address::generate(&env);
     let token_id = env
         .register_stellar_asset_contract_v2(admin.clone())
         .address();
     let registry_id = env.register(KeeperRegistry, ());
     let registry = KeeperRegistryClient::new(&env, &registry_id);
-    
     registry.initialize(&admin, &token_id, &300u32);
     let events_before = env.events().all();
-    
     // Second initialize call fails
     let _ = registry.try_initialize(&admin, &token_id, &300u32);
-    
     let events_after = env.events().all();
     // Check that no init event was added
     let mut found_init_event = false;
@@ -3176,26 +3269,28 @@ fn test_initialize_no_event_on_second_call() {
             found_init_event = true;
         }
     }
-    assert!(!found_init_event, "no event should be emitted on rejected second initialize");
+    assert!(
+        !found_init_event,
+        "no event should be emitted on rejected second initialize"
+    );
 }
 
 #[test]
 fn test_initialize_no_event_when_validation_fails() {
     let env = Env::default();
     env.mock_all_auths();
-    
     let admin = Address::generate(&env);
     let token_id = env
         .register_stellar_asset_contract_v2(admin.clone())
         .address();
     let registry_id = env.register(KeeperRegistry, ());
     let registry = KeeperRegistryClient::new(&env, &registry_id);
-    
+
     let events_before = env.events().all();
-    
+
     // Invalid fee_bps > 10_000
     let _ = registry.try_initialize(&admin, &token_id, &10_001u32);
-    
+
     let events_after = env.events().all();
     // Check that no init event was added
     let mut found_init_event = false;
@@ -3206,7 +3301,10 @@ fn test_initialize_no_event_when_validation_fails() {
             found_init_event = true;
         }
     }
-    assert!(!found_init_event, "no event should be emitted on validation failure");
+    assert!(
+        !found_init_event,
+        "no event should be emitted on validation failure"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

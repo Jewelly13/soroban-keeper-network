@@ -31,10 +31,7 @@
 
 #![no_std]
 
-use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, log, symbol_short, token, Address, Bytes,
-    BytesN, Env, Vec,
-};
+use soroban_sdk::{ contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Bytes, BytesN, Env, log };
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Storage Keys
@@ -159,9 +156,10 @@ pub enum KeeperError {
     /// A function requiring configured state (`initialize` must have been
     /// called) was invoked on a registry that isn't configured yet.
     NotInitialized = 15,
-    // 16 is reserved for `TtlTooShort`, added by a sibling in-flight PR (see
-    // #11 / register_task deadline-vs-TTL invariant). Left as a gap rather
-    // than reused so the two branches don't collide on the same discriminant.
+    /// `ttl_ledgers` does not cover the task's `deadline` plus the safety
+    /// margin — the storage entry could expire while the escrow is still
+    /// live. See [`required_ttl_ledgers`].
+    TtlTooShort = 16,
     /// `calldata` exceeds [`MAX_CALLDATA_LEN`].
     CalldataTooLarge = 17,
     /// `lock_ledgers` or `ttl_ledgers` passed to `register_task` fell outside
@@ -401,6 +399,28 @@ fn next_task_id(e: &Env) -> u64 {
     next
 }
 
+/// Ledgers close roughly every 5 seconds on Stellar. Used only to sanity-check
+/// that a task's storage outlives its deadline; a conservative estimate is
+/// correct here because over-estimating the ledger rate over-provisions TTL.
+const SECONDS_PER_LEDGER: u64 = 5;
+
+/// Extra ledgers kept beyond the deadline so `expire_task` (and `cancel_task`/
+/// `execute_task`) are still callable for a while after the deadline passes,
+/// giving a margin against clock drift between the two units below.
+const TTL_SAFETY_MARGIN_LEDGERS: u32 = 17_280; // ~1 day
+
+/// Minimum `ttl_ledgers` a task with the given `deadline` must be stored with
+/// so its Persistent storage entry cannot be evicted while the escrow it
+/// guards is still live. `deadline` is a unix timestamp (seconds);
+/// `ttl_ledgers` is a ledger count — the two are different units with no
+/// fixed conversion, so this is deliberately conservative
+/// (see [`SECONDS_PER_LEDGER`], [`TTL_SAFETY_MARGIN_LEDGERS`]).
+fn required_ttl_ledgers(e: &Env, deadline: u64) -> u64 {
+    let seconds_until_deadline = deadline.saturating_sub(e.ledger().timestamp());
+    let ledgers_until_deadline = seconds_until_deadline / SECONDS_PER_LEDGER;
+    ledgers_until_deadline + TTL_SAFETY_MARGIN_LEDGERS as u64
+}
+
 fn load_task(e: &Env, task_id: u64) -> Result<Task, KeeperError> {
     e.storage()
         .persistent()
@@ -533,6 +553,9 @@ fn validate_task_params(
     if ttl_ledgers < MIN_TTL_LEDGERS {
         return Err(KeeperError::InvalidTaskParams);
     }
+    if (ttl_ledgers as u64) < required_ttl_ledgers(e, deadline) {
+        return Err(KeeperError::TtlTooShort);
+    }
     Ok(())
 }
 
@@ -655,7 +678,6 @@ impl KeeperRegistry {
         bump_instance(&e);
 
         emit_initialized(&e, &admin, &reward_token, fee_bps);
-        log!(&e, "KeeperRegistry initialized by {}", admin);
         Ok(())
     }
 
@@ -726,7 +748,6 @@ impl KeeperRegistry {
         save_task(&e, task_id, &task);
         emit_task_registered(&e, task_id, &owner, reward, deadline);
 
-        log!(&e, "Task {} registered reward={}", task_id, reward);
         Ok(task_id)
     }
 
@@ -867,7 +888,6 @@ impl KeeperRegistry {
         save_task(&e, task_id, &task);
 
         emit_reward_increased(&e, task_id, task.reward);
-        log!(&e, "Task {} reward increased to {}", task_id, task.reward);
         Ok(())
     }
 
@@ -941,7 +961,6 @@ impl KeeperRegistry {
         save_task(&e, task_id, &task);
 
         emit_task_claimed(&e, task_id, &keeper);
-        log!(&e, "Task {} claimed by {}", task_id, keeper);
         Ok(())
     }
 
@@ -995,14 +1014,6 @@ impl KeeperRegistry {
         save_task(&e, task_id, &task);
 
         emit_task_executed(&e, task_id, &keeper, keeper_net, &proof);
-        log!(
-            &e,
-            "Task {} executed by {} net={} proof_len={}",
-            task_id,
-            keeper,
-            keeper_net,
-            proof.len()
-        );
         Ok(())
     }
 
@@ -1040,13 +1051,6 @@ impl KeeperRegistry {
         reward_token(&e)?.transfer(&e.current_contract_address(), &owner, &refund);
 
         emit_task_cancelled(&e, task_id, &owner);
-        log!(
-            &e,
-            "Task {} cancelled, {} refunded to {}",
-            task_id,
-            refund,
-            owner
-        );
         Ok(())
     }
 
@@ -1082,7 +1086,6 @@ impl KeeperRegistry {
         reward_token(&e)?.transfer(&e.current_contract_address(), &owner, &refund);
 
         emit_task_expired(&e, task_id);
-        log!(&e, "Task {} expired, {} refunded to owner", task_id, refund);
         Ok(())
     }
 
@@ -1108,7 +1111,6 @@ impl KeeperRegistry {
         reward_token(&e)?.transfer(&e.current_contract_address(), &keeper, &balance);
 
         emit_rewards_withdrawn(&e, &keeper, balance);
-        log!(&e, "Keeper {} withdrew {}", keeper, balance);
         Ok(balance)
     }
 
@@ -1134,10 +1136,10 @@ impl KeeperRegistry {
     // | `claim_task`       | BLOCKED     | opens new keeper exposure              |
     // | `execute_task`     | BLOCKED     | pays out new rewards                   |
     // | `increase_reward`  | BLOCKED     | opens new escrow exposure              |
-    // | `extend_deadline`  | BLOCKED     | keeps escrow locked in a contract the  |
-    // |                    |             | admin has declared unsafe; touches no  |
-    // |                    |             | funds directly but works against the   |
-    // |                    |             | point of a pause if left open          |
+    // | `extend_deadline`  | BLOCKED     | stops deadline from being moved on a   |
+    // |                    |             | paused task, which could otherwise     |
+    // |                    |             | re-open it to interaction when the     |
+    // |                    |             | intent of pause is to freeze activity. |
     // | `cancel_task`      | allowed     | owner reclaiming pending-task escrow;  |
     // |                    |             | liveness, not new exposure             |
     // | `expire_task`      | allowed     | permissionless fund recovery           |
@@ -1153,7 +1155,6 @@ impl KeeperRegistry {
         bump_instance(&e);
         e.storage().instance().set(&DataKey::Paused, &true);
         emit_paused(&e, true);
-        log!(&e, "Registry paused by {}", admin);
         Ok(())
     }
 
@@ -1162,7 +1163,6 @@ impl KeeperRegistry {
         bump_instance(&e);
         e.storage().instance().set(&DataKey::Paused, &false);
         emit_paused(&e, false);
-        log!(&e, "Registry unpaused by {}", admin);
         Ok(())
     }
 
@@ -1180,7 +1180,6 @@ impl KeeperRegistry {
         let old_bps = fee_bps(&e);
         e.storage().instance().set(&DataKey::FeeBps, &new_bps);
         emit_fee_updated(&e, old_bps, new_bps);
-        log!(&e, "Fee updated to {} bps", new_bps);
         Ok(())
     }
 
@@ -1198,7 +1197,6 @@ impl KeeperRegistry {
         let old_min: i128 = min_reward_floor(&e);
         e.storage().instance().set(&DataKey::MinReward, &min_reward);
         emit_min_reward_updated(&e, old_min, min_reward);
-        log!(&e, "Min reward set to {}", min_reward);
         Ok(())
     }
 
@@ -1214,7 +1212,6 @@ impl KeeperRegistry {
         bump_instance(&e);
         e.storage().instance().set(&DataKey::Admin, &new_admin);
         emit_admin_transferred(&e, &admin, &new_admin);
-        log!(&e, "Admin transferred from {} to {}", admin, new_admin);
         Ok(())
     }
 
@@ -1273,7 +1270,6 @@ impl KeeperRegistry {
 
         let remaining = accrued - amount;
         emit_fees_swept(&e, &treasury, amount, remaining);
-        log!(&e, "Swept {} fees to {}", amount, treasury);
         Ok(())
     }
 

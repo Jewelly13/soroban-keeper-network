@@ -192,5 +192,6 @@ order:
   repo currently has one compact `proptest!` per invariant (see
   `test.rs`), not the exhaustive, sequence-driven exploration those
   issues call for.
+
 - **A committed crash corpus** under `fuzz/corpus/*/regressions/` — none
   exists yet, since no crash has been found and minimized.

@@ -646,6 +646,13 @@ async function keeperLoop(
           continue;
         }
 
+        if (proof === null || proof === undefined) {
+          console.log(
+            `  ⏭️  Task ${task.taskId} (${taskTypeName}) not executed — leaving claimed for expiry or another keeper.`
+          );
+          continue;
+        }
+
         await withRetry(`execute_task ${task.taskId}`, () =>
           invokeContract(
             server,
