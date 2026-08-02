@@ -2672,6 +2672,31 @@ fn test_instance_ttl_renewed_by_mutation_stays_alive_past_initial_window() {
     assert_eq!(s.registry.get_fee_bps(), 500u32);
 }
 
+// Issue 0122: docs/ARCHITECTURE.md's "TTL / archival strategy" section
+// explicitly accepts that "a registry that is completely idle ... for the
+// full TTL window can still archive" as a tradeoff for not bumping TTL on
+// side-effect-free reads. This test proves that failure mode actually
+// happens rather than just being documented: with zero mutating calls after
+// `initialize()` (the only `bump_instance` call this test ever makes),
+// advancing well past `INSTANCE_BUMP_LEDGERS` genuinely lapses the
+// instance's TTL. `Deployer::get_contract_instance_ttl`'s host
+// implementation computes `live_until_ledger.checked_sub(current_ledger)`,
+// which underflows (panics) once the current ledger has actually passed
+// the entry's expiry -- so this is a direct proof of archival, not an
+// inference.
+#[test]
+#[should_panic]
+fn test_instance_ttl_lapses_when_registry_is_fully_idle_past_bump_window() {
+    let s = setup();
+
+    advance(&s.env, INSTANCE_BUMP_LEDGERS + 1_000, 0);
+
+    let _ = s
+        .env
+        .deployer()
+        .get_contract_instance_ttl(&s.registry.address);
+}
+
 // Regression test for issue #18: `upgrade` previously emitted no event at
 // all, so there was no on-chain, indexable record of who authorised an
 // upgrade or which WASM hash it moved to. This asserts the rejection path
@@ -3709,6 +3734,57 @@ proptest! {
                 "ttl_ledgers that covers the deadline plus safety margin must be accepted"
             );
         }
+    }
+
+    // I-9 — Instance TTL liveness under randomized, bounded-gap traffic
+    // (issue 0122, generalizing issue 0015's hand-written
+    // `test_instance_ttl_renewed_by_mutation_stays_alive_past_initial_window`).
+    // See docs/ARCHITECTURE.md's "TTL / archival strategy" section.
+    //
+    // `bump_instance` calls `extend_ttl(INSTANCE_BUMP_THRESHOLD,
+    // INSTANCE_BUMP_LEDGERS)` on every mutating entry point: per
+    // `storage::Instance::extend_ttl`'s documented semantics, that's a
+    // no-op whenever the remaining TTL is already >= INSTANCE_BUMP_THRESHOLD,
+    // and only resets the remaining TTL up to the full INSTANCE_BUMP_LEDGERS
+    // when it was below that threshold. The only gap bound that's safe
+    // between ANY two consecutive calls without inspecting live state is
+    // therefore INSTANCE_BUMP_THRESHOLD, not the larger INSTANCE_BUMP_LEDGERS
+    // (a call that lands while TTL is still comfortably above the threshold
+    // does not buy back a fresh full-size window) -- this property pins that
+    // bound directly rather than assuming the looser one.
+    #[test]
+    fn property_i9_instance_ttl_never_lapses_under_bounded_gap_traffic(
+        gaps in prop::collection::vec(0u32..INSTANCE_BUMP_THRESHOLD, 1..8),
+    ) {
+        let s = setup(); // initialize() already performed one bump_instance call.
+
+        for gap in gaps {
+            advance(&s.env, gap, 0);
+            let ttl = s
+                .env
+                .deployer()
+                .get_contract_instance_ttl(&s.registry.address);
+            prop_assert!(
+                ttl > 0,
+                "instance TTL lapsed after a {}-ledger gap despite a mutating call \
+                 following it within INSTANCE_BUMP_THRESHOLD",
+                gap
+            );
+
+            // Any mutating entry point calls bump_instance; this one
+            // touches only instance storage, isolating instance TTL
+            // renewal from the separate per-task TTL mechanism.
+            s.registry.set_min_reward(&s.admin, &0i128);
+        }
+
+        let ttl_final = s
+            .env
+            .deployer()
+            .get_contract_instance_ttl(&s.registry.address);
+        prop_assert!(
+            ttl_final > 0,
+            "instance TTL lapsed after a sequence of bounded-gap mutating calls"
+        );
     }
 }
 
