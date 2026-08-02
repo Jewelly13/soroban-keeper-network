@@ -19,12 +19,9 @@ use soroban_sdk::{
 };
 
 use crate::{
-    split_reward, DataKey, KeeperError, KeeperRegistry, KeeperRegistryClient, TaskStatus, TaskType,
-    INSTANCE_BUMP_LEDGERS, INSTANCE_BUMP_THRESHOLD, MAX_BATCH_READ, MAX_CALLDATA_LEN,
-    MAX_LOCK_LEDGERS, MIN_LOCK_LEDGERS, MIN_TTL_LEDGERS,
     split_reward, BatchTaskParams, DataKey, KeeperError, KeeperRegistry, KeeperRegistryClient,
-    TaskStatus, TaskType, INSTANCE_BUMP_LEDGERS, INSTANCE_BUMP_THRESHOLD, MAX_BATCH_SIZE,
-    MAX_CALLDATA_LEN, MAX_LOCK_LEDGERS, MIN_LOCK_LEDGERS, MIN_TTL_LEDGERS,
+    TaskStatus, TaskType, INSTANCE_BUMP_LEDGERS, INSTANCE_BUMP_THRESHOLD, MAX_BATCH_READ,
+    MAX_BATCH_SIZE, MAX_CALLDATA_LEN, MAX_LOCK_LEDGERS, MIN_LOCK_LEDGERS, MIN_TTL_LEDGERS,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3532,7 +3529,12 @@ proptest! {
     }
 
     // I-2 — Escrow recoverability: a claimed task past its deadline is
-    // always expirable.
+    // always expirable. Issue 0005 (ttl shorter than deadline strands
+    // escrow) originally required this property to carve out the
+    // ttl-shorter-than-deadline case; that bug is now fixed at the
+    // `register_task` boundary (see `property_i8` below), so an escrow
+    // that reaches `Claimed` can never have a ttl_ledgers too short to
+    // cover its own deadline, and no exemption is needed here.
     #[test]
     fn property_i2_lapsed_claim_is_always_expirable(reward in 1_i128..9_000_000) {
         let s = setup();
@@ -3666,6 +3668,47 @@ proptest! {
 
         assert_task_ids_monotonic(&ids)
             .expect("I-7: task ids must be strictly increasing and never reused");
+    }
+
+    // I-8 — TTL covers deadline (issue 0120, pinning issue 0005's fix):
+    // register_task must reject any (deadline, ttl_ledgers) pair whose
+    // persistent Task entry would expire before the task's own deadline,
+    // and must do so with KeeperError::TtlTooShort specifically — never
+    // silently accepting a registration that could later strand its
+    // escrow. Conversely, any ttl_ledgers that does cover
+    // `required_ttl_ledgers` (deadline distance plus the safety margin)
+    // must be accepted.
+    #[test]
+    fn property_i8_ttl_always_covers_deadline_or_registration_is_rejected(
+        seconds_until_deadline in 1_u64..300_000,
+        ttl_ledgers in MIN_TTL_LEDGERS..120_000u32,
+    ) {
+        let s = setup();
+        let deadline = s.env.ledger().timestamp() + seconds_until_deadline;
+        let required = crate::required_ttl_ledgers(&s.env, deadline);
+
+        let result = s.registry.try_register_task(
+            &s.admin,
+            &TaskType::Liquidation,
+            &calldata(&s.env),
+            &1_000_000i128,
+            &deadline,
+            &ttl_ledgers,
+            &120u32,
+        );
+
+        if (ttl_ledgers as u64) < required {
+            prop_assert_eq!(
+                result,
+                Err(Ok(KeeperError::TtlTooShort)),
+                "ttl_ledgers below the deadline's required coverage must be rejected with TtlTooShort"
+            );
+        } else {
+            prop_assert!(
+                result.is_ok(),
+                "ttl_ledgers that covers the deadline plus safety margin must be accepted"
+            );
+        }
     }
 }
 
