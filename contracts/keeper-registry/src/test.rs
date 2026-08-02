@@ -19,12 +19,9 @@ use soroban_sdk::{
 };
 
 use crate::{
-    split_reward, DataKey, KeeperError, KeeperRegistry, KeeperRegistryClient, TaskStatus, TaskType,
-    INSTANCE_BUMP_LEDGERS, INSTANCE_BUMP_THRESHOLD, MAX_BATCH_READ, MAX_CALLDATA_LEN,
-    MAX_LOCK_LEDGERS, MIN_LOCK_LEDGERS, MIN_TTL_LEDGERS,
     split_reward, BatchTaskParams, DataKey, KeeperError, KeeperRegistry, KeeperRegistryClient,
-    TaskStatus, TaskType, INSTANCE_BUMP_LEDGERS, INSTANCE_BUMP_THRESHOLD, MAX_BATCH_SIZE,
-    MAX_CALLDATA_LEN, MAX_LOCK_LEDGERS, MIN_LOCK_LEDGERS, MIN_TTL_LEDGERS,
+    TaskStatus, TaskType, INSTANCE_BUMP_LEDGERS, INSTANCE_BUMP_THRESHOLD, MAX_BATCH_READ,
+    MAX_BATCH_SIZE, MAX_CALLDATA_LEN, MAX_LOCK_LEDGERS, MIN_LOCK_LEDGERS, MIN_TTL_LEDGERS,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2675,6 +2672,31 @@ fn test_instance_ttl_renewed_by_mutation_stays_alive_past_initial_window() {
     assert_eq!(s.registry.get_fee_bps(), 500u32);
 }
 
+// Issue 0122: docs/ARCHITECTURE.md's "TTL / archival strategy" section
+// explicitly accepts that "a registry that is completely idle ... for the
+// full TTL window can still archive" as a tradeoff for not bumping TTL on
+// side-effect-free reads. This test proves that failure mode actually
+// happens rather than just being documented: with zero mutating calls after
+// `initialize()` (the only `bump_instance` call this test ever makes),
+// advancing well past `INSTANCE_BUMP_LEDGERS` genuinely lapses the
+// instance's TTL. `Deployer::get_contract_instance_ttl`'s host
+// implementation computes `live_until_ledger.checked_sub(current_ledger)`,
+// which underflows (panics) once the current ledger has actually passed
+// the entry's expiry -- so this is a direct proof of archival, not an
+// inference.
+#[test]
+#[should_panic]
+fn test_instance_ttl_lapses_when_registry_is_fully_idle_past_bump_window() {
+    let s = setup();
+
+    advance(&s.env, INSTANCE_BUMP_LEDGERS + 1_000, 0);
+
+    let _ = s
+        .env
+        .deployer()
+        .get_contract_instance_ttl(&s.registry.address);
+}
+
 // Regression test for issue #18: `upgrade` previously emitted no event at
 // all, so there was no on-chain, indexable record of who authorised an
 // upgrade or which WASM hash it moved to. This asserts the rejection path
@@ -3532,7 +3554,12 @@ proptest! {
     }
 
     // I-2 — Escrow recoverability: a claimed task past its deadline is
-    // always expirable.
+    // always expirable. Issue 0005 (ttl shorter than deadline strands
+    // escrow) originally required this property to carve out the
+    // ttl-shorter-than-deadline case; that bug is now fixed at the
+    // `register_task` boundary (see `property_i8` below), so an escrow
+    // that reaches `Claimed` can never have a ttl_ledgers too short to
+    // cover its own deadline, and no exemption is needed here.
     #[test]
     fn property_i2_lapsed_claim_is_always_expirable(reward in 1_i128..9_000_000) {
         let s = setup();
@@ -3666,6 +3693,98 @@ proptest! {
 
         assert_task_ids_monotonic(&ids)
             .expect("I-7: task ids must be strictly increasing and never reused");
+    }
+
+    // I-8 — TTL covers deadline (issue 0120, pinning issue 0005's fix):
+    // register_task must reject any (deadline, ttl_ledgers) pair whose
+    // persistent Task entry would expire before the task's own deadline,
+    // and must do so with KeeperError::TtlTooShort specifically — never
+    // silently accepting a registration that could later strand its
+    // escrow. Conversely, any ttl_ledgers that does cover
+    // `required_ttl_ledgers` (deadline distance plus the safety margin)
+    // must be accepted.
+    #[test]
+    fn property_i8_ttl_always_covers_deadline_or_registration_is_rejected(
+        seconds_until_deadline in 1_u64..300_000,
+        ttl_ledgers in MIN_TTL_LEDGERS..120_000u32,
+    ) {
+        let s = setup();
+        let deadline = s.env.ledger().timestamp() + seconds_until_deadline;
+        let required = crate::required_ttl_ledgers(&s.env, deadline);
+
+        let result = s.registry.try_register_task(
+            &s.admin,
+            &TaskType::Liquidation,
+            &calldata(&s.env),
+            &1_000_000i128,
+            &deadline,
+            &ttl_ledgers,
+            &120u32,
+        );
+
+        if (ttl_ledgers as u64) < required {
+            prop_assert_eq!(
+                result,
+                Err(Ok(KeeperError::TtlTooShort)),
+                "ttl_ledgers below the deadline's required coverage must be rejected with TtlTooShort"
+            );
+        } else {
+            prop_assert!(
+                result.is_ok(),
+                "ttl_ledgers that covers the deadline plus safety margin must be accepted"
+            );
+        }
+    }
+
+    // I-9 — Instance TTL liveness under randomized, bounded-gap traffic
+    // (issue 0122, generalizing issue 0015's hand-written
+    // `test_instance_ttl_renewed_by_mutation_stays_alive_past_initial_window`).
+    // See docs/ARCHITECTURE.md's "TTL / archival strategy" section.
+    //
+    // `bump_instance` calls `extend_ttl(INSTANCE_BUMP_THRESHOLD,
+    // INSTANCE_BUMP_LEDGERS)` on every mutating entry point: per
+    // `storage::Instance::extend_ttl`'s documented semantics, that's a
+    // no-op whenever the remaining TTL is already >= INSTANCE_BUMP_THRESHOLD,
+    // and only resets the remaining TTL up to the full INSTANCE_BUMP_LEDGERS
+    // when it was below that threshold. The only gap bound that's safe
+    // between ANY two consecutive calls without inspecting live state is
+    // therefore INSTANCE_BUMP_THRESHOLD, not the larger INSTANCE_BUMP_LEDGERS
+    // (a call that lands while TTL is still comfortably above the threshold
+    // does not buy back a fresh full-size window) -- this property pins that
+    // bound directly rather than assuming the looser one.
+    #[test]
+    fn property_i9_instance_ttl_never_lapses_under_bounded_gap_traffic(
+        gaps in prop::collection::vec(0u32..INSTANCE_BUMP_THRESHOLD, 1..8),
+    ) {
+        let s = setup(); // initialize() already performed one bump_instance call.
+
+        for gap in gaps {
+            advance(&s.env, gap, 0);
+            let ttl = s
+                .env
+                .deployer()
+                .get_contract_instance_ttl(&s.registry.address);
+            prop_assert!(
+                ttl > 0,
+                "instance TTL lapsed after a {}-ledger gap despite a mutating call \
+                 following it within INSTANCE_BUMP_THRESHOLD",
+                gap
+            );
+
+            // Any mutating entry point calls bump_instance; this one
+            // touches only instance storage, isolating instance TTL
+            // renewal from the separate per-task TTL mechanism.
+            s.registry.set_min_reward(&s.admin, &0i128);
+        }
+
+        let ttl_final = s
+            .env
+            .deployer()
+            .get_contract_instance_ttl(&s.registry.address);
+        prop_assert!(
+            ttl_final > 0,
+            "instance TTL lapsed after a sequence of bounded-gap mutating calls"
+        );
     }
 }
 
