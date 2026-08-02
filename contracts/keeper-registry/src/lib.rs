@@ -166,27 +166,24 @@ pub enum KeeperError {
     /// their allowed bounds.
     InvalidTaskParams = 18,
     /// Arithmetic operation would overflow or underflow.
-    ArithmeticOverflow = 20,
+    ArithmeticOverflow = 19,
     /// The attached verifier reported an `interface_version` other than
     /// [`KEEPER_VERIFIER_INTERFACE_VERSION`]. `verify` was not called.
-    IncompatibleVerifierInterface = 21,
+    IncompatibleVerifierInterface = 20,
     /// A batch read (`get_tasks` / `get_tasks_range`) asked for more than
-    /// [`MAX_BATCH_READ`] task ids. Returned rather than silently truncating,
-    /// so a caller can never mistake a clipped page for the end of a range.
-    BatchTooLarge = 22,
-    ArithmeticOverflow = 19,
-    /// `batch_register_tasks` was handed more entries than [`MAX_BATCH_SIZE`].
-    /// Split the worklist into smaller batches and submit them as separate
-    /// calls — see `docs/BATCH_OPERATIONS.md` §4.
-    BatchTooLarge = 20,
+    /// [`MAX_BATCH_READ`] task ids, or `batch_register_tasks` was handed more
+    /// entries than [`MAX_BATCH_SIZE`]. Returned rather than silently
+    /// truncating, so a caller can never mistake a clipped page/batch for the
+    /// end of a range — see `docs/BATCH_OPERATIONS.md` §4.
+    BatchTooLarge = 21,
     /// `batch_register_tasks` was handed an empty `tasks` vector. Rejected
     /// rather than treated as a no-op so a caller whose off-chain filter
     /// produced nothing finds out, instead of paying for an auth and a
     /// transaction that registered nothing.
-    EmptyBatch = 21,
+    EmptyBatch = 22,
     /// The sum of a batch's rewards exceeded the caller-supplied
     /// `max_total_reward` ceiling. Zero transfers occurred.
-    BatchRewardCeilingExceeded = 22,
+    BatchRewardCeilingExceeded = 23,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
