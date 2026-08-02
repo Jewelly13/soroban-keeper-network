@@ -74,3 +74,10 @@ path = "fuzz_targets/execute_task.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "uninitialized_registry"
+path = "fuzz_targets/uninitialized_registry.rs"
+test = false
+doc = false
+bench = false
