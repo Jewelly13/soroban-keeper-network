@@ -203,7 +203,7 @@ guidance: [docs/BATCH_OPERATIONS.md](docs/BATCH_OPERATIONS.md).
   (`CDJOYHBS7C2PVJS47BTRDLGBNG2YOE43VX6Y3EWIZPPPKOPRNYQQ54U4`) and ran a full
   register → claim → execute → withdraw cycle on-chain.
 - Added [docs/DEMO.md](docs/DEMO.md) (transaction-by-transaction trace) and
-  [DEPLOYMENTS.md](DEPLOYMENTS.md) (canonical address record); surfaced the live
+  [DEPLOYMENTS.md](docs/DEPLOYMENTS.md) (canonical address record); surfaced the live
   deployment in the README.
 
 ### Added — contract capabilities & views
