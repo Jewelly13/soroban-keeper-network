@@ -1293,7 +1293,8 @@ impl KeeperRegistry {
         // record first keeps it independent of whatever the new code does.
         emit_upgraded(&e, &admin, &new_wasm_hash);
 
-        e.deployer().update_current_contract_wasm(new_wasm_hash.clone());
+        e.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
         log!(&e, "Contract upgraded by {} to {:?}", admin, new_wasm_hash);
         Ok(())
     }

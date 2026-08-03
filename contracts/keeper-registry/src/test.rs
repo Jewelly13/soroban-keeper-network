@@ -975,7 +975,8 @@ fn test_batch_register_rejects_non_positive_ceiling() {
     let s = setup();
     let tasks = batch_of(&s.env, 1, 1_000_000i128);
     assert_eq!(
-        s.registry.try_batch_register_tasks(&s.admin, &tasks, &0i128),
+        s.registry
+            .try_batch_register_tasks(&s.admin, &tasks, &0i128),
         Err(Ok(KeeperError::InvalidReward))
     );
 }
@@ -1004,10 +1005,7 @@ fn test_batch_register_one_bad_entry_rejects_entire_batch() {
         ),
         (
             BatchTaskParams {
-                calldata: Bytes::from_slice(
-                    &s.env,
-                    &[0u8; (MAX_CALLDATA_LEN + 1) as usize]
-                ),
+                calldata: Bytes::from_slice(&s.env, &[0u8; (MAX_CALLDATA_LEN + 1) as usize]),
                 ..batch_entry(&s.env, 1_000_000i128)
             },
             KeeperError::CalldataTooLarge,
@@ -2346,11 +2344,8 @@ fn test_pause_policy_matrix_entry_point_by_entry_point() {
     // unsafe, working against the point of the pause.
     let old_deadline = s.registry.get_task(&extend_target_id).deadline;
     assert_eq!(
-        s.registry.try_extend_deadline(
-            &s.admin,
-            &extend_target_id,
-            &(old_deadline + 3_600)
-        ),
+        s.registry
+            .try_extend_deadline(&s.admin, &extend_target_id, &(old_deadline + 3_600)),
         Err(Ok(KeeperError::ContractPaused))
     );
     assert_eq!(
@@ -2505,9 +2500,12 @@ fn test_set_fee_emits_event() {
 
     // `events().all()` only reflects the most recent top-level invocation, so
     // this matches on the emitted payload rather than a count delta.
-    let found = s.env.events().all().iter().any(|event| {
-        event.2.try_into_val(&s.env) == Ok((old_bps, new_bps))
-    });
+    let found = s
+        .env
+        .events()
+        .all()
+        .iter()
+        .any(|event| event.2.try_into_val(&s.env) == Ok((old_bps, new_bps)));
     assert!(found, "FeeUpdated event was not emitted");
 }
 
@@ -2547,9 +2545,10 @@ fn test_transfer_admin_emits_event() {
 
     // `events().all()` only reflects the most recent top-level invocation, so
     // this matches on the emitted payload rather than a count delta.
-    let found = s.env.events().all().iter().any(|event| {
-        event.2.try_into_val(&s.env) == Ok((old_admin.clone(), new_admin.clone()))
-    });
+    let found =
+        s.env.events().all().iter().any(|event| {
+            event.2.try_into_val(&s.env) == Ok((old_admin.clone(), new_admin.clone()))
+        });
     assert!(found, "AdminTransferred event was not emitted");
 }
 
