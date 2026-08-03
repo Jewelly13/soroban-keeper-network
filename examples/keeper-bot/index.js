@@ -209,21 +209,32 @@ async function validateAndLoadConfig() {
  * already claimed by another keeper — are surfaced immediately so we don't
  * waste fees resubmitting a call that can never succeed.
  */
-async function withRetry(label, fn) {
+async function withRetry(label, fn, options = {}) {
+  // The retry policy and the sleep function are injectable so the unit tests
+  // can drive this without a loaded CONFIG and without real waiting. Callers
+  // in this file pass nothing and get the configured behaviour.
+  const {
+    maxRetries = CONFIG.maxRetries,
+    retryBaseMs = CONFIG.retryBaseMs,
+    sleepFn = sleep,
+  } = options;
+
   let lastErr;
-  for (let attempt = 0; attempt <= CONFIG.maxRetries; attempt++) {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
       return await fn();
     } catch (err) {
       lastErr = err;
-      if (isPermanentError(err) || attempt === CONFIG.maxRetries) {
+      if (isPermanentError(err) || attempt === maxRetries) {
         throw err;
       }
-      const backoff = CONFIG.retryBaseMs * 2 ** attempt;
-      const jitter = Math.floor(Math.random() * CONFIG.retryBaseMs);
+      const backoff = retryBaseMs * 2 ** attempt;
+      const jitter = Math.floor(Math.random() * retryBaseMs);
       const delay = backoff + jitter;
-      console.warn(`  ↻  ${label} failed (attempt ${attempt + 1}), retrying in ${delay}ms: ${err.message}`);
-      await sleep(delay);
+      console.warn(
+        `${label} failed (attempt ${attempt + 1}), retrying in ${delay}ms: ${err.message}`
+      );
+      await sleepFn(delay);
     }
   }
   throw lastErr;

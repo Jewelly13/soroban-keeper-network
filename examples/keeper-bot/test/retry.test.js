@@ -1,5 +1,5 @@
 /**
- * Test suite for withRetry()
+ * Test suite for withRetry().
  *
  * The retry mechanism is critical for keeper reliability. It must:
  *   - Retry transient failures with exponential backoff
@@ -7,272 +7,233 @@
  *   - Abort immediately on permanent errors
  *   - Respect the maximum retry limit
  *
- * Tests must run quickly, so we inject a fake timer instead of actually waiting.
+ * withRetry takes its retry policy and sleep function as an optional third
+ * argument, so these tests drive it without a loaded CONFIG and without ever
+ * waiting on a real timer.
  */
 
 "use strict";
 
-const { describe, it, beforeEach } = require("node:test");
+const { describe, it } = require("node:test");
 const assert = require("node:assert");
 
-// We need to test withRetry, but it depends on CONFIG which is set during
-// validateAndLoadConfig(). For testing, we'll set up a minimal CONFIG.
+const { withRetry } = require("../index.js");
 
-let originalConfig;
+const BASE_MS = 100;
 
-beforeEach(() => {
-  // Save original CONFIG if it exists
-  
-  
-  // Set up test CONFIG
-  delete require.cache[require.resolve("../index.js")];
-  require("../index.js");
-  // Mock CONFIG for testing
-  global.CONFIG = {
+/** Retry policy used by every test here, with sleep captured instead of awaited. */
+function policy(overrides = {}) {
+  const delays = [];
+  const options = {
     maxRetries: 3,
-    retryBaseMs: 100,
+    retryBaseMs: BASE_MS,
+    sleepFn: async (ms) => {
+      delays.push(ms);
+    },
+    ...overrides,
   };
-});
+  return { options, delays };
+}
 
 describe("withRetry", () => {
   describe("success cases", () => {
     it("returns immediately on first success", async () => {
-      const keeper = require("../index.js");
-      const fn = async () => "success";
-      const result = await keeper.withRetry("test-op", fn);
+      const { options } = policy();
+      let attempts = 0;
+      const result = await withRetry(
+        "test-op",
+        async () => {
+          attempts++;
+          return "success";
+        },
+        options
+      );
       assert.strictEqual(result, "success");
+      assert.strictEqual(attempts, 1);
     });
 
-    it("returns result from successful retry", async () => {
-      const keeper = require("../index.js");
+    it("returns the result from a successful retry", async () => {
+      const { options } = policy();
       let attempts = 0;
-      const fn = async () => {
-        attempts++;
-        if (attempts < 2) throw new Error("transient failure");
-        return "eventually succeeded";
-      };
-      const result = await keeper.withRetry("test-op", fn);
+      const result = await withRetry(
+        "test-op",
+        async () => {
+          attempts++;
+          if (attempts < 2) throw new Error("transient failure");
+          return "eventually succeeded";
+        },
+        options
+      );
       assert.strictEqual(result, "eventually succeeded");
       assert.strictEqual(attempts, 2);
     });
 
-    it("succeeds on last allowed attempt", async () => {
-      const keeper = require("../index.js");
+    it("succeeds on the last allowed attempt", async () => {
+      const { options } = policy();
       let attempts = 0;
-      const fn = async () => {
-        attempts++;
-        if (attempts <= 3) throw new Error("transient failure");
-        return "success";
-      };
-      const result = await keeper.withRetry("test-op", fn);
+      const result = await withRetry(
+        "test-op",
+        async () => {
+          attempts++;
+          if (attempts <= 3) throw new Error("transient failure");
+          return "success";
+        },
+        options
+      );
       assert.strictEqual(result, "success");
-      assert.strictEqual(attempts, 4); // Initial + 3 retries
+      assert.strictEqual(attempts, 4); // initial attempt plus three retries
     });
   });
 
   describe("retry exhaustion", () => {
     it("throws after maxRetries attempts", async () => {
-      const keeper = require("../index.js");
+      const { options } = policy();
       let attempts = 0;
-      const fn = async () => {
-        attempts++;
-        throw new Error("persistent transient failure");
-      };
-      
       await assert.rejects(
-        async () => keeper.withRetry("test-op", fn),
-        {
-          message: "persistent transient failure",
-        }
+        () =>
+          withRetry(
+            "test-op",
+            async () => {
+              attempts++;
+              throw new Error("persistent transient failure");
+            },
+            options
+          ),
+        { message: "persistent transient failure" }
       );
-      assert.strictEqual(attempts, 4); // Initial + 3 retries
+      assert.strictEqual(attempts, 4);
     });
 
     it("throws the last error encountered", async () => {
-      const keeper = require("../index.js");
-      const fn = async () => {
-        throw new Error("final error");
-      };
-      
+      const { options } = policy();
       await assert.rejects(
-        async () => keeper.withRetry("test-op", fn),
-        {
-          message: "final error",
-        }
+        () =>
+          withRetry(
+            "test-op",
+            async () => {
+              throw new Error("final error");
+            },
+            options
+          ),
+        { message: "final error" }
       );
     });
   });
 
   describe("permanent errors", () => {
-    it("does not retry on simulation failure", async () => {
-      const keeper = require("../index.js");
-      let attempts = 0;
-      const fn = async () => {
-        attempts++;
-        throw new Error("Simulation failed: InvalidAction");
-      };
-      
-      await assert.rejects(
-        async () => keeper.withRetry("test-op", fn),
-        {
-          message: "Simulation failed: InvalidAction",
-        }
-      );
-      assert.strictEqual(attempts, 1, "should not retry permanent errors");
-    });
+    const permanent = [
+      ["simulation failure", "Simulation failed: InvalidAction"],
+      ["unauthorized error", "Unauthorized keeper"],
+      ["already claimed", "Task already claimed"],
+    ];
 
-    it("does not retry on unauthorized error", async () => {
-      const keeper = require("../index.js");
-      let attempts = 0;
-      const fn = async () => {
-        attempts++;
-        throw new Error("Unauthorized keeper");
-      };
-      
-      await assert.rejects(
-        async () => keeper.withRetry("test-op", fn),
-        {
-          message: "Unauthorized keeper",
-        }
-      );
-      assert.strictEqual(attempts, 1);
-    });
-
-    it("does not retry on already claimed", async () => {
-      const keeper = require("../index.js");
-      let attempts = 0;
-      const fn = async () => {
-        attempts++;
-        throw new Error("Task already claimed");
-      };
-      
-      await assert.rejects(
-        async () => keeper.withRetry("test-op", fn),
-        {
-          message: "Task already claimed",
-        }
-      );
-      assert.strictEqual(attempts, 1);
-    });
+    for (const [name, message] of permanent) {
+      it(`does not retry on ${name}`, async () => {
+        const { options } = policy();
+        let attempts = 0;
+        await assert.rejects(
+          () =>
+            withRetry(
+              "test-op",
+              async () => {
+                attempts++;
+                throw new Error(message);
+              },
+              options
+            ),
+          { message }
+        );
+        assert.strictEqual(attempts, 1, "permanent errors must not be retried");
+      });
+    }
   });
 
   describe("exponential backoff", () => {
-    it("applies exponential backoff across retries", async () => {
-      const keeper = require("../index.js");
-      const delays = [];
-      const originalSleep = keeper.sleep;
-      
-      // Mock sleep to capture delays without actually waiting
-      keeper.sleep = async (ms) => {
-        delays.push(ms);
-        return Promise.resolve();
-      };
-
+    it("grows the delay exponentially across retries", async () => {
+      const { options, delays } = policy();
       let attempts = 0;
-      const fn = async () => {
-        attempts++;
-        if (attempts <= 3) throw new Error("retry me");
-        return "ok";
-      };
+      await withRetry(
+        "test-op",
+        async () => {
+          attempts++;
+          if (attempts <= 3) throw new Error("retry me");
+          return "ok";
+        },
+        options
+      );
 
-      try {
-        await keeper.withRetry("test-op", fn);
-      } finally {
-        keeper.sleep = originalSleep;
-      }
-
-      // Should have 3 delays (one before each retry)
-      assert.strictEqual(delays.length, 3);
-      
-      // Each delay should be >= the base exponential value
-      // Attempt 0 fails → delay >= 100 * 2^0 = 100
-      // Attempt 1 fails → delay >= 100 * 2^1 = 200
-      // Attempt 2 fails → delay >= 100 * 2^2 = 400
-      assert.ok(delays[0] >= 100, `First delay ${delays[0]} should be >= 100`);
-      assert.ok(delays[1] >= 200, `Second delay ${delays[1]} should be >= 200`);
-      assert.ok(delays[2] >= 400, `Third delay ${delays[2]} should be >= 400`);
+      assert.strictEqual(delays.length, 3, "one delay before each retry");
+      assert.ok(delays[0] >= BASE_MS, `first delay ${delays[0]} >= ${BASE_MS}`);
+      assert.ok(delays[1] >= BASE_MS * 2, `second delay ${delays[1]} >= ${BASE_MS * 2}`);
+      assert.ok(delays[2] >= BASE_MS * 4, `third delay ${delays[2]} >= ${BASE_MS * 4}`);
     });
 
-    it("applies jitter within expected bounds", async () => {
-      const keeper = require("../index.js");
-      const delays = [];
-      const originalSleep = keeper.sleep;
-      
-      keeper.sleep = async (ms) => {
-        delays.push(ms);
-        return Promise.resolve();
-      };
-
+    it("keeps jitter within one base interval of the backoff", async () => {
+      const { options, delays } = policy();
       let attempts = 0;
-      const fn = async () => {
-        attempts++;
-        if (attempts <= 2) throw new Error("retry me");
-        return "ok";
-      };
+      await withRetry(
+        "test-op",
+        async () => {
+          attempts++;
+          if (attempts <= 2) throw new Error("retry me");
+          return "ok";
+        },
+        options
+      );
 
-      try {
-        await keeper.withRetry("test-op", fn);
-      } finally {
-        keeper.sleep = originalSleep;
-      }
-
-      // Jitter adds random [0, retryBaseMs) to the exponential backoff
-      // So delay should be in range [base * 2^attempt, base * 2^attempt + base)
-      for (let i = 0; i < delays.length; i++) {
-        const minDelay = 100 * (2 ** i);
-        const maxDelay = minDelay + 100;
+      // Jitter adds a random [0, retryBaseMs) on top of the exponential term.
+      delays.forEach((delay, i) => {
+        const min = BASE_MS * 2 ** i;
+        const max = min + BASE_MS;
         assert.ok(
-          delays[i] >= minDelay && delays[i] < maxDelay,
-          `Delay ${delays[i]} should be in range [${minDelay}, ${maxDelay})`
+          delay >= min && delay < max,
+          `delay ${delay} should be in [${min}, ${max})`
         );
-      }
+      });
     });
   });
 
   describe("edge cases", () => {
-    it("handles synchronous exceptions", async () => {
-      const keeper = require("../index.js");
-      const fn = () => {
-        throw new Error("sync error");
-      };
-      
+    it("handles a synchronous exception", async () => {
+      const { options } = policy();
       await assert.rejects(
-        async () => keeper.withRetry("test-op", fn),
-        {
-          message: "sync error",
-        }
+        () =>
+          withRetry(
+            "test-op",
+            () => {
+              throw new Error("sync error");
+            },
+            options
+          ),
+        { message: "sync error" }
       );
     });
 
-    it("handles rejected promises", async () => {
-      const keeper = require("../index.js");
-      const fn = async () => Promise.reject(new Error("rejected"));
-      
+    it("handles a rejected promise", async () => {
+      const { options } = policy();
       await assert.rejects(
-        async () => keeper.withRetry("test-op", fn),
-        {
-          message: "rejected",
-        }
+        () => withRetry("test-op", () => Promise.reject(new Error("rejected")), options),
+        { message: "rejected" }
       );
     });
 
-    it("handles maxRetries = 0", async () => {
-      const keeper = require("../index.js");
-      global.CONFIG.maxRetries = 0;
-      
+    it("attempts exactly once when maxRetries is 0", async () => {
+      const { options, delays } = policy({ maxRetries: 0 });
       let attempts = 0;
-      const fn = async () => {
-        attempts++;
-        throw new Error("no retries allowed");
-      };
-      
       await assert.rejects(
-        async () => keeper.withRetry("test-op", fn),
-        {
-          message: "no retries allowed",
-        }
+        () =>
+          withRetry(
+            "test-op",
+            async () => {
+              attempts++;
+              throw new Error("no retries allowed");
+            },
+            options
+          ),
+        { message: "no retries allowed" }
       );
-      assert.strictEqual(attempts, 1, "should attempt once with maxRetries=0");
+      assert.strictEqual(attempts, 1);
+      assert.strictEqual(delays.length, 0, "no sleep when no retry is allowed");
     });
   });
 });
