@@ -414,7 +414,7 @@ jobs:
       - name: Verify required jobs succeeded
         run: |
           results='${{ join(needs.*.result, ' ') }}'
-          echo "Required job results (format, test, build-wasm): $results"
+          echo "Required job results (format, test, build-wasm, bot): $results"
           for r in $results; do
             if [ "$r" != "success" ]; then
               echo "::error::A required CI job did not succeed."
