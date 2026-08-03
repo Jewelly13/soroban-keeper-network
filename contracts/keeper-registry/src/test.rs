@@ -826,7 +826,7 @@ fn test_register_task_ttl_ledgers_below_min_fails() {
 fn test_register_task_ttl_ledgers_at_min_is_subsumed_by_deadline_rule() {
     let s = setup();
     let deadline = s.env.ledger().timestamp() + 3_600;
-    assert!(MIN_TTL_LEDGERS < TTL_SAFETY_MARGIN_LEDGERS);
+    const { assert!(MIN_TTL_LEDGERS < TTL_SAFETY_MARGIN_LEDGERS) };
     assert_eq!(
         s.registry.try_register_task(
             &s.admin,
