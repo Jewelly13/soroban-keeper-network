@@ -3745,7 +3745,7 @@ proptest! {
     ) {
         let s = setup();
         let deadline = s.env.ledger().timestamp() + seconds_until_deadline;
-        let required = crate::required_ttl_ledgers(&s.env, deadline);
+        let required = crate::internal::required_ttl_ledgers(&s.env, deadline);
 
         let result = s.registry.try_register_task(
             &s.admin,
