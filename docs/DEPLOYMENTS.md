@@ -13,7 +13,7 @@ Canonical record of on-chain `KeeperRegistry` deployments.
 | Explorer | https://stellar.expert/explorer/testnet/contract/CDJOYHBS7C2PVJS47BTRDLGBNG2YOE43VX6Y3EWIZPPPKOPRNYQQ54U4 |
 
 A full end-to-end run against this deployment (register → claim → execute →
-withdraw) is documented in [docs/DEMO.md](docs/DEMO.md).
+withdraw) is documented in [DEMO.md](DEMO.md).
 
 ## Mainnet
 
