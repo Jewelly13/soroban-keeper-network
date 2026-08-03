@@ -45,7 +45,7 @@ for target_path in fuzz/fuzz_targets/*.rs; do
   before=0
   [ -d "$corpus_dir" ] && before=$(find "$corpus_dir" -type f | wc -l | tr -d ' ')
 
-  echo "── Running $target for ${SECONDS_PER_TARGET}s ──"
+  echo "Running $target for ${SECONDS_PER_TARGET}s "
   log_file="$(mktemp)"
   cargo +nightly fuzz run "$target" -- -max_total_time="$SECONDS_PER_TARGET" >"$log_file" 2>&1
   exit_code=$?
@@ -70,7 +70,7 @@ for target_path in fuzz/fuzz_targets/*.rs; do
     decoded="$(cargo +nightly fuzz fmt "$target" "$minimized" 2>&1)"
 
     {
-      echo "| \`$target\` | 🔴 crash found | $runs | $before → $after | \`$minimized\` |"
+      echo "| \`$target\` | crash found | $runs | $before $after | \`$minimized\` |"
     } >>"$SUMMARY"
     {
       echo
@@ -84,9 +84,9 @@ for target_path in fuzz/fuzz_targets/*.rs; do
     } >>"$SUMMARY"
     rm -f "${log_file}.tmin"
   elif [ "$exit_code" -ne 0 ]; then
-    echo "| \`$target\` | ⚠️ build/run failed (pre-existing — see docs/FUZZING.md) | - | $before → $after | - |" >>"$SUMMARY"
+    echo "| \`$target\` | build/run failed (pre-existing — see docs/FUZZING.md) | - | $before $after | - |" >>"$SUMMARY"
   else
-    echo "| \`$target\` | ✅ ran clean | $runs | $before → $after | none |" >>"$SUMMARY"
+    echo "| \`$target\` | ran clean | $runs | $before $after | none |" >>"$SUMMARY"
   fi
 
   rm -f "$log_file"

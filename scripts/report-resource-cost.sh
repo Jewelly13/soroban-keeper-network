@@ -61,19 +61,19 @@ BASELINE="contracts/keeper-registry/resource-baseline.json"
          (($cpu - $base_cpu) as $d |
           ($d * 100 / (if $base_cpu == 0 then 1 else $base_cpu end)) as $pct |
           "\(if $d >= 0 then "+" else "" end)\($d) (\($pct)%)" +
-          (if ($pct >= $threshold or $pct <= -$threshold) then " ⚠️" else "" end))
+          (if ($pct >= $threshold or $pct <= -$threshold) then " " else "" end))
        end) as $cpu_delta |
       (if $base_mem == null then "n/a (new)"
        else
          (($mem - $base_mem) as $d |
           ($d * 100 / (if $base_mem == 0 then 1 else $base_mem end)) as $pct |
           "\(if $d >= 0 then "+" else "" end)\($d) (\($pct)%)" +
-          (if ($pct >= $threshold or $pct <= -$threshold) then " ⚠️" else "" end))
+          (if ($pct >= $threshold or $pct <= -$threshold) then " " else "" end))
        end) as $mem_delta |
       "| `\($name)` | \($cpu) | \($cpu_delta) | \($mem) | \($mem_delta) |"
     '
     echo
-    echo "⚠️ marks a change of ${REGRESSION_THRESHOLD_PCT}% or more against \`$BASELINE\`."
+    echo "marks a change of ${REGRESSION_THRESHOLD_PCT}% or more against \`$BASELINE\`."
     echo "Update the baseline in the same PR as an intentional cost change."
   fi
 } >>"$GITHUB_STEP_SUMMARY"
