@@ -131,6 +131,54 @@ soroban-keeper-network/
 | `docs/*` | Documentation only changes | Your own branch — yes |
 | `refactor/*` | Code restructuring (no behaviour change) | Your own branch — yes |
 
+---
+
+## Project Structure
+
+The contract and its tests are split into small, single-purpose modules. This
+is deliberate: it keeps two contributors working on different areas out of each
+other's way, because their changes land in different files instead of colliding
+at the end of one large one.
+
+```
+contracts/keeper-registry/src/
+├── lib.rs         module wiring, the contract struct, re-exports
+├── errors.rs      KeeperError
+├── types.rs       DataKey, Task, TaskType, TaskStatus, BatchTaskParams
+├── constants.rs   every tunable bound and protocol constant
+├── events.rs      the emit_* helpers
+├── internal.rs    shared pub(crate) helpers and guards
+├── task.rs        register / claim / execute / cancel / expire / withdraw
+├── batch.rs       batch_register_tasks, get_tasks, get_tasks_range
+├── admin.rs       initialize, pause, fees, transfer_admin, upgrade, sweep
+├── views.rs       read-only getters
+├── invariants.rs  shared invariant assertions (tests and fuzz targets)
+└── test/          one module per area, mirroring the list above
+```
+
+**Where does my change go?**
+
+| You are… | Edit |
+|----------|------|
+| changing a task lifecycle rule | `task.rs` + `test/<area>.rs` |
+| adding or changing an admin control | `admin.rs` + `test/admin.rs` |
+| adding a read-only view | `views.rs` + `test/…` |
+| adding an error variant | `errors.rs` — take the next free discriminant, never renumber |
+| changing a bound or magic number | `constants.rs` — it should exist in exactly one place |
+| adding an event | `events.rs`, and update the README event table |
+| adding a helper used by more than one entry point | `internal.rs` as `pub(crate)` |
+| adding a test fixture used by more than one test module | `test/common.rs` as `pub(crate)` |
+
+Two conventions worth following, both learned the hard way:
+
+- **Never inline a value that is enforced in more than one place.** Give it a
+  name in `constants.rs`. A literal repeated across call sites means a rule
+  change touches every one of them, which is how one small edit ends up
+  conflicting with every open PR.
+- **Name test helper modules after their scope** (`reentrant_token_cancel`,
+  not `reentrant_token`). Two PRs that each add a generically named helper
+  module will compile alone and fail once both land.
+
 ## Git Workflow
 
 We use **trunk-based development**. The `main` branch is the trunk, and it must always be stable and releasable.
