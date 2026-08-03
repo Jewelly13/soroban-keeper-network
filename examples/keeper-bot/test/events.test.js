@@ -15,7 +15,10 @@
 
 const { describe, it } = require("node:test");
 const assert = require("node:assert");
+const { nativeToScVal, xdr } = require("@stellar/stellar-sdk");
 const { fetchPendingTasks } = require("../index.js");
+
+const CONTRACT_ID = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
 
 /**
  * Fake RPC server that implements only the methods the keeper bot needs.
@@ -64,15 +67,20 @@ class FakeRpcServer {
 }
 
 /**
- * Helper to create a valid TaskRegistered event in the format returned by
- * the Soroban RPC.
+ * Builds a TaskRegistered event whose `value` is a real ScVal, because
+ * fetchPendingTasks decodes it with the SDK's own scValToNative. A hand-rolled
+ * stand-in with toU64/toI128 methods would not survive that call, so the fake
+ * has to carry genuine XDR.
+ *
+ * Payload matches `emit_task_registered` in the contract:
+ *   (task_id: u64, owner: Address, reward: i128, deadline: u64)
  */
 function createTaskEvent(taskId, reward, deadline) {
   return {
     type: "contract",
     ledger: "1000",
     ledgerClosedAt: "2024-01-01T00:00:00Z",
-    contractId: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+    contractId: CONTRACT_ID,
     id: `0001000000000000-${taskId}`,
     pagingToken: `0001000000000000-${taskId}`,
     inSuccessfulContractCall: true,
@@ -80,15 +88,12 @@ function createTaskEvent(taskId, reward, deadline) {
       "AAAADwAAAANyZWc=", // "reg"
       "AAAADwAAAAR0YXNr", // "task"
     ],
-    value: {
-      // Mimic ScVal structure
-      value: () => [
-        { toU64: () => BigInt(taskId) }, // taskId
-        { value: () => "owner-address" }, // owner (not decoded in function)
-        { toI128: () => BigInt(reward) }, // reward
-        { toU64: () => BigInt(deadline) }, // deadline
-      ],
-    },
+    value: xdr.ScVal.scvVec([
+      nativeToScVal(BigInt(taskId), { type: "u64" }),
+      nativeToScVal(CONTRACT_ID, { type: "address" }),
+      nativeToScVal(BigInt(reward), { type: "i128" }),
+      nativeToScVal(BigInt(deadline), { type: "u64" }),
+    ]),
   };
 }
 
@@ -293,24 +298,12 @@ describe("fetchPendingTasks", () => {
 
     it("handles large task IDs", async () => {
       const server = new FakeRpcServer();
-      const largeTaskId = 2n ** 63n - 1n; // Max u64
-      server.setEvents([
-        {
-          ...createTaskEvent(0, 1000000, 1735689600),
-          value: {
-            value: () => [
-              { toU64: () => largeTaskId },
-              { value: () => "owner" },
-              { toI128: () => 1000000n },
-              { toU64: () => 1735689600n },
-            ],
-          },
-        },
-      ]);
+      const largeTaskId = 2n ** 64n - 1n; // Max u64
+      server.setEvents([createTaskEvent(largeTaskId, 1000000, 1735689600)]);
 
       const tasks = await fetchPendingTasks(
         server,
-        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+        CONTRACT_ID,
         900
       );
 
