@@ -81,7 +81,7 @@ let CONFIG; // Initialized in main() after validation
 // ─────────────────────────────────────────────────────────────────────────────
 
 function fail(name, value, reason) {
-  let message = `❌  Invalid ${name}`;
+  let message = `Invalid ${name}`;
   if (value) {
     message += `: ${value}`;
   }
@@ -399,16 +399,16 @@ async function fetchPendingTasks(server, contractId, startLedger) {
         if (skipped === 1) {
           // Log the first failure in full — if the event shape has changed, one
           // decoded error is worth more than a hundred counted ones.
-          console.warn(`⚠️  Could not decode a TaskRegistered event: ${err.message}`);
+          console.warn(`Could not decode a TaskRegistered event: ${err.message}`);
         }
       }
     }
     if (skipped > 0) {
-      console.warn(`⚠️  Skipped ${skipped} undecodable event(s) — the contract's event shape may have changed.`);
+      console.warn(`Skipped ${skipped} undecodable event(s) — the contract's event shape may have changed.`);
     }
     return tasks;
   } catch (err) {
-    console.warn("⚠️  Failed to fetch events:", err.message);
+    console.warn("Failed to fetch events:", err.message);
     return [];
   }
 }
@@ -458,10 +458,10 @@ const TASK_TYPE_NAMES = {
  * decode `task.calldata` into a target contract call and submit it.
  */
 async function ttlExtensionExecutor(task, ctx) {
-  ctx.log(`  ⚙️  Executing TtlExtension task ${task.taskId}...`);
+  ctx.log(`  Executing TtlExtension task ${task.taskId}...`);
   const nowSeconds = Math.floor(Date.now() / 1000);
   if (task.deadline <= nowSeconds) {
-    ctx.log(`  ⚠️  Task ${task.taskId} deadline already passed — refusing to fabricate proof.`);
+    ctx.log(`  Task ${task.taskId} deadline already passed — refusing to fabricate proof.`);
     return null;
   }
   return Buffer.from(`ttl-extension:task:${task.taskId}:confirmed-live`);
@@ -474,7 +474,7 @@ async function ttlExtensionExecutor(task, ctx) {
  * `.env.example` for the accompanying warning.
  */
 async function simulatedExecutor(task, ctx) {
-  ctx.log(`  🧪  [SIMULATE_EXECUTION] Fabricating proof for task ${task.taskId} — NOT real execution.`);
+  ctx.log(`  [SIMULATE_EXECUTION] Fabricating proof for task ${task.taskId} — NOT real execution.`);
   await sleep(500);
   return Buffer.from(`keeper-proof:task:${task.taskId}:ts:${Date.now()}`);
 }
@@ -508,7 +508,7 @@ async function executeTaskOffChain(task, ctx, simulateExecution) {
       return simulatedExecutor(task, ctx);
     }
     ctx.log(
-      `  ⏭️  No executor registered for task type ${task.taskTypeName} (task ${task.taskId}) — skipping.`
+      `  No executor registered for task type ${task.taskTypeName} (task ${task.taskId}) — skipping.`
     );
     return null;
   }
@@ -516,7 +516,7 @@ async function executeTaskOffChain(task, ctx, simulateExecution) {
   try {
     return await executor(task, ctx);
   } catch (err) {
-    ctx.log(`  ⚠️  Executor for task ${task.taskId} threw: ${err.message}`);
+    ctx.log(`  Executor for task ${task.taskId} threw: ${err.message}`);
     return null;
   }
 }
@@ -542,7 +542,7 @@ async function keeperLoop(
 
   try {
     const nowSeconds = Math.floor(Date.now() / 1000);
-    console.log(`\n🔄  Keeper round at ${new Date().toISOString()}`);
+    console.log(`\nKeeper round at ${new Date().toISOString()}`);
 
     const latestLedger = await server.getLatestLedger();
     const startLedger = Math.max(1, latestLedger.sequence - 1000);
@@ -553,14 +553,14 @@ async function keeperLoop(
       startLedger
     );
     console.log(
-      `  📋  Found ${pendingTasks.length} TaskRegistered events to evaluate`
+      `  Found ${pendingTasks.length} TaskRegistered events to evaluate`
     );
 
     if (pendingTasks.length === 0) {
       newEmptyRounds++;
       if (newEmptyRounds > 0 && newEmptyRounds % 30 === 0) {
         console.warn(
-          `  ⚠️  No TaskRegistered events found for ${newEmptyRounds} consecutive rounds.`
+          `  No TaskRegistered events found for ${newEmptyRounds} consecutive rounds.`
         );
       }
     } else {
@@ -584,22 +584,22 @@ async function keeperLoop(
               )
             );
             console.log(
-              `  ♻️  Task ${task.taskId} expired — escrow refunded to owner`
+              `  Task ${task.taskId} expired — escrow refunded to owner`
             );
           } catch (err) {
             console.log(
-              `  ⏰  Task ${task.taskId} past deadline (skip: ${err.message})`
+              `  Task ${task.taskId} past deadline (skip: ${err.message})`
             );
           }
         } else {
-          console.log(`  ⏰  Task ${task.taskId} is past deadline, skipping`);
+          console.log(`  Task ${task.taskId} is past deadline, skipping`);
         }
         continue;
       }
 
       try {
         console.log(
-          `  📌  Attempting to claim task ${task.taskId} (reward: ${task.reward})...`
+          `  Attempting to claim task ${task.taskId} (reward: ${task.reward})...`
         );
         await withRetry(`claim_task ${task.taskId}`, () =>
           invokeContract(
@@ -614,7 +614,7 @@ async function keeperLoop(
             ]
           )
         );
-        console.log(`  ✅  Task ${task.taskId} claimed!`);
+        console.log(`  Task ${task.taskId} claimed!`);
 
         // Fetch full task details — the TaskRegistered event decoded in
         // fetchPendingTasks carries only { taskId, reward, deadline }, but
@@ -652,14 +652,14 @@ async function keeperLoop(
 
         if (proof === null || proof === undefined) {
           console.log(
-            `  ⏭️  Task ${task.taskId} (${taskTypeName}) not executed — leaving claimed for expiry or another keeper.`
+            `  Task ${task.taskId} (${taskTypeName}) not executed — leaving claimed for expiry or another keeper.`
           );
           continue;
         }
 
         if (proof === null || proof === undefined) {
           console.log(
-            `  ⏭️  Task ${task.taskId} (${taskTypeName}) not executed — leaving claimed for expiry or another keeper.`
+            `  Task ${task.taskId} (${taskTypeName}) not executed — leaving claimed for expiry or another keeper.`
           );
           continue;
         }
@@ -679,18 +679,18 @@ async function keeperLoop(
           )
         );
         console.log(
-          `  💰  Task ${task.taskId} executed! Proof: ${proof.toString("hex").slice(0, 20)}...`
+          `  Task ${task.taskId} executed! Proof: ${proof.toString("hex").slice(0, 20)}...`
         );
         summary.processed++;
       } catch (err) {
         console.warn(
-          `  ⚠️  Failed to process task ${task.taskId}: ${err.message}`
+          `  Failed to process task ${task.taskId}: ${err.message}`
         );
         summary.errors.push(err);
       }
     }
   } catch (err) {
-    console.error(`❌  Keeper loop error: ${err.message}`);
+    console.error(`Keeper loop error: ${err.message}`);
     summary.errors.push(err);
   }
 
@@ -710,10 +710,10 @@ async function keeperLoop(
       [nativeToScVal(keypair.publicKey(), { type: "address" })]
     );
     const balance = BigInt(rawBalance || 0);
-    console.log(`  💎  Accumulated reward balance: ${balance} stroops`);
+    console.log(`  Accumulated reward balance: ${balance} stroops`);
 
     if (balance >= CONFIG.withdrawThreshold) {
-      console.log(`  💸  Withdrawing ${balance} stroops...`);
+      console.log(`  Withdrawing ${balance} stroops...`);
       // withdraw_rewards mutates state, so it still goes through the
       // submitting path.
       await invokeContract(
@@ -724,10 +724,10 @@ async function keeperLoop(
         "withdraw_rewards",
         [nativeToScVal(keypair.publicKey(), { type: "address" })]
       );
-      console.log(`  ✅  Withdrawal complete!`);
+      console.log(`  Withdrawal complete!`);
     }
   } catch (err) {
-    console.warn(`  ⚠️  Balance check failed: ${err.message}`);
+    console.warn(`  Balance check failed: ${err.message}`);
     summary.errors.push(err);
   }
   return { summary, emptyRounds: newEmptyRounds };
@@ -744,9 +744,9 @@ async function main() {
   const keypair = Keypair.fromSecret(CONFIG.secretKey);
   const server = new SorobanRpc.Server(rpcUrl, { allowHttp: false });
 
-  console.log("╔══════════════════════════════════════════════════════════════╗");
-  console.log("║         Soroban Keeper Network — Keeper Bot v0.1.0          ║");
-  console.log("╚══════════════════════════════════════════════════════════════╝");
+  console.log("");
+  console.log("Soroban Keeper Network — Keeper Bot v0.1.0          ");
+  console.log("");
   console.log(`  Network  : ${CONFIG.network}`);
   console.log(`  RPC URL  : ${rpcUrl}`);
   console.log(`  Keeper   : ${keypair.publicKey()}`);
@@ -762,9 +762,9 @@ async function main() {
   // Verify connectivity
   try {
     const health = await server.getHealth();
-    console.log(`✅  RPC healthy — ledger ${health.ledger}`);
+    console.log(`RPC healthy — ledger ${health.ledger}`);
   } catch (e) {
-    console.error(`❌  RPC unreachable at ${rpcUrl}: ${e.message}`);
+    console.error(`RPC unreachable at ${rpcUrl}: ${e.message}`);
     process.exit(1);
   }
 
@@ -776,7 +776,7 @@ async function main() {
       CONFIG.registryContractId
     );
     const ok = summary.errors.length === 0;
-    console.log(ok ? "✅  Round complete." : "⚠️  Round completed with errors.");
+    console.log(ok ? "Round complete." : "Round completed with errors.");
     process.exit(ok ? 0 : 1);
   }
 
@@ -789,10 +789,10 @@ async function main() {
   function requestShutdown(signal) {
     if (shuttingDown) return;
     shuttingDown = true;
-    console.log(`\n🛑  ${signal} received — finishing current round then exiting...`);
+    console.log(`\n${signal} received — finishing current round then exiting...`);
     if (timer) clearInterval(timer);
     if (!roundInFlight) {
-      console.log("👋  Clean shutdown.");
+      console.log("Clean shutdown.");
       process.exit(0);
     }
   }
@@ -813,16 +813,16 @@ async function main() {
       emptyRounds = newEmptyRounds;
       if (summary.errors.length > 0) {
         console.error(
-          `❌  Keeper round finished with ${summary.errors.length} error(s)`
+          `Keeper round finished with ${summary.errors.length} error(s)`
         );
       }
     } catch (err) {
       // This is for truly unexpected errors in the loop itself
-      console.error("❌  Fatal keeper loop error:", err.message);
+      console.error("Fatal keeper loop error:", err.message);
     } finally {
       roundInFlight = false;
       if (shuttingDown) {
-        console.log("👋  Clean shutdown.");
+        console.log("Clean shutdown.");
         process.exit(0);
       }
     }

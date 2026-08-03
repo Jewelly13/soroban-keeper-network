@@ -27,7 +27,7 @@
  * signing or sending anything:
  *   node index.js tasks.example.json --dry-run
  *
- * ── Why `max_total_reward` is the exact sum, not a padded buffer ──────────
+ * Why `max_total_reward` is the exact sum, not a padded buffer 
  *
  * `max_total_reward` is a ceiling on the escrow one call may pull from the
  * owner. Because the call is atomic (docs/BATCH_OPERATIONS.md §3), there is
@@ -44,7 +44,7 @@
  * MAX_TOTAL_REWARD_BUFFER_BPS in .env — it is 0 by default, deliberately, and
  * the script prints loudly when it is not.
  *
- * ── One transaction per chunk ────────────────────────────────────────────
+ * One transaction per chunk 
  *
  * A list longer than the contract's `MAX_BATCH_SIZE` is split into several
  * calls. Each chunk is an independent atomic transaction with its own
@@ -122,7 +122,7 @@ const NETWORK_CONFIG = {
 // ─────────────────────────────────────────────────────────────────────────────
 
 function fail(message) {
-  console.error(`❌  ${message}`);
+  console.error(`${message}`);
   process.exit(1);
 }
 
@@ -531,9 +531,9 @@ async function main() {
 
   const entries = parseTaskFile(config.taskFile);
 
-  console.log("╔══════════════════════════════════════════════════════════════╗");
-  console.log("║      Soroban Keeper Network — Batch Registration Helper      ║");
-  console.log("╚══════════════════════════════════════════════════════════════╝");
+  console.log("");
+  console.log("Soroban Keeper Network — Batch Registration Helper      ");
+  console.log("");
   console.log(`  Network  : ${config.network}`);
   console.log(`  Registry : ${config.registryContractId}`);
   console.log(`  Task list: ${config.taskFile} (${entries.length} entries)`);
@@ -572,7 +572,7 @@ async function main() {
       );
     } catch (e) {
       console.warn(
-        `⚠️  Could not read max_batch_size() (${e.message}); falling back to ${FALLBACK_MAX_BATCH_SIZE}.`
+        `Could not read max_batch_size() (${e.message}); falling back to ${FALLBACK_MAX_BATCH_SIZE}.`
       );
     }
     try {
@@ -586,7 +586,7 @@ async function main() {
         )
       );
     } catch (e) {
-      console.warn(`⚠️  Could not read min_reward() (${e.message}); assuming 0.`);
+      console.warn(`Could not read min_reward() (${e.message}); assuming 0.`);
     }
   } else {
     console.log(
@@ -604,7 +604,7 @@ async function main() {
   console.log(`  Total escrow     : ${grandTotal} stroops across all chunks`);
   if (config.bufferBps > 0) {
     console.log(
-      `  ⚠️  max_total_reward padded by ${config.bufferBps} bps above each chunk's sum.\n` +
+      `  max_total_reward padded by ${config.bufferBps} bps above each chunk's sum.\n` +
         "      The default is 0 (exact sum) — see this file's header for why."
     );
   }
@@ -623,7 +623,7 @@ async function main() {
         );
       }
     });
-    console.log("\n✅  Dry run complete — nothing was submitted.");
+    console.log("\nDry run complete — nothing was submitted.");
     return;
   }
 
@@ -632,7 +632,7 @@ async function main() {
     const chunk = chunks[i];
     const ceiling = ceilingFor(chunk, config.bufferBps);
     console.log(
-      `→  Chunk ${i + 1}/${chunks.length}: ${chunk.length} entries, max_total_reward=${ceiling}`
+      `Chunk ${i + 1}/${chunks.length}: ${chunk.length} entries, max_total_reward=${ceiling}`
     );
 
     let result;
@@ -648,7 +648,7 @@ async function main() {
     } catch (err) {
       // Every chunk is its own atomic transaction: this one registered
       // nothing, earlier ones already landed, later ones were not attempted.
-      console.error(`❌  Chunk ${i + 1} failed: ${err.message}`);
+      console.error(`Chunk ${i + 1} failed: ${err.message}`);
       console.error(
         `    Zero tasks from this chunk were registered and no escrow moved.\n` +
           `    Chunks 1..${i} already landed; chunks ${i + 2}..${chunks.length} were not attempted.\n` +
@@ -667,7 +667,7 @@ async function main() {
   }
 
   reportRegistered(registered);
-  console.log(`\n✅  Registered ${registered.length} task(s).`);
+  console.log(`\nRegistered ${registered.length} task(s).`);
 }
 
 /** Prints each returned task id next to the entry that produced it. */
@@ -676,10 +676,10 @@ function reportRegistered(registered) {
     console.log("\n  No tasks were registered.");
     return;
   }
-  console.log("\n  Task id  │  Entry");
-  console.log("  ─────────┼──────────────────────────────────────────────");
+  console.log("\n  Task id  Entry");
+  console.log("  ");
   for (const { entry, taskId } of registered) {
-    console.log(`  ${String(taskId).padStart(7)}  │  ${entry.label}`);
+    console.log(`  ${String(taskId).padStart(7)}  ${entry.label}`);
   }
 }
 
