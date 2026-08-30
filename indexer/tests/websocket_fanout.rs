@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use futures::{SinkExt, StreamExt};
 use keeper_indexer::api::{router, ApiState};
+use keeper_indexer::cache::AggregateCaches;
 use keeper_indexer::ingest::Ingestor;
 use keeper_indexer::rpc::{RawEvent, RawValue};
 use keeper_indexer::store::Store;
@@ -24,6 +25,7 @@ async fn start_server() -> (String, Ingestor) {
     let ingestor = Ingestor::new(store);
     let app = router(ApiState {
         ingestor: ingestor.clone(),
+        caches: AggregateCaches::from_secs(0),
     });
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");

@@ -16,12 +16,16 @@ pub mod websocket;
 use axum::Router;
 use utoipa::OpenApi;
 
+use crate::cache::AggregateCaches;
 use crate::ingest::Ingestor;
 
 /// Shared state every handler reads from.
 #[derive(Clone)]
 pub struct ApiState {
     pub ingestor: Ingestor,
+    /// Short-TTL caches in front of the expensive aggregate folds. Cloned with
+    /// the state, so every handler shares one set of entries.
+    pub caches: AggregateCaches,
 }
 
 /// The OpenAPI document, derived from the same handler and response types the

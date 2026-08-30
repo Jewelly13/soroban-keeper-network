@@ -31,6 +31,8 @@
 //! - [`state`] -- folds mirroring the contract's own views.
 //! - [`backfill`] -- the ledger walk shared by catch-up and steady state.
 //! - [`queries`] -- aggregate folds the API exposes, such as the leaderboard.
+//! - [`cache`] -- a short-TTL cache in front of those folds, so dashboard
+//!   traffic does not translate into repeated identical aggregation.
 
 pub mod event;
 pub mod numeric;
@@ -81,6 +83,7 @@ pub async fn ingest_all(client: &Client, events: &[event::Event]) -> Result<(), 
 }
 pub mod api;
 pub mod backfill;
+pub mod cache;
 pub mod config;
 pub mod events;
 pub mod ingest;
