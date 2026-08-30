@@ -5,18 +5,10 @@ edition = "2021"
 license = "Apache-2.0"
 description = "Off-chain event indexer for the keeper registry contract"
 
-[dependencies]
-tokio = { workspace = true }
-tokio-postgres = { workspace = true }
-thiserror = { workspace = true }
-
-[dev-dependencies]
-tokio = { workspace = true }
-description = "Event indexer for the Soroban keeper registry contract"
-license = "Apache-2.0"
 publish = false
 
 [dependencies]
+tokio-postgres = { workspace = true }
 anyhow = "1.0"
 axum = { version = "0.8", features = ["ws"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
