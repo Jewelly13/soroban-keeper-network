@@ -1,3 +1,5 @@
+// Entry point for @soroban-keeper-network/sdk.
+//
 /**
  * `@soroban-keeper-network/sdk` -- a typed client for the keeper-registry
  * contract.

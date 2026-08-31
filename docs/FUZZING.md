@@ -180,6 +180,32 @@ cargo +nightly fuzz run execute_task -- -max_total_time=120
 property tests) *is* run in ordinary CI today, same as any other unit test —
 that part isn't optional or fuzzing-specific.
 
+### Wave 2 check-in (backlog 0146)
+
+Backlog 0146 asked for a check-in, once epic E03's full target list exists,
+on whether the `fuzz-pr` budget (every registered target, 60 seconds each)
+still holds, or whether a path-filter (only running targets whose
+corresponding source file changed) is worth adding.
+
+As of this check-in, `fuzz/fuzz_targets/` has four registered targets, not
+the roughly a dozen the epic eventually expects, and per the "Target
+status" table above, two of them (`register_task`, `smoke`) don't currently
+compile and so exit immediately rather than spending their 60-second
+budget. `fuzz-pr` therefore runs at most **two** targets for up to 60
+seconds each (`execute_task`, `uninitialized_registry`) — around two
+minutes of wall-clock time, on top of the toolchain/cache setup steps —
+and only on PRs that touch `contracts/keeper-registry/` or `fuzz/` at all
+(see the job's "Check for relevant changes" step in `ci.yml`).
+
+That is not a noticeable per-PR wait, and a path-filter would add real
+complexity (a diff-to-target mapping, and a fallback list of "shared"
+files like `lib.rs` that must still trigger every target) for no current
+benefit. Per this issue's own acceptance criteria, no change is made here.
+This is worth revisiting once epic E03's remaining targets (`register_task`
+and `smoke` fixed, plus the not-yet-landed targets tracked in backlog
+0062, 0063, 0110, and 0134) actually land and are compiling — at that
+point, re-measure `fuzz-pr`'s wall-clock time with the fuller target list
+before deciding whether path-filtering is worth adding.
 ## Epic E03 retrospective: invariant coverage map
 
 Epic E03 is fuzzing and property testing. This section is its closing

@@ -112,6 +112,8 @@ soroban-keeper-network/
 │   └── deploy.sh                 # Deployment script
 ├── examples/
 │   └── keeper-bot/               # Off-chain keeper bot (Node.js)
+├── packages/
+│   └── sdk-ts/                   # TypeScript SDK for the contract (npm package)
 ├── .github/
 │   └── workflows/
 │       └── ci.yml                # GitHub Actions CI

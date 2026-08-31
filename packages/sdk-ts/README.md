@@ -1,5 +1,6 @@
 # @soroban-keeper-network/sdk
 
+Typed TypeScript client for the Soroban Keeper Network `keeper-registry`
 A typed TypeScript client for the keeper-registry contract in
 [`contracts/keeper-registry`](../../contracts/keeper-registry).
 
@@ -136,6 +137,9 @@ and `examples/` entries makes standalone installs unwieldy.
 cd packages/sdk-ts
 npm install
 npm run build   # emits dist/cjs (CommonJS), dist/esm (ESM), and .d.ts declarations
+npm test        # builds, then runs the require()/import smoke tests
+```
+
 npm test        # builds, then runs the smoke tests and the vitest suite
 ```
 
@@ -250,6 +254,8 @@ browsing outside of a local `npm run docs`.
 - `src/index.ts` — package entry point.
 - `tsconfig.json` — shared compiler options.
 - `tsconfig.cjs.json` / `tsconfig.esm.json` — per-target build configs.
+- `test/` — `node --test` smoke tests, one exercising `require()` and one
+  exercising `import`, against the built `dist/` output.
 - `typedoc.json` — TypeDoc config for the generated API reference.
 - `test/` — `node --test` smoke tests, one exercising `require()` and one
   exercising `import`, against the built `dist/` output.
