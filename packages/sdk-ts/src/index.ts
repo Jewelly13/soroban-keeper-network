@@ -42,6 +42,11 @@ export {
   isKeeperError,
 } from "./errors.js";
 
+export {
+  tryWithdrawRewards,
+  withdrawRewards,
+  type WithdrawRewardsParams,
+} from "./methods/withdrawRewards.js";
 export { extendDeadline, type ExtendDeadlineParams } from "./methods/extendDeadline.js";
 export {
   executeTask,

@@ -26,6 +26,13 @@ the address the contract requires authorization from, and the SDK checks that
 locally rather than spending a fee on a transaction that would fail
 `require_auth`.
 
+## `client.withdrawRewards`
+
+```ts
+const withdrawn: bigint = await client.withdrawRewards({ keeper });
+
+// Or, treating an empty balance as a normal "nothing to do":
+const maybe: bigint = await client.tryWithdrawRewards({ keeper });
 ## `client.extendDeadline`
 
 ```ts
@@ -76,6 +83,9 @@ Every failure is typed, so nothing needs to match on an error message:
 import { KeeperErrorCode, isKeeperError } from "@soroban-keeper-network/sdk";
 
 try {
+  await client.withdrawRewards({ keeper });
+} catch (error) {
+  if (isKeeperError(error, KeeperErrorCode.NoRewardsAvailable)) return;
   await client.extendDeadline({ owner, taskId, newDeadline });
 } catch (error) {
   if (isKeeperError(error, KeeperErrorCode.NotTaskOwner)) return;
