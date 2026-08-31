@@ -1,3 +1,4 @@
+// packages/sdk-ts/src/errors.ts
 /**
  * Typed decoding of the KeeperRegistry contract's error enum (issue 0166 in
  * the SDK epic).
@@ -49,6 +50,84 @@ export enum KeeperErrorCode {
   BatchRewardCeilingExceeded = 23,
 }
 
+const KEEPER_ERROR_CODES = new Set<number>(
+  Object.values(KeeperErrorCode).filter(
+    (value): value is number => typeof value === "number",
+  ),
+);
+
+export function decodeKeeperError(
+  result: unknown,
+): KeeperErrorCode | undefined {
+  const code = extractKeeperErrorCode(result);
+
+  if (code === undefined) {
+    return undefined;
+  }
+
+  return KEEPER_ERROR_CODES.has(code)
+    ? (code as KeeperErrorCode)
+    : undefined;
+}
+
+function extractKeeperErrorCode(
+  result: unknown,
+): number | undefined {
+  if (!result || typeof result !== "object") {
+    return undefined;
+  }
+
+  const candidate = result as Record<string, unknown>;
+
+  const directCandidates = [
+    candidate.errorCode,
+    candidate.code,
+    candidate.contractError,
+  ];
+
+  for (const value of directCandidates) {
+    const code = toInteger(value);
+
+    if (code !== undefined) {
+      return code;
+    }
+  }
+
+  const nestedCandidates = [
+    candidate.error,
+    candidate.result,
+    candidate.simulation,
+    candidate.resultXdr,
+    candidate.errorResult,
+  ];
+
+  for (const value of nestedCandidates) {
+    const code = extractKeeperErrorCode(value);
+
+    if (code !== undefined) {
+      return code;
+    }
+  }
+
+  return undefined;
+}
+
+function toInteger(value: unknown): number | undefined {
+  if (
+    typeof value === "number" &&
+    Number.isInteger(value)
+  ) {
+    return value;
+  }
+
+  if (
+    typeof value === "string" &&
+    /^-?\d+$/.test(value)
+  ) {
+    return Number(value);
+  }
+
+  return undefined;
 /** Every code in {@link KeeperErrorCode}, for validating a decoded number is a known variant. */
 const KNOWN_CODES: ReadonlySet<number> = new Set(
   Object.values(KeeperErrorCode).filter(
