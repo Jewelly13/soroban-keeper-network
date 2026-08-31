@@ -21,6 +21,8 @@ import {
 
 import type { ContractCaller, TransactionSigner } from "./core/caller.js";
 import { KeeperRpcError, KeeperSdkError, toKeeperError } from "./errors.js";
+import type { ContractCompatibility, VersionOptions } from "./methods/views.js";
+import * as views from "./methods/views.js";
 import type { WithdrawRewardsParams } from "./methods/withdrawRewards.js";
 import { tryWithdrawRewards, withdrawRewards } from "./methods/withdrawRewards.js";
 import type { ExecuteTaskParams } from "./methods/executeTask.js";
@@ -139,6 +141,44 @@ export class KeeperRegistryClient implements ContractCaller {
 
   // -- typed entry points ----------------------------------------------------
 
+  /** See {@link views.admin}. */
+  admin(): Promise<string | undefined> {
+    return views.admin(this);
+  }
+
+  /** See {@link views.getFeeBps}. */
+  getFeeBps(): Promise<number> {
+    return views.getFeeBps(this);
+  }
+
+  /** See {@link views.isPaused}. */
+  isPaused(): Promise<boolean> {
+    return views.isPaused(this);
+  }
+
+  /** See {@link views.feesAccrued}. */
+  feesAccrued(): Promise<bigint> {
+    return views.feesAccrued(this);
+  }
+
+  /** See {@link views.rewardTokenAddress}. */
+  rewardTokenAddress(): Promise<string | undefined> {
+    return views.rewardTokenAddress(this);
+  }
+
+  /** See {@link views.minReward}. */
+  minReward(): Promise<bigint> {
+    return views.minReward(this);
+  }
+
+  /** See {@link views.version}. Warns if the contract is outside this SDK's range. */
+  version(options?: VersionOptions): Promise<number> {
+    return views.version(this, options);
+  }
+
+  /** See {@link views.checkContractCompatibility}. */
+  checkContractCompatibility(): Promise<ContractCompatibility> {
+    return views.checkContractCompatibility(this);
   /** See {@link withdrawRewards}. */
   withdrawRewards(params: WithdrawRewardsParams): Promise<bigint> {
     return withdrawRewards(this, params);
