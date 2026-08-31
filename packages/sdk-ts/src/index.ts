@@ -29,6 +29,7 @@ export type {
   TransactionSigner,
 } from "./core/caller.js";
 export type { IntegerInput } from "./core/scval.js";
+export { fromUnixSeconds, toUnixSeconds, type TimestampInput } from "./core/time.js";
 
 export { MAX_PROOF_LEN } from "./constants.js";
 
@@ -41,6 +42,7 @@ export {
   isKeeperError,
 } from "./errors.js";
 
+export { extendDeadline, type ExtendDeadlineParams } from "./methods/extendDeadline.js";
 export {
   executeTask,
   toProofBytes,

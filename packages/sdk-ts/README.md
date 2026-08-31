@@ -26,6 +26,14 @@ the address the contract requires authorization from, and the SDK checks that
 locally rather than spending a fee on a transaction that would fail
 `require_auth`.
 
+## `client.extendDeadline`
+
+```ts
+await client.extendDeadline({
+  owner,
+  taskId: 42n,
+  newDeadline: new Date("2026-01-01T00:00:00Z"),
+});
 ## `client.executeTask`
 
 ```ts
@@ -41,6 +49,11 @@ layer of its own. `u32` fields (`feeBps`, `version`, ledger counts) stay plain
 `number`. A `number` is accepted where an integer is expected, but a
 non-integer or unsafe one is rejected rather than silently rounded.
 
+**Timestamps accept `Date | number | bigint` and are returned as `Date`.** A
+bare number or bigint is read as Unix *seconds*, matching the
+`Math.floor(Date.now() / 1000)` the keeper-bot already computes. A value that
+looks like milliseconds is rejected at the boundary rather than accepted as a
+deadline in the year 54,000.
 **Proofs accept `Uint8Array | Buffer | string`, and a string is always hex.**
 The `0x` prefix is optional. A string that is not valid hex is refused instead
 of falling back to UTF-8, because guessing wrong between the two encodings puts
@@ -63,6 +76,9 @@ Every failure is typed, so nothing needs to match on an error message:
 import { KeeperErrorCode, isKeeperError } from "@soroban-keeper-network/sdk";
 
 try {
+  await client.extendDeadline({ owner, taskId, newDeadline });
+} catch (error) {
+  if (isKeeperError(error, KeeperErrorCode.NotTaskOwner)) return;
   await client.executeTask({ keeper, taskId, proof });
 } catch (error) {
   if (isKeeperError(error, KeeperErrorCode.NotTaskClaimer)) return;
