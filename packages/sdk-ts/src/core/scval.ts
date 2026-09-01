@@ -83,3 +83,17 @@ export function u32Arg(value: number, label: string): xdr.ScVal {
 export function i128Arg(value: IntegerInput, label: string): xdr.ScVal {
   return nativeToScVal(toBigInt(value, label), { type: "i128" });
 }
+
+/**
+ * Converts a `BytesN<32>` argument -- a contract WASM hash.
+ *
+ * The length is checked here rather than left to the encoder: a hash of the
+ * wrong length otherwise surfaces as an opaque XDR failure well away from the
+ * argument that caused it.
+ */
+export function bytesN32Arg(value: Uint8Array, label: string): xdr.ScVal {
+  if (value.length !== 32) {
+    throw new KeeperSdkError(`${label} must be exactly 32 bytes, got ${value.length}.`);
+  }
+  return xdr.ScVal.scvBytes(Buffer.from(value));
+}

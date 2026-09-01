@@ -59,6 +59,21 @@ export {
 } from "./methods/views.js";
 
 export {
+  sweepFees,
+  transferAdmin,
+  upgrade,
+  type SweepFeesParams,
+  type TransferAdminParams,
+  type UpgradeParams,
+} from "./methods/adminDualAuth.js";
+
+export {
+  keypairAuthSigner,
+  signAuthEntries,
+  type AuthEntrySigner,
+} from "./core/auth.js";
+
+export {
   pause,
   setFeeBps,
   setMinReward,
