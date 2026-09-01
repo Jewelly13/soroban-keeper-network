@@ -731,6 +731,15 @@ async function keeperLoop(client, emptyRounds = 0) {
           "get_task",
           [nativeToScVal(task.taskId, { type: "u64" })]
         );
+        console.log(
+          `  Attempting to claim task ${task.taskId} (reward: ${task.reward})...`
+        );
+        await withRetry(`claim_task ${task.taskId}`, () =>
+          client.invoke("claim_task", [
+            nativeToScVal(keypair.publicKey(), { type: "address" }),
+            nativeToScVal(task.taskId, { type: "u64" }),
+          ])
+        );
         const taskType = fullTask.task_type;
         const taskTypeName = TASK_TYPE_NAMES[taskType] || `Unknown(${taskType})`;
         const verifier = fullTask.verifier || null;
