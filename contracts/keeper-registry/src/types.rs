@@ -84,7 +84,9 @@ pub struct Task {
     pub deadline: u64,
     /// Ledger TTL for this storage entry.
     pub ttl_ledgers: u32,
+    pub verifier: Option<Address>,
     pub status: TaskStatus,
+
     /// Set when a keeper claims the task.
     pub claimer: Option<Address>,
     /// Ledger sequence at claim time — used to enforce the lock window.
