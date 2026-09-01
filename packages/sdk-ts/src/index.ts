@@ -57,6 +57,18 @@ export {
   type ContractCompatibility,
   type VersionOptions,
 } from "./methods/views.js";
+
+export {
+  pause,
+  setFeeBps,
+  setMinReward,
+  unpause,
+  type AdminCallParams,
+  type SetFeeBpsParams,
+  type SetMinRewardParams,
+} from "./methods/admin.js";
+
+export {
   tryWithdrawRewards,
   withdrawRewards,
   type WithdrawRewardsParams,

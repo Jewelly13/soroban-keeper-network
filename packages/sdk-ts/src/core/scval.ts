@@ -61,3 +61,25 @@ export function toBigInt(value: IntegerInput, label: string): bigint {
   }
   return BigInt(value);
 }
+
+/**
+ * Converts a `u32` argument.
+ *
+ * `u32` stays a plain `number` per the numeric convention, so this rejects a
+ * non-integer or out-of-range value rather than letting `nativeToScVal` coerce
+ * it -- a fee in basis points that silently wrapped would be a real loss.
+ */
+export function u32Arg(value: number, label: string): xdr.ScVal {
+  if (!Number.isInteger(value)) {
+    throw new KeeperSdkError(`${label} must be an integer, got ${value}.`);
+  }
+  if (value < 0 || value > 4_294_967_295) {
+    throw new KeeperSdkError(`${label} exceeds the contract's u32 range, got ${value}.`);
+  }
+  return nativeToScVal(value, { type: "u32" });
+}
+
+/** Converts an `i128` argument, accepting a `bigint` or a safe `number`. */
+export function i128Arg(value: IntegerInput, label: string): xdr.ScVal {
+  return nativeToScVal(toBigInt(value, label), { type: "i128" });
+}

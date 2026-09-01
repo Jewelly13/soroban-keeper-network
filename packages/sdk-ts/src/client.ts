@@ -27,6 +27,12 @@ import type { WithdrawRewardsParams } from "./methods/withdrawRewards.js";
 import { tryWithdrawRewards, withdrawRewards } from "./methods/withdrawRewards.js";
 import type { ExecuteTaskParams } from "./methods/executeTask.js";
 import { executeTask } from "./methods/executeTask.js";
+import type {
+  AdminCallParams,
+  SetFeeBpsParams,
+  SetMinRewardParams,
+} from "./methods/admin.js";
+import { pause, setFeeBps, setMinReward, unpause } from "./methods/admin.js";
 
 /**
  * The subset of `rpc.Server` this SDK uses.
@@ -179,6 +185,28 @@ export class KeeperRegistryClient implements ContractCaller {
   /** See {@link views.checkContractCompatibility}. */
   checkContractCompatibility(): Promise<ContractCompatibility> {
     return views.checkContractCompatibility(this);
+  }
+
+  /** See {@link pause}. */
+  pause(params: AdminCallParams): Promise<void> {
+    return pause(this, params);
+  }
+
+  /** See {@link unpause}. */
+  unpause(params: AdminCallParams): Promise<void> {
+    return unpause(this, params);
+  }
+
+  /** See {@link setFeeBps}. */
+  setFeeBps(params: SetFeeBpsParams): Promise<void> {
+    return setFeeBps(this, params);
+  }
+
+  /** See {@link setMinReward}. */
+  setMinReward(params: SetMinRewardParams): Promise<void> {
+    return setMinReward(this, params);
+  }
+
   /** See {@link withdrawRewards}. */
   withdrawRewards(params: WithdrawRewardsParams): Promise<bigint> {
     return withdrawRewards(this, params);
@@ -187,6 +215,8 @@ export class KeeperRegistryClient implements ContractCaller {
   /** See {@link tryWithdrawRewards}: resolves to `0n` instead of rejecting. */
   tryWithdrawRewards(params: WithdrawRewardsParams): Promise<bigint> {
     return tryWithdrawRewards(this, params);
+  }
+
   /** See {@link executeTask}. */
   executeTask(params: ExecuteTaskParams): Promise<void> {
     return executeTask(this, params);
