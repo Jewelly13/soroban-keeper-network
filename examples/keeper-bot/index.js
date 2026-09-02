@@ -44,6 +44,11 @@
 
 require("dotenv").config();
 
+// `rpc` is the Soroban RPC namespace. It was called `SorobanRpc` until
+// @stellar/stellar-sdk v16 dropped that alias — destructuring the old name
+// yields `undefined` rather than an error, so the bot used to get all the way
+// to `new SorobanRpc.Server(...)` before failing with an unhelpful
+// "Cannot read properties of undefined". See test/rpcNamespace.test.js.
 const {
   Keypair,
   rpc: SorobanRpc,
@@ -141,6 +146,10 @@ async function validateAndLoadConfig() {
     },
   });
 
+  // After validating the required string values, we can create the server
+  // connection and use it to validate the contract's existence on the network.
+  const { rpcUrl } = NETWORK_CONFIG[network];
+  const server = createServer(rpcUrl);
   // After validating the required string values, we can create the client
   // and use its underlying RPC connection to validate the contract's
   // existence on the network.
@@ -305,6 +314,98 @@ const REGISTRY_EVENTS = {
   taskRegistered: [topicSymbol("reg"), topicSymbol("task")],
 };
 
+/**
+ * Builds the Soroban RPC client. Both call sites (startup validation and
+ * main) need identical settings, so they share one factory rather than
+ * repeating the constructor and its options.
+ *
+ * `allowHttp: false` is not configurable on purpose: every endpoint in
+ * NETWORK_CONFIG is https, and a keeper signs transactions, so quietly
+ * permitting plaintext would put a secret key's traffic on the wire.
+ *
+ * Constructing a server performs no network I/O, which is what lets the
+ * regression test in test/rpcNamespace.test.js call this offline.
+ */
+function createServer(rpcUrl) {
+  return new rpc.Server(rpcUrl, { allowHttp: false });
+}
+
+async function simulateAndSend(server, keypair, networkPassphrase, tx) {
+  const simResponse = await server.simulateTransaction(tx);
+  if (rpc.Api.isSimulationError(simResponse)) {
+    throw new Error(`Simulation failed: ${simResponse.error}`);
+  }
+
+  const preparedTx = rpc.assembleTransaction(tx, simResponse).build();
+  preparedTx.sign(keypair);
+
+  const sendResponse = await server.sendTransaction(preparedTx);
+  if (sendResponse.status === "ERROR") {
+    throw new Error(`Send failed: ${JSON.stringify(sendResponse.errorResult)}`);
+  }
+
+  // Poll for confirmation
+  let getResponse = await server.getTransaction(sendResponse.hash);
+  let attempts = 0;
+  while (getResponse.status === rpc.Api.GetTransactionStatus.NOT_FOUND && attempts < 30) {
+    await sleep(2000);
+    getResponse = await server.getTransaction(sendResponse.hash);
+    attempts++;
+  }
+
+  if (getResponse.status === rpc.Api.GetTransactionStatus.SUCCESS) {
+    return getResponse;
+  } else {
+    throw new Error(`Transaction failed with status: ${getResponse.status}`);
+  }
+}
+
+async function invokeContract(server, keypair, networkPassphrase, contractId, method, args) {
+  const account = await server.getAccount(keypair.publicKey());
+  const contract = new Contract(contractId);
+
+  const tx = new TransactionBuilder(account, {
+    fee: BASE_FEE,
+    networkPassphrase,
+  })
+    .addOperation(contract.call(method, ...args))
+    .setTimeout(30)
+    .build();
+
+  return simulateAndSend(server, keypair, networkPassphrase, tx);
+}
+
+/**
+ * Evaluates a read-only contract function via simulation.
+ *
+ * No transaction is signed, submitted, or confirmed, and no sequence number
+ * is consumed — this is safe (and cheap) to call on every polling round.
+ * Use `invokeContract` instead for anything that mutates state, since that
+ * is the only path that actually submits.
+ *
+ * Note: simulation still builds a transaction envelope, so `server.getAccount`
+ * requires the source account to already exist (be funded) on-chain — the
+ * same requirement `invokeContract` has today. A brand-new, unfunded keeper
+ * key will throw here.
+ */
+async function readContract(server, sourcePublicKey, networkPassphrase, contractId, method, args) {
+  const account = await server.getAccount(sourcePublicKey);
+  const contract = new Contract(contractId);
+
+  const tx = new TransactionBuilder(account, {
+    fee: BASE_FEE,
+    networkPassphrase,
+  })
+    .addOperation(contract.call(method, ...args))
+    .setTimeout(30)
+    .build();
+
+  const sim = await server.simulateTransaction(tx);
+  if (rpc.Api.isSimulationError(sim)) {
+    throw new Error(`Simulation failed: ${sim.error}`);
+  }
+  return sim.result ? scValToNative(sim.result.retval) : null;
+}
 // `simulateAndSend`/`invokeContract`/`readContract` used to live here as
 // hand-rolled functions. They are now `KeeperRegistryClient.invoke()` /
 // `KeeperRegistryClient.read()` in the SDK (packages/sdk-ts/src/client.ts) —
@@ -892,6 +993,7 @@ async function main() {
     await loadSdk();
   const { rpcUrl } = NETWORK_PRESETS[CONFIG.network];
   const keypair = Keypair.fromSecret(CONFIG.secretKey);
+  const server = createServer(rpcUrl);
   const client = new KeeperRegistryClient({
     contractId: CONFIG.registryContractId,
     network: CONFIG.network,
@@ -915,6 +1017,12 @@ async function main() {
 
   // Verify connectivity
   try {
+    const health = await server.getHealth();
+    // `latestLedger`, not `ledger` — the same v16 API drift as the `rpc`
+    // rename above. This one degraded quietly to "ledger undefined" instead
+    // of throwing, so the startup banner has been printing a hole where the
+    // one number that proves RPC is live should be.
+    console.log(`RPC healthy — ledger ${health.latestLedger}`);
     const health = await client.rpc.getHealth();
     console.log(`RPC healthy — ledger ${health.ledger}`);
   } catch (e) {
@@ -998,6 +1106,7 @@ function sleep(ms) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 module.exports = {
+  createServer,
   isPermanentError,
   withRetry,
   fetchPendingTasks,
