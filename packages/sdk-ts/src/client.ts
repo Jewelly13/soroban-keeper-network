@@ -22,6 +22,8 @@ import {
 
 import type { ContractCaller, TransactionSigner } from "./core/caller.js";
 import { KeeperRpcError, KeeperSdkError, toKeeperError } from "./errors.js";
+import type { IntegerInput } from "./core/scval.js";
+import type { Task } from "./types.js";
 import type { ContractCompatibility, VersionOptions } from "./methods/views.js";
 import * as views from "./methods/views.js";
 import type { WithdrawRewardsParams } from "./methods/withdrawRewards.js";
@@ -215,6 +217,26 @@ export class KeeperRegistryClient implements ContractCaller {
   /** See {@link views.checkContractCompatibility}. */
   checkContractCompatibility(): Promise<ContractCompatibility> {
     return views.checkContractCompatibility(this);
+  }
+
+  /** See {@link views.getTask}. */
+  getTask(taskId: IntegerInput): Promise<Task> {
+    return views.getTask(this, taskId);
+  }
+
+  /** See {@link views.taskCount}. */
+  taskCount(): Promise<number> {
+    return views.taskCount(this);
+  }
+
+  /** See {@link views.keeperBalance}. */
+  keeperBalance(keeper: string): Promise<bigint> {
+    return views.keeperBalance(this, keeper);
+  }
+
+  /** See {@link views.isClaimable}. */
+  isClaimable(taskId: IntegerInput): Promise<boolean> {
+    return views.isClaimable(this, taskId);
   }
 
   /** See {@link transferAdmin}. */
