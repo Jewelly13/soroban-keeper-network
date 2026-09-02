@@ -418,8 +418,10 @@ without breaking existing consumers.
 |-------|-----------|--------|----------------------------|
 | `Initialized` | `initialize` | `("init", "admin")` | `(admin: Address, reward_token: Address, fee_bps: u32)` — emitted at most once |
 | `TaskRegistered` | `register_task` | `("reg", "task")` | `(task_id: u64, owner: Address, reward: i128, deadline: u64)` |
+| `VerifierAttached` | `register_task` | `("vattach", "task")` | `(task_id: u64, verifier: Address)` — emitted when a verifier is attached at registration |
 | `RewardIncreased` | `increase_reward` | `("topup", "task")` | `(task_id: u64, new_reward: i128)` — the new **total** reward, not the delta |
 | `DeadlineExtended` | `extend_deadline` | `("extend", "task")` | `(task_id: u64, new_deadline: u64)` |
+| `VerifierUpdated` | `update_verifier` | `("vupdate", "task")` | `(task_id: u64, old_verifier: Option<Address>, new_verifier: Option<Address>)` — before/after update pattern (`None` clears/lacks verifier) |
 | `TaskClaimed` | `claim_task` | `("claim", "task")` | `(task_id: u64, keeper: Address, ledger_seq: u32)` |
 | `TaskExecuted` | `execute_task` | `("exec", "task")` | `(task_id: u64, keeper: Address, net_reward: i128, proof: Bytes)` |
 | `TaskCancelled` | `cancel_task` | `("cancel", "task")` | `(task_id: u64, owner: Address)` |
@@ -439,22 +441,8 @@ Notes:
 - `("admin", "xfer")` is the only event whose first topic is `"admin"`; every
   other admin event uses `"admin"` as its *second* topic. Filter on both topics,
   not just one.
-- `VerifierUpdated` and `TaskVerificationFailed` are epic E04 (verifier
-  integration) events; see [`docs/EVENTS.md`](docs/EVENTS.md) for their
-  full schema and indexer-relevant purpose per field, and note that
-  epic's current implementation status there before building against
-  them.
-| Event | Topics | Data |
-|-------|--------|------|
-| `TaskRegistered` | `("reg", "task")` | `(task_id, owner, reward, deadline)` |
-| `TaskClaimed` | `("claim", "task")` | `(task_id, keeper, ledger_seq)` |
-| `TaskExecuted` | `("exec", "task")` | `(task_id, keeper, net_reward, proof)` |
-| `TaskExpired` | `("exp", "task")` | `(task_id,)` |
-| `TaskCancelled` | `("cancel", "task")` | `(task_id, owner)` |
-| `RewardsWithdrawn` | `("withdraw", "reward")` | `(keeper, amount)` |
-| `Initialized` | `("init", "admin")` | `(admin, reward_token, fee_bps)` — emitted at most once |
-| `MinRewardUpdated` | `("minrwd", "admin")` | `(old_min, new_min)` |
-| `FeesSweep` | `("sweep", "admin")` | `(treasury, amount, remaining)` |
+- `VerifierAttached` is emitted on `register_task` when an optional verifier is attached, preserving the standard 4-tuple schema of `TaskRegistered` for backwards compatibility with existing event parsers.
+- `VerifierUpdated` follows the `FeeUpdated` / `MinRewardUpdated` before/after pattern with `(task_id, old_verifier, new_verifier)`.
 
 #### Task Lifecycle State Machine
 

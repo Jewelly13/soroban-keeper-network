@@ -129,6 +129,9 @@ pub fn emit_upgraded(e: &Env, admin: &Address, new_wasm_hash: &BytesN<32>) {
     );
 }
 
+pub fn emit_verifier_attached(e: &Env, task_id: u64, verifier: &Address) {
+    e.events().publish(
+        (symbol_short!("vattach"), symbol_short!("task")),
 pub fn emit_verifier_updated(e: &Env, task_id: u64, verifier: &Option<Address>) {
     e.events().publish(
         (symbol_short!("verifier"), symbol_short!("task")),
@@ -136,3 +139,21 @@ pub fn emit_verifier_updated(e: &Env, task_id: u64, verifier: &Option<Address>) 
     );
 }
 
+pub fn emit_verifier_updated(
+    e: &Env,
+    task_id: u64,
+    old_verifier: Option<Address>,
+    new_verifier: Option<Address>,
+) {
+    e.events().publish(
+        (symbol_short!("vupdate"), symbol_short!("task")),
+        (task_id, old_verifier, new_verifier),
+    );
+}
+
+pub fn emit_task_verification_failed(e: &Env, task_id: u64, keeper: &Address) {
+    e.events().publish(
+        (symbol_short!("verfail"), symbol_short!("task")),
+        (task_id, keeper.clone()),
+    );
+}
