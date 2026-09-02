@@ -36,6 +36,8 @@ import type { IncreaseRewardParams } from "./methods/increaseReward.js";
 import { increaseReward } from "./methods/increaseReward.js";
 import type { ClaimTaskOutcome, ClaimTaskParams } from "./methods/claimTask.js";
 import { claimTask } from "./methods/claimTask.js";
+import type { CancelTaskOutcome, CancelTaskParams } from "./methods/cancelTask.js";
+import { cancelTask } from "./methods/cancelTask.js";
 import type {
   SweepFeesParams,
   TransferAdminParams,
@@ -276,6 +278,11 @@ export class KeeperRegistryClient implements ContractCaller {
   /** See {@link claimTask}: routine claim-race outcomes are returned, not thrown. */
   claimTask(params: ClaimTaskParams): Promise<ClaimTaskOutcome> {
     return claimTask(this, params);
+  }
+
+  /** See {@link cancelTask}: a live lock and a terminal status are returned, not thrown. */
+  cancelTask(params: CancelTaskParams): Promise<CancelTaskOutcome> {
+    return cancelTask(this, params);
   }
 
   // -- shared plumbing -------------------------------------------------------
