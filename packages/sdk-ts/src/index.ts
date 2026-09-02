@@ -98,6 +98,11 @@ export {
 export { registerTask, type RegisterTaskParams } from "./methods/registerTask.js";
 export { increaseReward, type IncreaseRewardParams } from "./methods/increaseReward.js";
 export {
+  claimTask,
+  type ClaimTaskOutcome,
+  type ClaimTaskParams,
+} from "./methods/claimTask.js";
+export {
   MAX_CALLDATA_LEN,
   MAX_LOCK_LEDGERS,
   MIN_LOCK_LEDGERS,
