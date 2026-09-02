@@ -38,6 +38,8 @@ import type { ClaimTaskOutcome, ClaimTaskParams } from "./methods/claimTask.js";
 import { claimTask } from "./methods/claimTask.js";
 import type { CancelTaskOutcome, CancelTaskParams } from "./methods/cancelTask.js";
 import { cancelTask } from "./methods/cancelTask.js";
+import type { ExpireTaskParams } from "./methods/expireTask.js";
+import { expireTask } from "./methods/expireTask.js";
 import type {
   SweepFeesParams,
   TransferAdminParams,
@@ -283,6 +285,11 @@ export class KeeperRegistryClient implements ContractCaller {
   /** See {@link cancelTask}: a live lock and a terminal status are returned, not thrown. */
   cancelTask(params: CancelTaskParams): Promise<CancelTaskOutcome> {
     return cancelTask(this, params);
+  }
+
+  /** See {@link expireTask}. */
+  expireTask(params: ExpireTaskParams): Promise<void> {
+    return expireTask(this, params);
   }
 
   // -- shared plumbing -------------------------------------------------------

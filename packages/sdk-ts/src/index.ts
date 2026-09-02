@@ -107,6 +107,7 @@ export {
   type CancelTaskOutcome,
   type CancelTaskParams,
 } from "./methods/cancelTask.js";
+export { expireTask, type ExpireTaskParams } from "./methods/expireTask.js";
 export {
   MAX_CALLDATA_LEN,
   MAX_LOCK_LEDGERS,
