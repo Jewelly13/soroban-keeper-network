@@ -30,7 +30,8 @@ fn test_update_verifier_sets_and_clears_verifier_on_pending_task() {
     assert_eq!(s.registry.get_task(&task_id).verifier, None);
 
     // Set new verifier
-    s.registry.update_verifier(&owner, &task_id, &Some(verifier.clone()));
+    s.registry
+        .update_verifier(&owner, &task_id, &Some(verifier.clone()));
     assert_eq!(s.registry.get_task(&task_id).verifier, Some(verifier));
 
     // Clear verifier (None)
@@ -52,7 +53,9 @@ fn test_update_verifier_rejects_claimed_task() {
     assert_eq!(s.registry.get_task(&task_id).status, TaskStatus::Claimed);
 
     // Owner attempt to update verifier on claimed task must return InvalidTaskStatus
-    let result = s.registry.try_update_verifier(&owner, &task_id, &Some(verifier));
+    let result = s
+        .registry
+        .try_update_verifier(&owner, &task_id, &Some(verifier));
     assert_eq!(result, Err(Ok(KeeperError::InvalidTaskStatus)));
 }
 
@@ -65,7 +68,9 @@ fn test_update_verifier_rejects_non_owner() {
     let task_id = register_default_task(&s);
 
     // Non-owner call must fail with NotTaskOwner
-    let result = s.registry.try_update_verifier(&stranger, &task_id, &Some(verifier));
+    let result = s
+        .registry
+        .try_update_verifier(&stranger, &task_id, &Some(verifier));
     assert_eq!(result, Err(Ok(KeeperError::NotTaskOwner)));
 }
 

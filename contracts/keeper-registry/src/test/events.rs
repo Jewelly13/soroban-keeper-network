@@ -269,7 +269,9 @@ fn test_emit_verifier_attached_event() {
     let verifier = Address::generate(&s.env);
     let task_id = 42u64;
 
-    crate::emit_verifier_attached(&s.env, task_id, &verifier);
+    s.env.as_contract(&s.registry.address, || {
+        crate::emit_verifier_attached(&s.env, task_id, &verifier);
+    });
 
     let events = s.env.events().all();
     let event = events.last().unwrap();
@@ -286,21 +288,25 @@ fn test_emit_verifier_updated_event_before_after_pattern() {
     let task_id = 100u64;
 
     // Test update from Some to Some
-    crate::emit_verifier_updated(
-        &s.env,
-        task_id,
-        Some(old_verifier.clone()),
-        Some(new_verifier.clone()),
-    );
+    s.env.as_contract(&s.registry.address, || {
+        crate::emit_verifier_updated(
+            &s.env,
+            task_id,
+            Some(old_verifier.clone()),
+            Some(new_verifier.clone()),
+        );
+    });
     let events = s.env.events().all();
     let event = events.last().unwrap();
     let data: (u64, Option<Address>, Option<Address>) = event.2.try_into_val(&s.env).unwrap();
     assert_eq!(data.0, task_id);
-    assert_eq!(data.1, Some(old_verifier));
-    assert_eq!(data.2, Some(new_verifier));
+    assert_eq!(data.1, Some(old_verifier.clone()));
+    assert_eq!(data.2, Some(new_verifier.clone()));
 
     // Test update clearing verifier (Some to None)
-    crate::emit_verifier_updated(&s.env, task_id, Some(old_verifier.clone()), None);
+    s.env.as_contract(&s.registry.address, || {
+        crate::emit_verifier_updated(&s.env, task_id, Some(old_verifier.clone()), None);
+    });
     let events = s.env.events().all();
     let event = events.last().unwrap();
     let data: (u64, Option<Address>, Option<Address>) = event.2.try_into_val(&s.env).unwrap();
@@ -309,7 +315,9 @@ fn test_emit_verifier_updated_event_before_after_pattern() {
     assert_eq!(data.2, None);
 
     // Test attaching verifier to previously unverified task (None to Some)
-    crate::emit_verifier_updated(&s.env, task_id, None, Some(new_verifier.clone()));
+    s.env.as_contract(&s.registry.address, || {
+        crate::emit_verifier_updated(&s.env, task_id, None, Some(new_verifier.clone()));
+    });
     let events = s.env.events().all();
     let event = events.last().unwrap();
     let data: (u64, Option<Address>, Option<Address>) = event.2.try_into_val(&s.env).unwrap();
@@ -319,12 +327,14 @@ fn test_emit_verifier_updated_event_before_after_pattern() {
 }
 
 #[test]
-fn test_emit_task_verification_failed_event() {
+fn test_emit_verification_failed_event() {
     let s = setup();
     let keeper = Address::generate(&s.env);
     let task_id = 7u64;
 
-    crate::emit_task_verification_failed(&s.env, task_id, &keeper);
+    s.env.as_contract(&s.registry.address, || {
+        crate::emit_verification_failed(&s.env, task_id, &keeper);
+    });
 
     let events = s.env.events().all();
     let event = events.last().unwrap();

@@ -1,5 +1,14 @@
 //! Task lifecycle: registration, funding, claiming, execution, and the two
 //! refund paths (owner cancel and permissionless expiry).
+//!
+//! `register_task`'s arity (owner, task_type, calldata, reward, deadline,
+//! ttl_ledgers, lock_ledgers, verifier) is inherent to the ABI: every field is
+//! a distinct scalar a caller must supply, and a params struct would just move
+//! them without improving anything. The allow below is module-level, not on
+//! the function itself, because `#[contractimpl]` generates its spec entry
+//! and client method as sibling items in this module, not nested inside the
+//! `impl` block, so a function- or impl-level attribute does not cover them.
+#![allow(clippy::too_many_arguments)]
 
 use soroban_sdk::{contractimpl, log, Address, Bytes, Env};
 
@@ -39,9 +48,6 @@ impl KeeperRegistry {
     //
     // Returns the new task_id.
 
-    // The task parameters are all distinct scalars a caller must supply; a
-    // params struct would just move them without improving the ABI.
-    #[allow(clippy::too_many_arguments)]
     pub fn register_task(
         e: Env,
         owner: Address,
@@ -79,7 +85,6 @@ impl KeeperRegistry {
             reward,
             deadline,
             ttl_ledgers,
-            verifier: None,
             status: TaskStatus::Pending,
 
             claimer: None,
@@ -185,11 +190,12 @@ impl KeeperRegistry {
             return Err(KeeperError::InvalidTaskStatus);
         }
 
+        let old_verifier = task.verifier.clone();
         bump_instance(&e);
         task.verifier = new_verifier.clone();
         save_task(&e, task_id, &task);
 
-        emit_verifier_updated(&e, task_id, &new_verifier);
+        emit_verifier_updated(&e, task_id, old_verifier, new_verifier);
         Ok(())
     }
     // ── claim_task ───────────────────────────────────────────────────────────
