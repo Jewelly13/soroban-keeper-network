@@ -369,10 +369,14 @@ mod tests {
                 .expect("insert");
         }
 
-        router(ApiState {
-            ingestor: Ingestor::new(store),
-            caches: AggregateCaches::from_secs(crate::cache::DEFAULT_TTL_SECS),
-        })
+        router(
+            ApiState {
+                ingestor: Ingestor::new(store),
+                caches: AggregateCaches::from_secs(crate::cache::DEFAULT_TTL_SECS),
+            },
+            1_000,
+            1_000,
+        )
     }
 
     async fn get_json(app: &axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {

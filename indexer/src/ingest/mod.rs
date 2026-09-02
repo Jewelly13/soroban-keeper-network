@@ -13,6 +13,7 @@
 pub mod admin;
 pub mod keepers;
 pub mod parse;
+pub mod tasks;
 
 use anyhow::Result;
 use tokio::sync::broadcast;

@@ -95,12 +95,17 @@ async fn serve_seeded_api_for_loadtest() {
         ingestor.ingest_batch(&batch).await.expect("ingest");
     }
 
-    let app = router(ApiState {
-        ingestor,
-        // The TTL under test. Set LOADTEST_CACHE_TTL_SECS=0 to measure the
-        // uncached path for comparison.
-        caches: AggregateCaches::from_secs(env_or("LOADTEST_CACHE_TTL_SECS", 10)),
-    });
+    let app = router(
+        ApiState {
+            ingestor,
+            // The TTL under test. Set LOADTEST_CACHE_TTL_SECS=0 to measure the
+            // uncached path for comparison.
+            caches: AggregateCaches::from_secs(env_or("LOADTEST_CACHE_TTL_SECS", 10)),
+        },
+        // A load test measures the server itself, not its rate limiter.
+        u32::MAX,
+        u32::MAX,
+    );
 
     let listener = TcpListener::bind(("127.0.0.1", port as u16))
         .await
