@@ -30,6 +30,10 @@ import type { ExecuteTaskParams } from "./methods/executeTask.js";
 import type { AuthEntrySigner } from "./core/auth.js";
 import { signAuthEntries } from "./core/auth.js";
 import { executeTask } from "./methods/executeTask.js";
+import type { RegisterTaskParams } from "./methods/registerTask.js";
+import { registerTask } from "./methods/registerTask.js";
+import type { IncreaseRewardParams } from "./methods/increaseReward.js";
+import { increaseReward } from "./methods/increaseReward.js";
 import type {
   SweepFeesParams,
   TransferAdminParams,
@@ -255,6 +259,16 @@ export class KeeperRegistryClient implements ContractCaller {
   /** See {@link executeTask}. */
   executeTask(params: ExecuteTaskParams): Promise<void> {
     return executeTask(this, params);
+  }
+
+  /** See {@link registerTask}. */
+  registerTask(params: RegisterTaskParams): Promise<bigint> {
+    return registerTask(this, params);
+  }
+
+  /** See {@link increaseReward}. */
+  increaseReward(params: IncreaseRewardParams): Promise<void> {
+    return increaseReward(this, params);
   }
 
   // -- shared plumbing -------------------------------------------------------

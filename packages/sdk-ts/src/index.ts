@@ -95,6 +95,14 @@ export {
   type ExecuteTaskParams,
   type ProofInput,
 } from "./methods/executeTask.js";
+export { registerTask, type RegisterTaskParams } from "./methods/registerTask.js";
+export { increaseReward, type IncreaseRewardParams } from "./methods/increaseReward.js";
+export {
+  MAX_CALLDATA_LEN,
+  MAX_LOCK_LEDGERS,
+  MIN_LOCK_LEDGERS,
+  MIN_TTL_LEDGERS,
+} from "./constants.js";
 // Entry point for @soroban-keeper-network/sdk.
 //
 // This package began as a scaffold (backlog 0151 / epic E12) and now

@@ -24,6 +24,17 @@ export function addressArg(value: string, label: string): xdr.ScVal {
   return new Address(value).toScVal();
 }
 
+/**
+ * Converts an `Option<Address>` argument.
+ *
+ * Soroban encodes `None` as void and `Some(x)` as `x` itself, so an omitted
+ * optional address is a real argument that must still be passed -- dropping it
+ * would shift every later positional argument.
+ */
+export function optionalAddressArg(value: string | undefined, label: string): xdr.ScVal {
+  return value === undefined ? xdr.ScVal.scvVoid() : addressArg(value, label);
+}
+
 /** Converts a `u64` argument, rejecting negatives and lossy `number` inputs. */
 export function u64Arg(value: IntegerInput, label: string): xdr.ScVal {
   const asBigInt = toBigInt(value, label);
