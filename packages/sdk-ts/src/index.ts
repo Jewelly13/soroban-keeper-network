@@ -131,3 +131,11 @@ export {
   type UnsignedTransaction,
 } from "./transactionBuilder.js";
 export { TaskStatus, TaskType, type Task } from "./types.js";
+export {
+  NETWORK_PRESETS,
+  NETWORK_NAMES,
+  isNetworkName,
+} from "./network.js";
+export type { NetworkName, NetworkPreset } from "./network.js";
+export { withRetry } from "./retry.js";
+export type { RetryOptions } from "./retry.js";
