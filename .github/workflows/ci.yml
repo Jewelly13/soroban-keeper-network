@@ -553,6 +553,15 @@ jobs:
           name: sdk-ts-dist
           path: packages/sdk-ts/dist
 
+      - name: Install SDK's own runtime dependencies
+        # Node's ESM resolver walks up from the real path of the imported
+        # file (packages/sdk-ts/dist/client.js), not from the bot's
+        # node_modules the file: dependency symlinks into — so
+        # @stellar/stellar-sdk (a peerDependency the SDK never bundles)
+        # must exist under packages/sdk-ts itself, not just under the bot.
+        working-directory: packages/sdk-ts
+        run: npm install --no-audit --no-fund --omit=dev
+
       - name: Install dependencies
         run: npm install --no-audit --no-fund
 
