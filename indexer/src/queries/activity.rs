@@ -114,18 +114,16 @@ pub async fn get_address_activity(
                     });
                 }
             }
-            EventPayload::RewardsWithdrawn { keeper, amount } => {
-                if keeper == address {
-                    feed_items.push(ActivityItem {
-                        cursor: ev.cursor,
-                        ledger: ev.ledger,
-                        ledger_close_time: ev.ledger_close_time,
-                        role: ActivityRole::Keeper,
-                        event_type: "rewards_withdrawn".to_string(),
-                        task_id: None,
-                        amount: Some(amount.0.to_string()),
-                    });
-                }
+            EventPayload::RewardsWithdrawn { keeper, amount } if keeper == address => {
+                feed_items.push(ActivityItem {
+                    cursor: ev.cursor,
+                    ledger: ev.ledger,
+                    ledger_close_time: ev.ledger_close_time,
+                    role: ActivityRole::Keeper,
+                    event_type: "rewards_withdrawn".to_string(),
+                    task_id: None,
+                    amount: Some(amount.0.to_string()),
+                });
             }
             _ => {}
         }

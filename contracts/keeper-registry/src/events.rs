@@ -10,6 +10,9 @@ use soroban_sdk::{symbol_short, Address, Bytes, BytesN, Env};
 // Events — emitted for off-chain keeper bots to consume
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ─── E01 — Contract Core Hardening: task lifecycle ─────────────────────
+// New task-lifecycle events go here.
+
 pub fn emit_task_registered(e: &Env, task_id: u64, owner: &Address, reward: i128, deadline: u64) {
     e.events().publish(
         (symbol_short!("reg"), symbol_short!("task")),
@@ -56,6 +59,23 @@ pub fn emit_rewards_withdrawn(e: &Env, keeper: &Address, amount: i128) {
     );
 }
 
+pub fn emit_reward_increased(e: &Env, task_id: u64, new_reward: i128) {
+    e.events().publish(
+        (symbol_short!("topup"), symbol_short!("task")),
+        (task_id, new_reward),
+    );
+}
+
+pub fn emit_deadline_extended(e: &Env, task_id: u64, new_deadline: u64) {
+    e.events().publish(
+        (symbol_short!("extend"), symbol_short!("task")),
+        (task_id, new_deadline),
+    );
+}
+
+// ─── E01 — Contract Core Hardening: admin ──────────────────────────────
+// New admin/governance events go here.
+
 pub fn emit_paused(e: &Env, paused: bool) {
     e.events()
         .publish((symbol_short!("paused"), symbol_short!("admin")), (paused,));
@@ -72,20 +92,6 @@ pub fn emit_admin_transferred(e: &Env, old_admin: &Address, new_admin: &Address)
     e.events().publish(
         (symbol_short!("admin"), symbol_short!("xfer")),
         (old_admin.clone(), new_admin.clone()),
-    );
-}
-
-pub fn emit_reward_increased(e: &Env, task_id: u64, new_reward: i128) {
-    e.events().publish(
-        (symbol_short!("topup"), symbol_short!("task")),
-        (task_id, new_reward),
-    );
-}
-
-pub fn emit_deadline_extended(e: &Env, task_id: u64, new_deadline: u64) {
-    e.events().publish(
-        (symbol_short!("extend"), symbol_short!("task")),
-        (task_id, new_deadline),
     );
 }
 
@@ -110,6 +116,16 @@ pub fn emit_initialized(e: &Env, admin: &Address, reward_token: &Address, fee_bp
     );
 }
 
+pub fn emit_upgraded(e: &Env, admin: &Address, new_wasm_hash: &BytesN<32>) {
+    e.events().publish(
+        (symbol_short!("upgrade"), symbol_short!("admin")),
+        (admin.clone(), new_wasm_hash.clone()),
+    );
+}
+
+// ─── E04 — On-chain Execution Verifier ─────────────────────────────────
+// New verifier-related events go here.
+
 /// Emitted when a task's attached verifier rejects a proof (`verify` returned
 /// `false`, or the call panicked). Distinct from `TaskExecuted`: the two are
 /// mutually exclusive for a given `execute_task` call — a rejection emits
@@ -119,13 +135,6 @@ pub fn emit_verification_failed(e: &Env, task_id: u64, keeper: &Address) {
     e.events().publish(
         (symbol_short!("verfail"), symbol_short!("task")),
         (task_id, keeper.clone()),
-    );
-}
-
-pub fn emit_upgraded(e: &Env, admin: &Address, new_wasm_hash: &BytesN<32>) {
-    e.events().publish(
-        (symbol_short!("upgrade"), symbol_short!("admin")),
-        (admin.clone(), new_wasm_hash.clone()),
     );
 }
 

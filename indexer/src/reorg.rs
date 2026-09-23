@@ -365,7 +365,7 @@ mod tests {
         let other = event(11, "tx-b", 0, "GB");
 
         assert_eq!(
-            fingerprint(10, &[this.clone()]),
+            fingerprint(10, std::slice::from_ref(&this)),
             fingerprint(10, &[this, other])
         );
     }

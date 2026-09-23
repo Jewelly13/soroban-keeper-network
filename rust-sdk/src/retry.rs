@@ -169,9 +169,7 @@ mod tests {
         NotTaskClaimer,
     }
 
-    fn instant_sleep(_: Duration) -> impl Future<Output = ()> {
-        async {}
-    }
+    async fn instant_sleep(_: Duration) {}
 
     #[tokio::test]
     async fn transient_timeout_is_retried_until_success() {

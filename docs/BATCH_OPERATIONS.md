@@ -101,7 +101,7 @@ because it is what issue 0104 should follow when it measures:
   `max_total_reward` sum check up front).
 - Issue 0107 adds pinned CPU-instruction ceiling tests for `claim_task` and
   `execute_task` using `env.cost_estimate().budget()`
-  (`contracts/keeper-registry/src/test.rs`). The same measurement technique
+  (`contracts/keeper-registry/src/test/perf.rs`). The same measurement technique
   applies directly to `register_task` and, once implemented,
   `batch_register_tasks` — issue 0104 should measure the real batch call at
   increasing N until it approaches Soroban's per-transaction instruction

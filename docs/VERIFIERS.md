@@ -17,7 +17,8 @@ prerequisites exist in this repository yet:
   it was meant to also cover) has no prior content to extend.
 
 What *does* exist as of issue 0100 landing (`.github/workflows/ci.yml`'s
-`resource-cost` advisory job, `contracts/keeper-registry/src/test.rs`'s
+`resource-cost` advisory job,
+`contracts/keeper-registry/src/test/resource_report.rs`'s
 `resource_report` test) is the measurement methodology and the no-verifier
 baseline itself, which this document records below. The per-verifier deltas
 this issue's acceptance criteria actually ask for cannot be produced until

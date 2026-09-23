@@ -147,10 +147,9 @@ PR description.
 
 Per-entry-point CPU-instruction ceilings for the hottest contract functions
 (`claim_task`, `execute_task`) are pinned as regular `#[test]`s in
-`contracts/keeper-registry/src/test.rs` rather than a separate CI job — see
-the "CPU-instruction regression ceilings" section of that file for the
-reasoning and the margin chosen. These run as part of the required `test`
-job like any other test.
+`contracts/keeper-registry/src/test/perf.rs` rather than a separate CI job
+— see that file for the reasoning and the margin chosen. These run as part
+of the required `test` job like any other test.
 
 ## Mutation testing (evaluated, not adopted yet)
 

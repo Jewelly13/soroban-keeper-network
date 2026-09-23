@@ -2,10 +2,16 @@
 #
 # Publish backlog issues from .github/backlog/issues/ to GitHub Issues.
 #
-# Each issue file carries YAML front matter (title, labels, epic, wave) followed
-# by the Markdown body. This script splits the two, creates the issue with `gh`,
-# and skips any issue whose title is already open on the repository so it can be
-# re-run safely.
+# Each issue file carries YAML front matter (title, labels, epic, wave,
+# depends_on) followed by the Markdown body. This script splits the two,
+# creates the issue with `gh`, and skips any issue whose title is already
+# open on the repository so it can be re-run safely. An issue whose
+# depends_on lists a local issue number that hasn't been pushed yet, or is
+# pushed but still open, is held back rather than created — re-run the
+# script after the dependency closes to pick it up.
+#
+# --dry-run does not query GitHub, so it cannot tell what's actually
+# closed — every depends_on will show as held back in dry-run output.
 #
 #   ./.github/backlog/push.sh --from 1 --to 50 --dry-run
 #   ./.github/backlog/push.sh --from 1 --to 50
@@ -47,13 +53,28 @@ fi
 # would rate-limit long before the run finished.
 echo "Fetching existing issue titles from $REPO ..."
 EXISTING="$(mktemp)"
-trap 'rm -f "$EXISTING"' EXIT
+# Titles of issues that are open (not yet closed) — used to hold back any
+# issue whose depends_on isn't done yet. Title-keyed like $EXISTING, since
+# gh has no cheap "closed" filter keyed by our own file numbering.
+OPEN_TITLES="$(mktemp)"
+trap 'rm -f "$EXISTING" "$OPEN_TITLES"' EXIT
 if [ "$DRY_RUN" -eq 0 ]; then
   gh issue list --repo "$REPO" --state all --limit 1000 --json title \
     --jq '.[].title' > "$EXISTING"
+  gh issue list --repo "$REPO" --state open --limit 1000 --json title \
+    --jq '.[].title' > "$OPEN_TITLES"
 else
   : > "$EXISTING"
+  : > "$OPEN_TITLES"
 fi
+
+# Given a local issue number (e.g. "0050"), finds its front-matter title.
+# Used to resolve depends_on: [0050] into the title push.sh already tracks.
+title_for_issue_number() {
+  local dep_file
+  dep_file="$(ls "$ISSUE_DIR/$1"-*.md 2>/dev/null | head -1)"
+  [ -n "$dep_file" ] && front_matter_value "$dep_file" title
+}
 
 # Reads the value of a single-line front-matter key.
 front_matter_value() {
@@ -83,6 +104,7 @@ issue_body() {
 
 created=0
 skipped=0
+held=0
 failed=0
 
 for file in "$ISSUE_DIR"/*.md; do
@@ -98,6 +120,7 @@ for file in "$ISSUE_DIR"/*.md; do
 
   title="$(front_matter_value "$file" title)"
   labels="$(front_matter_value "$file" labels)"
+  depends_on="$(front_matter_value "$file" depends_on)"
 
   if [ -z "$title" ]; then
     echo "  !  $base — no title in front matter, skipping" >&2
@@ -108,6 +131,33 @@ for file in "$ISSUE_DIR"/*.md; do
   if grep -Fxq "$title" "$EXISTING" 2>/dev/null; then
     echo "  =  $base — already on GitHub, skipping"
     skipped=$((skipped + 1))
+    continue
+  fi
+
+  # Hold back an issue whose depends_on lists an issue that isn't closed
+  # yet — either never pushed at all, or pushed and still open. This is
+  # what keeps two contributors from picking up sequenced work in
+  # parallel: the dependent issue simply doesn't exist on GitHub yet for
+  # anyone to claim.
+  unmet=""
+  if [ -n "$depends_on" ]; then
+    IFS=',' read -ra dep_nums <<< "$depends_on"
+    for dep_num in "${dep_nums[@]}"; do
+      dep_num="$(echo "$dep_num" | sed 's/^[ \t"]*//; s/[ \t"]*$//')"
+      [ -z "$dep_num" ] && continue
+      dep_title="$(title_for_issue_number "$dep_num")"
+      if [ -z "$dep_title" ]; then
+        unmet="$unmet $dep_num(no-file)"
+      elif ! grep -Fxq "$dep_title" "$EXISTING" 2>/dev/null; then
+        unmet="$unmet $dep_num(not-pushed)"
+      elif grep -Fxq "$dep_title" "$OPEN_TITLES" 2>/dev/null; then
+        unmet="$unmet $dep_num(open)"
+      fi
+    done
+  fi
+  if [ -n "$unmet" ]; then
+    echo "  ~  $base — held back, depends_on not closed:$unmet"
+    held=$((held + 1))
     continue
   fi
 
@@ -151,5 +201,5 @@ for file in "$ISSUE_DIR"/*.md; do
 done
 
 echo
-echo "created: $created   skipped: $skipped   failed: $failed"
+echo "created: $created   skipped: $skipped   held: $held   failed: $failed"
 [ "$failed" -eq 0 ]

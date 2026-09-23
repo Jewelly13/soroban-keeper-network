@@ -501,7 +501,11 @@ jobs:
           node-version: "20"
 
       - name: Install dependencies
-        run: npm install --no-audit --no-fund
+        # npm ci (not npm install) so a package.json/package-lock.json
+        # drift fails this check loudly instead of npm silently rewriting
+        # the lockfile — the drift then only surfaces as a merge conflict
+        # against main days later.
+        run: npm ci --no-audit --no-fund
 
       - name: Typecheck
         run: npx tsc --noEmit -p tsconfig.json
@@ -562,10 +566,13 @@ jobs:
         # consumers bring their own copy), so `--omit=dev` would skip the
         # one place npm can actually resolve it from in this job.
         working-directory: packages/sdk-ts
-        run: npm install --no-audit --no-fund
+        run: npm ci --no-audit --no-fund
 
       - name: Install dependencies
-        run: npm install --no-audit --no-fund
+        # npm ci, not npm install — a stale package-lock.json fails this
+        # check instead of npm silently rewriting it, so drift shows up as
+        # a red check on the PR instead of a conflict against main later.
+        run: npm ci --no-audit --no-fund
 
       - name: Run tests
         run: npm test

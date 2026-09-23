@@ -166,9 +166,10 @@ contracts/keeper-registry/src/
 | changing a task lifecycle rule | `task.rs` + `test/<area>.rs` |
 | adding or changing an admin control | `admin.rs` + `test/admin.rs` |
 | adding a read-only view | `views.rs` + `test/…` |
-| adding an error variant | `errors.rs` — take the next free discriminant, never renumber |
+| adding an error variant | `errors.rs` — append it under your epic's `// ─── E0N — ... ───` banner (add one at the end if it doesn't exist yet, never interleave with another epic's block), at the next free discriminant, never renumber |
+| adding a type used by the contract's storage/ABI | `types.rs` — under the matching epic banner inside "Domain Types" |
 | changing a bound or magic number | `constants.rs` — it should exist in exactly one place |
-| adding an event | `events.rs`, and update the README event table |
+| adding an event | `events.rs` — under your epic's banner, same convention as `errors.rs`, and update the README event table |
 | adding a helper used by more than one entry point | `internal.rs` as `pub(crate)` |
 | adding a test fixture used by more than one test module | `test/common.rs` as `pub(crate)` |
 | changing the verifier interface or how `execute_task` calls it | `verifier.rs` + `task.rs` + `test/verifier.rs`, and `docs/VERIFIER_DESIGN.md` |
@@ -392,7 +393,8 @@ cargo watch -x "test --all --features testutils"
 
 ### Test Structure
 
-- Unit tests live in `contracts/keeper-registry/src/test.rs`.
+- Unit tests live in `contracts/keeper-registry/src/test/`, split by area
+  (see the Project Structure section above).
 - Integration tests that cross contract boundaries go in `tests/`.
 - Use `Env::default()` + `env.mock_all_auths()` for simplicity in unit tests.
 - Use real auth flows when testing auth-specific paths.
@@ -409,7 +411,7 @@ not just a patched line of contract code:
 1. Minimize the crashing input (`cargo fuzz tmin <target> <path-to-crash>`)
    and commit it under `fuzz/corpus/<target>/regressions/`, so the fuzzer's
    own corpus keeps re-testing it on every future run.
-2. Add a corresponding `#[test]` in `contracts/keeper-registry/src/test.rs`
+2. Add a corresponding `#[test]` in `contracts/keeper-registry/src/test/`
    that reproduces the exact scenario **in human-readable form** — the
    actual sequence of contract calls that triggered the crash, not "replay
    these fuzzer bytes." A raw fuzzer input replay is not reviewable by a

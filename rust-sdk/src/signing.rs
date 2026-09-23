@@ -40,7 +40,7 @@ impl TransactionSigner for KeypairSigner {
 
     fn sign_payload(&self, payload: &[u8]) -> Result<soroban_sdk::Bytes, SignerError> {
         // In testing/local mock mode, return mock signature payload
-        let mut bytes = soroban_sdk::Bytes::new(&self.address.env());
+        let mut bytes = soroban_sdk::Bytes::new(self.address.env());
         for &b in payload {
             bytes.push_back(b);
         }

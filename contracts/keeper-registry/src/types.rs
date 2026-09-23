@@ -29,6 +29,8 @@ pub enum DataKey {
 // Domain Types
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ─── E01 — Contract Core Hardening ─────────────────────────────────────
+
 /// The kind of automation this task represents.
 /// Contributors: add new variants here as the network supports more use-cases.
 #[contracttype]
@@ -101,6 +103,8 @@ pub struct Task {
     /// are permissionless, like keepers (design doc §5).
     pub verifier: Option<Address>,
 }
+
+// ─── E05 — Batch Operations & Gas ──────────────────────────────────────
 
 /// One entry in a [`KeeperRegistry::batch_register_tasks`] call — the same
 /// fields `register_task` takes, minus `owner`, which is shared across the

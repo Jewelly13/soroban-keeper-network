@@ -16,7 +16,7 @@ impl TransactionSigner for CustomHsmSigner {
         &self,
         payload: &[u8],
     ) -> Result<soroban_sdk::Bytes, soroban_keeper_sdk::SignerError> {
-        let mut bytes = Bytes::new(&self.addr.env());
+        let mut bytes = Bytes::new(self.addr.env());
         for &b in payload {
             bytes.push_back(b);
         }

@@ -13,6 +13,9 @@ use soroban_sdk::contracterror;
 #[contracterror]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum KeeperError {
+    // ─── E01 — Contract Core Hardening ─────────────────────────────────
+    // Base task-lifecycle and admin errors. New variants for core
+    // correctness/hardening work go here, at the next free discriminant.
     AlreadyInitialized = 1,
     Unauthorized = 2,
     ContractPaused = 3,
@@ -26,8 +29,6 @@ pub enum KeeperError {
     NotTaskOwner = 11,
     NotTaskClaimer = 12,
     NoRewardsAvailable = 13,
-    /// `proof` passed to `execute_task` exceeded `MAX_PROOF_LEN`.
-    ProofTooLarge = 14,
     /// A function requiring configured state (`initialize` must have been
     /// called) was invoked on a registry that isn't configured yet.
     NotInitialized = 15,
@@ -42,9 +43,26 @@ pub enum KeeperError {
     InvalidTaskParams = 18,
     /// Arithmetic operation would overflow or underflow.
     ArithmeticOverflow = 19,
+
+    // ─── E04 — On-chain Execution Verifier ─────────────────────────────
+    // New verifier-interface/verification errors go here.
+    /// `proof` passed to `execute_task` exceeded `MAX_PROOF_LEN`.
+    ProofTooLarge = 14,
     /// The attached verifier reported an `interface_version` other than
     /// [`KEEPER_VERIFIER_INTERFACE_VERSION`]. `verify` was not called.
     IncompatibleVerifierInterface = 20,
+    /// A task's attached verifier rejected the proof (`verify` returned
+    /// `false`, or the call panicked — the two are treated identically, see
+    /// `docs/VERIFIER_DESIGN.md` §2). Distinct from `InvalidTaskStatus` (the
+    /// task moved out from under the caller — don't retry the same way) and
+    /// `NotTaskClaimer` (wrong caller): this means the caller IS the current
+    /// claimer of a still-`Claimed` task, but the specific proof it submitted
+    /// was rejected, so retrying with a different proof against the same
+    /// claim is meaningful.
+    VerificationFailed = 24,
+
+    // ─── E05 — Batch Operations & Gas ──────────────────────────────────
+    // New batch-registration/-read errors go here.
     /// A batch read (`get_tasks` / `get_tasks_range`) asked for more than
     /// [`MAX_BATCH_READ`] task ids, or `batch_register_tasks` was handed more
     /// entries than [`MAX_BATCH_SIZE`]. Returned rather than silently
@@ -59,13 +77,4 @@ pub enum KeeperError {
     /// The sum of a batch's rewards exceeded the caller-supplied
     /// `max_total_reward` ceiling. Zero transfers occurred.
     BatchRewardCeilingExceeded = 23,
-    /// A task's attached verifier rejected the proof (`verify` returned
-    /// `false`, or the call panicked — the two are treated identically, see
-    /// `docs/VERIFIER_DESIGN.md` §2). Distinct from `InvalidTaskStatus` (the
-    /// task moved out from under the caller — don't retry the same way) and
-    /// `NotTaskClaimer` (wrong caller): this means the caller IS the current
-    /// claimer of a still-`Claimed` task, but the specific proof it submitted
-    /// was rejected, so retrying with a different proof against the same
-    /// claim is meaningful.
-    VerificationFailed = 24,
 }

@@ -273,8 +273,8 @@ A **shared, permissionless, on-chain coordination layer** where:
   See the `pause`/`unpause` doc comment in
   `contracts/keeper-registry/src/lib.rs` and the
   `test_pause_policy_matrix_entry_point_by_entry_point` test in
-  `contracts/keeper-registry/src/test.rs` for the authoritative, verified
-  matrix.
+  `contracts/keeper-registry/src/test/admin.rs` for the authoritative,
+  verified matrix.
 - `set_fee_bps` MUST reject values > 10 000.
 - `transfer_admin` MUST require auth from BOTH current admin AND new admin.
 - `upgrade` MUST use `deployer().update_current_contract_wasm`, and MUST

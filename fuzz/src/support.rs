@@ -34,7 +34,7 @@ impl RegistryHarness {
         let keeper = Address::generate(&env);
 
         // Deploy a SAC-wrapped reward token, matching the pattern in
-        // contracts/keeper-registry/src/test.rs's `setup()`.
+        // contracts/keeper-registry/src/test/common.rs's `setup()`.
         let reward_token = env
             .register_stellar_asset_contract_v2(admin.clone())
             .address();

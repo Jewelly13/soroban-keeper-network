@@ -1,8 +1,8 @@
 # Fuzzing & Property Testing
 
 This document covers the fuzz harness (`fuzz/`), the property tests in
-`contracts/keeper-registry/src/test.rs`, and the shared invariant module
-both use. It documents what actually exists today, not the full eventual
+`contracts/keeper-registry/src/test/property.rs`, and the shared invariant
+module both use. It documents what actually exists today, not the full eventual
 scope of the fuzzing epic (E03) — see the "What's not here yet" section at
 the end for what's still open.
 
