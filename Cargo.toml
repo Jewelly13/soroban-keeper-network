@@ -4,6 +4,7 @@ members = [
     "contracts/keeper-registry",
     "indexer",
     "rust-sdk",
+    "examples/keeper-bot-v2",
 ]
 
 [workspace.dependencies]
