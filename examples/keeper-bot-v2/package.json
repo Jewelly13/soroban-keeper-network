@@ -1,0 +1,44 @@
+{
+  "name": "soroban-keeper-bot-v2",
+  "version": "0.2.0",
+  "description": "Production-grade keeper bot for the Soroban Keeper Network - v2 with concurrent task processing",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "test": "vitest",
+    "test:run": "vitest run",
+    "lint": "eslint src/ test/",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "soroban",
+    "stellar",
+    "keeper",
+    "automation",
+    "defi",
+    "concurrent",
+    "v2"
+  ],
+  "license": "Apache-2.0",
+  "dependencies": {
+    "@soroban-keeper-network/sdk": "file:../../packages/sdk-ts",
+    "@stellar/stellar-sdk": "^16.2.0",
+    "better-sqlite3": "^9.2.2",
+    "dotenv": "^17.4.2"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/better-sqlite3": "^7.6.8",
+    "@types/node": "^20.10.6",
+    "eslint": "^10.8.0",
+    "globals": "^17.8.0",
+    "typescript": "^5.3.3",
+    "vitest": "^1.1.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
